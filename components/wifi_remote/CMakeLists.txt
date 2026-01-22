@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS 
+        "src/wifi_remote.c"
+    INCLUDE_DIRS 
+        "include"
+    PRIV_REQUIRES 
+        esp_wifi 
+        esp_http_server 
+        esp_event 
+        esp_netif 
+        json 
+        nvs_flash
+    REQUIRES
+        common
+)

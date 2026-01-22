@@ -1,0 +1,5 @@
+# WiFi 遥控器 WebSocket 支持
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# FreeRTOS 高精度定时 (平衡控制需要)
+CONFIG_FREERTOS_HZ=1000
