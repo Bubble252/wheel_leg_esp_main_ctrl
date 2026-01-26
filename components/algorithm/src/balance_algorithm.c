@@ -136,7 +136,13 @@ esp_err_t balance_compute(const balance_input_t *input, balance_output_t *output
     
     // 检查紧急停止
     if (balance_check_emergency(input->pitch)) {
-        ESP_LOGW(TAG, "Emergency stop! Pitch: %.2f", input->pitch);
+        // 限流打印：每秒最多打印一次
+        static uint32_t last_emergency_log = 0;
+        uint32_t now = (uint32_t)(esp_log_timestamp());
+        if (now - last_emergency_log > 1000) {
+            ESP_LOGW(TAG, "Emergency stop! Pitch: %.2f", input->pitch);
+            last_emergency_log = now;
+        }
         return ESP_ERR_INVALID_STATE;
     }
     

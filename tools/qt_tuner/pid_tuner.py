@@ -825,10 +825,33 @@ class SpeedAdaptivePanel(QWidget):
 
 
 # ============================================================================
-# 腿部控制面板
+# 腿部控制面板 (独立于平衡控制)
 # ============================================================================
 class LegControlPanel(QWidget):
-    """腿部电机控制面板"""
+    """腿部电机控制面板 - 运动学控制 + 直接角度控制
+    
+    功能:
+    - 运动学控制: 通过腿长和身体夹角控制腿部姿态
+    - 直接角度控制: 直接设置髋关节和膝关节电机角度
+    - 运动学测试: 正运动学(FK)和逆运动学(IK)计算验证
+    - 预设姿态: 常用姿态快捷设置
+    
+    对应串口命令:
+    - balance leg on/off: 使能/禁用腿部电机
+    - balance leg set <lh> <lk> <rh> <rk>: 直接设置电机角度
+    - balance leg target <length> <angle> [left|right|both]: 运动学目标设置
+    - balance leg speed <rpm>: 设置腿部移动速度
+    - balance leg status: 查询腿部状态
+    - balance leg test fk/ik: 运动学测试
+    """
+    
+    # 运动学参数 (与 leg_kinematics.h 保持一致)
+    LEG_THIGH_LENGTH = 0.10  # 大腿长度 (m)
+    LEG_SHANK_LENGTH = 0.10  # 小腿长度 (m)
+    LEG_LENGTH_MIN = 0.11    # 最小腿长 (m) - 与 C 代码一致
+    LEG_LENGTH_MAX = 0.17    # 最大腿长 (m) - 与 C 代码一致
+    LEG_BODY_ANGLE_MIN = -160.0  # 最小身体夹角 (度), 向前蹬腿
+    LEG_BODY_ANGLE_MAX = -20.0   # 最大身体夹角 (度), 向后蹬腿
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -838,97 +861,157 @@ class LegControlPanel(QWidget):
     def init_ui(self):
         layout = QVBoxLayout(self)
         
-        # ===== Roll 控制开关 =====
-        roll_group = QGroupBox("Roll 控制")
-        roll_layout = QHBoxLayout()
+        # ===== 警告提示 =====
+        warning_label = QLabel("⚠️ 重要: 必须先在【平衡控制】面板执行【初始化平衡系统】才能使用腿部控制!")
+        warning_label.setStyleSheet(
+            "background-color: #ff9800; color: black; padding: 8px; "
+            "border-radius: 4px; font-weight: bold;"
+        )
+        warning_label.setWordWrap(True)
+        layout.addWidget(warning_label)
         
-        self.roll_status = QLabel("状态: 未知")
-        self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold;")
-        roll_layout.addWidget(self.roll_status)
-        
-        roll_layout.addStretch()
-        
-        self.roll_on_btn = QPushButton("开启 Roll")
-        self.roll_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
-        self.roll_on_btn.clicked.connect(lambda: self.send_roll_cmd("on"))
-        roll_layout.addWidget(self.roll_on_btn)
-        
-        self.roll_off_btn = QPushButton("关闭 Roll")
-        self.roll_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
-        self.roll_off_btn.clicked.connect(lambda: self.send_roll_cmd("off"))
-        roll_layout.addWidget(self.roll_off_btn)
-        
-        roll_group.setLayout(roll_layout)
-        layout.addWidget(roll_group)
-        
-        # ===== 腿部电机开关 =====
-        leg_enable_group = QGroupBox("腿部电机使能")
-        leg_enable_layout = QHBoxLayout()
+        # ===== 腿部电机使能 =====
+        enable_group = QGroupBox("🦿 腿部电机控制")
+        enable_layout = QHBoxLayout()
         
         self.leg_status = QLabel("状态: 未知")
         self.leg_status.setStyleSheet("font-size: 14px; font-weight: bold;")
-        leg_enable_layout.addWidget(self.leg_status)
+        enable_layout.addWidget(self.leg_status)
         
-        leg_enable_layout.addStretch()
+        enable_layout.addStretch()
         
-        self.leg_on_btn = QPushButton("使能腿部")
+        self.leg_on_btn = QPushButton("✅ 使能腿部")
         self.leg_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
         self.leg_on_btn.clicked.connect(lambda: self.send_leg_cmd("on"))
-        leg_enable_layout.addWidget(self.leg_on_btn)
+        enable_layout.addWidget(self.leg_on_btn)
         
-        self.leg_off_btn = QPushButton("禁用腿部")
+        self.leg_off_btn = QPushButton("❌ 禁用腿部")
         self.leg_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
         self.leg_off_btn.clicked.connect(lambda: self.send_leg_cmd("off"))
-        leg_enable_layout.addWidget(self.leg_off_btn)
+        enable_layout.addWidget(self.leg_off_btn)
         
-        leg_enable_group.setLayout(leg_enable_layout)
-        layout.addWidget(leg_enable_group)
+        self.leg_status_btn = QPushButton("📊 状态")
+        self.leg_status_btn.clicked.connect(lambda: self.send_leg_cmd("status"))
+        enable_layout.addWidget(self.leg_status_btn)
         
-        # ===== 腿部角度设置 =====
-        angle_group = QGroupBox("腿部角度设置 (单位: 度)")
+        enable_group.setLayout(enable_layout)
+        layout.addWidget(enable_group)
+        
+        # ===== 运动学控制 (腿长 + 身体夹角) =====
+        kin_group = QGroupBox("📐 运动学控制 (腿长 + 身体夹角)")
+        kin_layout = QGridLayout()
+        kin_layout.setSpacing(10)
+        
+        # 腿长设置
+        kin_layout.addWidget(QLabel("腿长 (m):"), 0, 0)
+        self.leg_length_input = QDoubleSpinBox()
+        self.leg_length_input.setRange(self.LEG_LENGTH_MIN, self.LEG_LENGTH_MAX)
+        self.leg_length_input.setValue(0.15)
+        self.leg_length_input.setDecimals(3)
+        self.leg_length_input.setSingleStep(0.005)
+        self.leg_length_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.leg_length_input.valueChanged.connect(self.update_ik_preview)
+        kin_layout.addWidget(self.leg_length_input, 0, 1)
+        
+        # 腿长滑块
+        self.leg_length_slider = QSlider(Qt.Horizontal)
+        self.leg_length_slider.setRange(int(self.LEG_LENGTH_MIN * 1000), int(self.LEG_LENGTH_MAX * 1000))
+        self.leg_length_slider.setValue(150)
+        self.leg_length_slider.valueChanged.connect(lambda v: self.leg_length_input.setValue(v / 1000.0))
+        self.leg_length_input.valueChanged.connect(lambda v: self.leg_length_slider.setValue(int(v * 1000)))
+        kin_layout.addWidget(self.leg_length_slider, 0, 2, 1, 2)
+        
+        # 身体夹角设置
+        kin_layout.addWidget(QLabel("身体夹角 (°):"), 1, 0)
+        self.body_angle_input = QDoubleSpinBox()
+        self.body_angle_input.setRange(self.LEG_BODY_ANGLE_MIN, self.LEG_BODY_ANGLE_MAX)
+        self.body_angle_input.setValue(-90)  # 默认垂直向下
+        self.body_angle_input.setDecimals(1)
+        self.body_angle_input.setSingleStep(1)
+        self.body_angle_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.body_angle_input.valueChanged.connect(self.update_ik_preview)
+        kin_layout.addWidget(self.body_angle_input, 1, 1)
+        
+        # 身体夹角滑块
+        self.body_angle_slider = QSlider(Qt.Horizontal)
+        self.body_angle_slider.setRange(int(self.LEG_BODY_ANGLE_MIN), int(self.LEG_BODY_ANGLE_MAX))
+        self.body_angle_slider.setValue(-90)  # 默认垂直向下
+        self.body_angle_slider.valueChanged.connect(lambda v: self.body_angle_input.setValue(v))
+        self.body_angle_input.valueChanged.connect(lambda v: self.body_angle_slider.setValue(int(v)))
+        kin_layout.addWidget(self.body_angle_slider, 1, 2, 1, 2)
+        
+        # 目标选择
+        kin_layout.addWidget(QLabel("目标:"), 2, 0)
+        self.target_combo = QComboBox()
+        self.target_combo.addItems(["双腿 (both)", "仅左腿 (left)", "仅右腿 (right)"])
+        kin_layout.addWidget(self.target_combo, 2, 1)
+        
+        # 发送按钮
+        self.send_kin_btn = QPushButton("📤 发送运动学目标")
+        self.send_kin_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px; font-size: 14px;")
+        self.send_kin_btn.clicked.connect(self.send_kinematics_target)
+        kin_layout.addWidget(self.send_kin_btn, 2, 2, 1, 2)
+        
+        # IK 预览显示 - 电机角度
+        kin_layout.addWidget(QLabel("IK预览 (电机):"), 3, 0)
+        self.ik_preview_label = QLabel("Hip: --, Knee: --")
+        self.ik_preview_label.setStyleSheet("font-size: 12px; color: #888; padding: 5px;")
+        kin_layout.addWidget(self.ik_preview_label, 3, 1, 1, 3)
+        
+        # IK 预览显示 - 运动学角度 theta1/theta2
+        kin_layout.addWidget(QLabel("IK预览 (θ1,θ2):"), 4, 0)
+        self.ik_theta_label = QLabel("θ1: --, θ2: --")
+        self.ik_theta_label.setStyleSheet("font-size: 12px; color: #00ccff; padding: 5px; font-weight: bold;")
+        kin_layout.addWidget(self.ik_theta_label, 4, 1, 1, 3)
+        
+        kin_group.setLayout(kin_layout)
+        layout.addWidget(kin_group)
+        
+        # ===== 直接角度控制 =====
+        angle_group = QGroupBox("🔧 直接角度控制 (电机角度)")
         angle_layout = QGridLayout()
         angle_layout.setSpacing(10)
         
         # 左腿
-        angle_layout.addWidget(QLabel("左髋关节 (L_Hip):"), 0, 0)
+        angle_layout.addWidget(QLabel("左髋 (L_Hip):"), 0, 0)
         self.left_hip_input = QDoubleSpinBox()
         self.left_hip_input.setRange(-180, 180)
-        self.left_hip_input.setValue(30)
+        self.left_hip_input.setValue(-105)  # 默认站立
         self.left_hip_input.setDecimals(1)
         self.left_hip_input.setSingleStep(5)
         self.left_hip_input.setStyleSheet("font-size: 14px; padding: 5px;")
         angle_layout.addWidget(self.left_hip_input, 0, 1)
         
-        angle_layout.addWidget(QLabel("左膝关节 (L_Knee):"), 1, 0)
+        angle_layout.addWidget(QLabel("左膝 (L_Knee):"), 1, 0)
         self.left_knee_input = QDoubleSpinBox()
         self.left_knee_input.setRange(-180, 180)
-        self.left_knee_input.setValue(-60)
+        self.left_knee_input.setValue(60)  # 默认站立
         self.left_knee_input.setDecimals(1)
         self.left_knee_input.setSingleStep(5)
         self.left_knee_input.setStyleSheet("font-size: 14px; padding: 5px;")
         angle_layout.addWidget(self.left_knee_input, 1, 1)
         
         # 右腿
-        angle_layout.addWidget(QLabel("右髋关节 (R_Hip):"), 0, 2)
+        angle_layout.addWidget(QLabel("右髋 (R_Hip):"), 0, 2)
         self.right_hip_input = QDoubleSpinBox()
         self.right_hip_input.setRange(-180, 180)
-        self.right_hip_input.setValue(30)
+        self.right_hip_input.setValue(105)  # 右腿镜像
         self.right_hip_input.setDecimals(1)
         self.right_hip_input.setSingleStep(5)
         self.right_hip_input.setStyleSheet("font-size: 14px; padding: 5px;")
         angle_layout.addWidget(self.right_hip_input, 0, 3)
         
-        angle_layout.addWidget(QLabel("右膝关节 (R_Knee):"), 1, 2)
+        angle_layout.addWidget(QLabel("右膝 (R_Knee):"), 1, 2)
         self.right_knee_input = QDoubleSpinBox()
         self.right_knee_input.setRange(-180, 180)
-        self.right_knee_input.setValue(-60)
+        self.right_knee_input.setValue(-60)  # 右腿镜像
         self.right_knee_input.setDecimals(1)
         self.right_knee_input.setSingleStep(5)
         self.right_knee_input.setStyleSheet("font-size: 14px; padding: 5px;")
         angle_layout.addWidget(self.right_knee_input, 1, 3)
         
         # 同步选项
-        self.sync_checkbox = QPushButton("🔗 左右同步")
+        self.sync_checkbox = QPushButton("🔗 左右镜像同步")
         self.sync_checkbox.setCheckable(True)
         self.sync_checkbox.setChecked(True)
         self.sync_checkbox.clicked.connect(self.on_sync_toggled)
@@ -938,11 +1021,17 @@ class LegControlPanel(QWidget):
         self.left_hip_input.valueChanged.connect(self.sync_left_to_right)
         self.left_knee_input.valueChanged.connect(self.sync_left_to_right)
         
+        # 发送角度按钮
+        self.send_angle_btn = QPushButton("📤 发送电机角度")
+        self.send_angle_btn.setStyleSheet("background-color: #FF9800; color: white; padding: 10px; font-size: 14px;")
+        self.send_angle_btn.clicked.connect(self.send_leg_angles)
+        angle_layout.addWidget(self.send_angle_btn, 2, 2, 1, 2)
+        
         angle_group.setLayout(angle_layout)
         layout.addWidget(angle_group)
         
-        # ===== 腿部速度设置 =====
-        speed_group = QGroupBox("腿部移动速度")
+        # ===== 速度设置 =====
+        speed_group = QGroupBox("⚡ 腿部移动速度")
         speed_layout = QHBoxLayout()
         
         speed_layout.addWidget(QLabel("速度 (rpm):"))
@@ -962,93 +1051,289 @@ class LegControlPanel(QWidget):
         speed_group.setLayout(speed_layout)
         layout.addWidget(speed_group)
         
-        # ===== 操作按钮 =====
-        btn_layout = QHBoxLayout()
+        # ===== 预设姿态 (运动学) =====
+        preset_group = QGroupBox("🎯 预设姿态 (运动学)")
+        preset_layout = QGridLayout()
         
-        self.set_angles_btn = QPushButton("📐 设置腿部角度")
-        self.set_angles_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px 30px; font-size: 14px;")
-        self.set_angles_btn.clicked.connect(self.send_leg_angles)
-        btn_layout.addWidget(self.set_angles_btn)
-        
-        self.query_btn = QPushButton("🔍 查询状态")
-        self.query_btn.clicked.connect(self.query_status)
-        btn_layout.addWidget(self.query_btn)
-        
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        # ===== 预设姿态 =====
-        preset_group = QGroupBox("预设姿态")
-        preset_layout = QHBoxLayout()
-        
-        presets = [
-            ("站立", 30, -60),
-            ("半蹲", 45, -90),
-            ("蹲下", 60, -120),
-            ("伸直", 0, 0),
+        # 运动学预设 (腿长, 身体夹角) - 垂直向下是-90°
+        kin_presets = [
+            ("站立", 0.14, -90),    # 正常站立，垂直向下
+            ("半蹲", 0.12, -90),    # 半蹲
+            ("蹲下", 0.11, -90),    # 蹲下
+            ("伸直", 0.17, -90),    # 腿伸直
+            ("前蹬", 0.14, -120),   # 向前蹬腿
+            ("后蹬", 0.14, -60),    # 向后蹬腿
         ]
         
-        for name, hip, knee in presets:
-            btn = QPushButton(name)
-            btn.clicked.connect(lambda checked, h=hip, k=knee: self.apply_preset(h, k))
-            preset_layout.addWidget(btn)
+        for i, (name, length, angle) in enumerate(kin_presets):
+            btn = QPushButton(f"{name}\n({length}m, {angle}°)")
+            btn.setStyleSheet("padding: 8px;")
+            btn.clicked.connect(lambda checked, l=length, a=angle: self.apply_kin_preset(l, a))
+            preset_layout.addWidget(btn, i // 3, i % 3)
         
-        preset_layout.addStretch()
         preset_group.setLayout(preset_layout)
         layout.addWidget(preset_group)
         
+        # ===== 运动学测试 =====
+        test_group = QGroupBox("🧪 运动学测试 (FK/IK)")
+        test_layout = QVBoxLayout()
+        
+        # FK 测试
+        fk_layout = QHBoxLayout()
+        fk_layout.addWidget(QLabel("FK: Hip="))
+        self.fk_hip_input = QDoubleSpinBox()
+        self.fk_hip_input.setRange(-180, 180)
+        self.fk_hip_input.setValue(-105)
+        self.fk_hip_input.setDecimals(1)
+        fk_layout.addWidget(self.fk_hip_input)
+        
+        fk_layout.addWidget(QLabel("Knee="))
+        self.fk_knee_input = QDoubleSpinBox()
+        self.fk_knee_input.setRange(-180, 180)
+        self.fk_knee_input.setValue(60)
+        self.fk_knee_input.setDecimals(1)
+        fk_layout.addWidget(self.fk_knee_input)
+        
+        self.fk_side_combo = QComboBox()
+        self.fk_side_combo.addItems(["left", "right"])
+        fk_layout.addWidget(self.fk_side_combo)
+        
+        self.fk_test_btn = QPushButton("计算 FK")
+        self.fk_test_btn.clicked.connect(self.test_fk)
+        fk_layout.addWidget(self.fk_test_btn)
+        
+        test_layout.addLayout(fk_layout)
+        
+        # IK 测试
+        ik_layout = QHBoxLayout()
+        ik_layout.addWidget(QLabel("IK: L="))
+        self.ik_length_input = QDoubleSpinBox()
+        self.ik_length_input.setRange(0.11, 0.17)
+        self.ik_length_input.setValue(0.14)
+        self.ik_length_input.setDecimals(3)
+        ik_layout.addWidget(self.ik_length_input)
+        
+        ik_layout.addWidget(QLabel("Angle="))
+        self.ik_angle_input = QDoubleSpinBox()
+        self.ik_angle_input.setRange(-160, -20)
+        self.ik_angle_input.setValue(-90)  # 垂直向下
+        self.ik_angle_input.setDecimals(1)
+        ik_layout.addWidget(self.ik_angle_input)
+        
+        self.ik_side_combo = QComboBox()
+        self.ik_side_combo.addItems(["left", "right"])
+        ik_layout.addWidget(self.ik_side_combo)
+        
+        self.ik_test_btn = QPushButton("计算 IK")
+        self.ik_test_btn.clicked.connect(self.test_ik)
+        ik_layout.addWidget(self.ik_test_btn)
+        
+        test_layout.addLayout(ik_layout)
+        
+        # 测试结果显示
+        self.test_result_label = QLabel("测试结果: --")
+        self.test_result_label.setStyleSheet("font-size: 12px; color: #00ff00; background-color: #1a1a2e; padding: 8px;")
+        test_layout.addWidget(self.test_result_label)
+        
+        test_group.setLayout(test_layout)
+        layout.addWidget(test_group)
+        
+        # ===== 腿部状态显示 =====
+        state_group = QGroupBox("📊 当前腿部状态")
+        state_layout = QGridLayout()
+        
+        state_layout.addWidget(QLabel(""), 0, 0)
+        state_layout.addWidget(QLabel("左腿"), 0, 1)
+        state_layout.addWidget(QLabel("右腿"), 0, 2)
+        
+        state_layout.addWidget(QLabel("腿长 (m):"), 1, 0)
+        self.left_length_label = self.create_state_label()
+        state_layout.addWidget(self.left_length_label, 1, 1)
+        self.right_length_label = self.create_state_label()
+        state_layout.addWidget(self.right_length_label, 1, 2)
+        
+        state_layout.addWidget(QLabel("身体夹角 (°):"), 2, 0)
+        self.left_angle_label = self.create_state_label()
+        state_layout.addWidget(self.left_angle_label, 2, 1)
+        self.right_angle_label = self.create_state_label()
+        state_layout.addWidget(self.right_angle_label, 2, 2)
+        
+        state_layout.addWidget(QLabel("髋关节 (°):"), 3, 0)
+        self.left_hip_label = self.create_state_label()
+        state_layout.addWidget(self.left_hip_label, 3, 1)
+        self.right_hip_label = self.create_state_label()
+        state_layout.addWidget(self.right_hip_label, 3, 2)
+        
+        state_layout.addWidget(QLabel("膝关节 (°):"), 4, 0)
+        self.left_knee_label = self.create_state_label()
+        state_layout.addWidget(self.left_knee_label, 4, 1)
+        self.right_knee_label = self.create_state_label()
+        state_layout.addWidget(self.right_knee_label, 4, 2)
+        
+        # 添加 theta1/theta2 显示 (从编码器计算)
+        state_layout.addWidget(QLabel("θ1 (大腿角):"), 5, 0)
+        self.left_theta1_label = self.create_state_label("#ffcc00")
+        state_layout.addWidget(self.left_theta1_label, 5, 1)
+        self.right_theta1_label = self.create_state_label("#ffcc00")
+        state_layout.addWidget(self.right_theta1_label, 5, 2)
+        
+        state_layout.addWidget(QLabel("θ2 (膝角):"), 6, 0)
+        self.left_theta2_label = self.create_state_label("#ffcc00")
+        state_layout.addWidget(self.left_theta2_label, 6, 1)
+        self.right_theta2_label = self.create_state_label("#ffcc00")
+        state_layout.addWidget(self.right_theta2_label, 6, 2)
+        
+        state_group.setLayout(state_layout)
+        layout.addWidget(state_group)
+        
         layout.addStretch()
+        
+        # 初始化 IK 预览
+        self.update_ik_preview()
+    
+    def create_state_label(self, color="#00ccff"):
+        """创建状态显示标签"""
+        label = QLabel("--")
+        label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {color}; "
+                          "background-color: #1a1a2e; padding: 5px; border-radius: 3px;")
+        label.setAlignment(Qt.AlignCenter)
+        label.setMinimumWidth(80)
+        return label
+    
+    def update_ik_preview(self):
+        """更新逆运动学预览 (本地计算) - 与 C 代码 leg_kinematics.c 保持一致"""
+        import math
+        
+        length = self.leg_length_input.value()
+        body_angle = self.body_angle_input.value()
+        
+        L1 = self.LEG_THIGH_LENGTH
+        L2 = self.LEG_SHANK_LENGTH
+        
+        # 检查可达性
+        L_min = abs(L1 - L2) + 0.001
+        L_max = L1 + L2 - 0.001
+        if length < L_min or length > L_max:
+            self.ik_preview_label.setText("⚠️ 目标不可达!")
+            self.ik_preview_label.setStyleSheet("font-size: 12px; color: #ff4444; padding: 5px;")
+            self.ik_theta_label.setText("θ1: --, θ2: --")
+            return
+        
+        # ===== 与 C 代码一致的 IK 算法 =====
+        # 左腿 offset (校准: Hip=-60°, Knee=-55° → body_angle=-90°, theta2=-90°)
+        hip_offset = -15.0
+        knee_offset = 35.0
+        
+        # Step 1: 余弦定理求膝关节角度 theta2
+        cos_theta2 = (length*length - L1*L1 - L2*L2) / (2 * L1 * L2)
+        cos_theta2 = max(-1.0, min(1.0, cos_theta2))
+        theta2 = -math.acos(cos_theta2)  # 取负号，因为弯曲方向是负的
+        theta2_deg = math.degrees(theta2)
+        
+        # Step 2: 计算 beta 角
+        sin_theta2 = math.sin(theta2)
+        beta = math.atan2(L2 * sin_theta2, L1 + L2 * cos_theta2)
+        
+        # Step 3: 身体夹角 -> 大腿角度
+        alpha = math.radians(body_angle)
+        theta1 = alpha - beta
+        theta1_deg = math.degrees(theta1)
+        
+        # Step 4: 运动学角度 -> 电机角度
+        hip_motor = theta1_deg + hip_offset
+        knee_motor = theta2_deg + knee_offset
+        
+        # 右腿镜像
+        right_hip_motor = -theta1_deg + (-hip_offset)  # 右腿 offset 符号相反
+        right_knee_motor = -theta2_deg + (-knee_offset)
+        
+        self.ik_preview_label.setText(
+            f"左腿: Hip={hip_motor:.1f}°, Knee={knee_motor:.1f}° | "
+            f"右腿: Hip={right_hip_motor:.1f}°, Knee={right_knee_motor:.1f}°"
+        )
+        self.ik_preview_label.setStyleSheet("font-size: 12px; color: #888; padding: 5px;")
+        
+        # 显示 theta1/theta2 (运动学角度)
+        self.ik_theta_label.setText(f"θ1={theta1_deg:.1f}° (大腿), θ2={theta2_deg:.1f}° (膝关节, 0=伸直, 负=弯曲)")
+        self.ik_theta_label.setStyleSheet("font-size: 12px; color: #00ccff; padding: 5px; font-weight: bold;")
     
     def on_sync_toggled(self, checked):
         if checked:
-            self.sync_checkbox.setText("🔗 左右同步 (开)")
+            self.sync_checkbox.setText("🔗 左右镜像同步 (开)")
             self.sync_left_to_right()
         else:
-            self.sync_checkbox.setText("🔗 左右同步 (关)")
+            self.sync_checkbox.setText("🔗 左右镜像同步 (关)")
     
     def sync_left_to_right(self):
+        """左右腿镜像同步"""
         if self.sync_checkbox.isChecked():
-            self.right_hip_input.setValue(self.left_hip_input.value())
-            self.right_knee_input.setValue(self.left_knee_input.value())
+            # 右腿是左腿的镜像
+            self.right_hip_input.setValue(-self.left_hip_input.value())
+            self.right_knee_input.setValue(-self.left_knee_input.value())
     
-    def apply_preset(self, hip, knee):
-        self.left_hip_input.setValue(hip)
-        self.left_knee_input.setValue(knee)
-        if self.sync_checkbox.isChecked():
-            self.right_hip_input.setValue(hip)
-            self.right_knee_input.setValue(knee)
-    
-    def send_roll_cmd(self, state):
-        if not self.parent_window.is_connected():
-            QMessageBox.warning(self, "警告", "请先连接串口!")
-            return
-        cmd = f"balance roll {state}"
-        if self.parent_window.send_command(cmd):
-            self.parent_window.log(f"发送: {cmd}")
-            if state == "on":
-                self.roll_status.setText("状态: 已开启")
-                self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
-            else:
-                self.roll_status.setText("状态: 已关闭")
-                self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
+    def apply_kin_preset(self, length, angle):
+        """应用运动学预设"""
+        self.leg_length_input.setValue(length)
+        self.body_angle_input.setValue(angle)
     
     def send_leg_cmd(self, state):
+        """发送腿部控制命令"""
         if not self.parent_window.is_connected():
             QMessageBox.warning(self, "警告", "请先连接串口!")
             return
+        
+        # 检查是否已初始化平衡系统
+        if hasattr(self.parent_window, 'balance_panel') and \
+           not self.parent_window.balance_panel.balance_initialized:
+            QMessageBox.warning(self, "警告", 
+                "请先在【平衡控制】面板点击【初始化平衡系统】!\n\n"
+                "腿部电机需要 balance init 命令创建电机句柄后才能使能。")
+            return
+        
         cmd = f"balance leg {state}"
         if self.parent_window.send_command(cmd):
             self.parent_window.log(f"发送: {cmd}")
             if state == "on":
                 self.leg_status.setText("状态: 已使能")
                 self.leg_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
-            else:
+            elif state == "off":
                 self.leg_status.setText("状态: 已禁用")
                 self.leg_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
     
-    def send_leg_angles(self):
+    def send_kinematics_target(self):
+        """发送运动学目标"""
         if not self.parent_window.is_connected():
             QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        
+        # 检查是否已初始化
+        if hasattr(self.parent_window, 'balance_panel') and \
+           not self.parent_window.balance_panel.balance_initialized:
+            QMessageBox.warning(self, "警告", 
+                "请先在【平衡控制】面板点击【初始化平衡系统】!")
+            return
+        
+        length = self.leg_length_input.value()
+        angle = self.body_angle_input.value()
+        
+        target_map = {0: "both", 1: "left", 2: "right"}
+        target = target_map[self.target_combo.currentIndex()]
+        
+        cmd = f"balance leg target {length:.3f} {angle:.1f} {target}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+    
+    def send_leg_angles(self):
+        """发送直接电机角度"""
+        if not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        
+        # 检查是否已初始化
+        if hasattr(self.parent_window, 'balance_panel') and \
+           not self.parent_window.balance_panel.balance_initialized:
+            QMessageBox.warning(self, "警告", 
+                "请先在【平衡控制】面板点击【初始化平衡系统】!")
             return
         
         lh = self.left_hip_input.value()
@@ -1061,6 +1346,7 @@ class LegControlPanel(QWidget):
             self.parent_window.log(f"发送: {cmd}")
     
     def send_leg_speed(self):
+        """发送腿部速度"""
         if not self.parent_window.is_connected():
             QMessageBox.warning(self, "警告", "请先连接串口!")
             return
@@ -1070,15 +1356,84 @@ class LegControlPanel(QWidget):
         if self.parent_window.send_command(cmd):
             self.parent_window.log(f"发送: {cmd}")
     
-    def query_status(self):
+    def test_fk(self):
+        """正运动学测试 (发送到设备)"""
         if not self.parent_window.is_connected():
             QMessageBox.warning(self, "警告", "请先连接串口!")
             return
         
-        # 查询 roll 和 leg 状态
-        self.parent_window.send_command("balance roll")
-        self.parent_window.send_command("balance leg")
-        self.parent_window.log("查询 Roll 和腿部状态...")
+        hip = self.fk_hip_input.value()
+        knee = self.fk_knee_input.value()
+        side = self.fk_side_combo.currentText()
+        
+        cmd = f"balance leg test fk {hip:.1f} {knee:.1f} {side}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+    
+    def test_ik(self):
+        """逆运动学测试 (发送到设备)"""
+        if not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        
+        length = self.ik_length_input.value()
+        angle = self.ik_angle_input.value()
+        side = self.ik_side_combo.currentText()
+        
+        cmd = f"balance leg test ik {length:.3f} {angle:.1f} {side}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+    
+    def update_leg_state(self, left_state, right_state):
+        """更新腿部状态显示
+        
+        Args:
+            left_state: dict with keys: length, angle, hip, knee
+            right_state: dict with keys: length, angle, hip, knee
+        """
+        # 左腿 offset (校准: Hip=-60°, Knee=-55° → body_angle=-90°)
+        left_hip_offset = -15.0
+        left_knee_offset = 35.0
+        # 右腿 offset (镜像)
+        right_hip_offset = 15.0
+        right_knee_offset = -35.0
+        
+        if left_state:
+            self.left_length_label.setText(f"{left_state.get('length', 0):.3f}")
+            self.left_angle_label.setText(f"{left_state.get('angle', 0):.1f}")
+            self.left_hip_label.setText(f"{left_state.get('hip', 0):.1f}")
+            self.left_knee_label.setText(f"{left_state.get('knee', 0):.1f}")
+            
+            # 计算 theta1/theta2 从编码器 (正运动学的逆操作)
+            hip_motor = left_state.get('hip', 0)
+            knee_motor = left_state.get('knee', 0)
+            theta1 = hip_motor - left_hip_offset
+            theta2 = knee_motor - left_knee_offset
+            self.left_theta1_label.setText(f"{theta1:.1f}")
+            self.left_theta2_label.setText(f"{theta2:.1f}")
+        
+        if right_state:
+            self.right_length_label.setText(f"{right_state.get('length', 0):.3f}")
+            self.right_angle_label.setText(f"{right_state.get('angle', 0):.1f}")
+            self.right_hip_label.setText(f"{right_state.get('hip', 0):.1f}")
+            self.right_knee_label.setText(f"{right_state.get('knee', 0):.1f}")
+            
+            # 计算 theta1/theta2 从编码器 (右腿镜像)
+            hip_motor = right_state.get('hip', 0)
+            knee_motor = right_state.get('knee', 0)
+            # 右腿镜像: theta = -(motor - offset)
+            theta1 = -(hip_motor - right_hip_offset)
+            theta2 = -(knee_motor - right_knee_offset)
+            self.right_theta1_label.setText(f"{theta1:.1f}")
+            self.right_theta2_label.setText(f"{theta2:.1f}")
+    
+    def update_test_result(self, result_text):
+        """更新测试结果显示"""
+        self.test_result_label.setText(result_text)
+        if "failed" in result_text.lower() or "error" in result_text.lower():
+            self.test_result_label.setStyleSheet("font-size: 12px; color: #ff4444; background-color: #1a1a2e; padding: 8px;")
+        else:
+            self.test_result_label.setStyleSheet("font-size: 12px; color: #00ff00; background-color: #1a1a2e; padding: 8px;")
 
 
 # ============================================================================
@@ -1487,6 +1842,33 @@ class BalanceControlPanel(QWidget):
         enable_group.setLayout(enable_layout)
         layout.addWidget(enable_group)
         
+        # Roll 控制 (从腿部面板移过来，属于平衡控制)
+        roll_group = QGroupBox("Roll 平衡控制 (侧倾补偿)")
+        roll_layout = QHBoxLayout()
+        
+        self.roll_status = QLabel("状态: 未知")
+        self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        roll_layout.addWidget(self.roll_status)
+        
+        roll_layout.addStretch()
+        
+        self.roll_on_btn = QPushButton("✅ 开启 Roll")
+        self.roll_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
+        self.roll_on_btn.clicked.connect(lambda: self.send_roll_cmd("on"))
+        roll_layout.addWidget(self.roll_on_btn)
+        
+        self.roll_off_btn = QPushButton("❌ 关闭 Roll")
+        self.roll_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
+        self.roll_off_btn.clicked.connect(lambda: self.send_roll_cmd("off"))
+        roll_layout.addWidget(self.roll_off_btn)
+        
+        self.roll_status_btn = QPushButton("📊 状态")
+        self.roll_status_btn.clicked.connect(lambda: self.send_cmd("balance roll"))
+        roll_layout.addWidget(self.roll_status_btn)
+        
+        roll_group.setLayout(roll_layout)
+        layout.addWidget(roll_group)
+        
         # 角度零点设置
         zero_group = QGroupBox("角度零点设置")
         zero_layout = QHBoxLayout()
@@ -1535,6 +1917,123 @@ class BalanceControlPanel(QWidget):
         plot_group.setLayout(plot_layout)
         layout.addWidget(plot_group)
         
+        # ========== 环路调试控制 (新增) ==========
+        loop_group = QGroupBox("🔧 环路调试 (单环/组合调试)")
+        loop_layout = QVBoxLayout()
+        
+        # 说明标签
+        loop_desc = QLabel("LQR控制环: A=角度环 B=角速度环 C=位移环 D=速度环 H=总输出 | Y=Yaw转向")
+        loop_desc.setStyleSheet("color: #888; font-size: 11px;")
+        loop_layout.addWidget(loop_desc)
+        
+        # 预设组合
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("快捷预设:"))
+        
+        self.loop_full_btn = QPushButton("🟢 全开 (Full)")
+        self.loop_full_btn.setToolTip("启用所有环路: ABCDHY")
+        self.loop_full_btn.clicked.connect(lambda: self.set_loop_preset("full"))
+        preset_layout.addWidget(self.loop_full_btn)
+        
+        self.loop_simple_btn = QPushButton("🟡 简单 (AB)")
+        self.loop_simple_btn.setToolTip("仅角度+角速度环: A+B")
+        self.loop_simple_btn.clicked.connect(lambda: self.set_loop_preset("simple"))
+        preset_layout.addWidget(self.loop_simple_btn)
+        
+        self.loop_none_btn = QPushButton("🔴 全关")
+        self.loop_none_btn.setToolTip("关闭所有环路 (电机无输出)")
+        self.loop_none_btn.clicked.connect(lambda: self.set_loop_preset("none"))
+        preset_layout.addWidget(self.loop_none_btn)
+        
+        self.loop_status_btn = QPushButton("📊 状态")
+        self.loop_status_btn.clicked.connect(lambda: self.send_cmd("balance loop status"))
+        preset_layout.addWidget(self.loop_status_btn)
+        
+        loop_layout.addLayout(preset_layout)
+        
+        # 分隔线
+        line1 = QFrame()
+        line1.setFrameShape(QFrame.HLine)
+        line1.setStyleSheet("color: #444;")
+        loop_layout.addWidget(line1)
+        
+        # 各环路独立开关 - LQR 内环
+        lqr_label = QLabel("LQR 平衡环 (Pitch):")
+        lqr_label.setStyleSheet("font-weight: bold;")
+        loop_layout.addWidget(lqr_label)
+        
+        lqr_layout = QHBoxLayout()
+        
+        # 初始化环路复选框字典
+        self.loop_checks = {}
+        
+        loop_items = [
+            ("A", "角度环", "控制俯仰角度"),
+            ("B", "角速度环", "控制俯仰角速度"),
+            ("C", "位移环", "控制位置/距离"),
+            ("D", "速度环", "控制车轮速度"),
+            ("H", "总输出", "LQR控制器输出"),
+        ]
+        
+        for code, name, tip in loop_items:
+            cb = QCheckBox(f"{code}:{name}")
+            cb.setToolTip(tip)
+            cb.setChecked(True)  # 默认全开
+            cb.stateChanged.connect(lambda state, c=code: self.on_loop_toggle(c, state))
+            self.loop_checks[code] = cb
+            lqr_layout.addWidget(cb)
+        
+        loop_layout.addLayout(lqr_layout)
+        
+        # Yaw 转向控制 (独立于 LQR)
+        yaw_layout = QHBoxLayout()
+        yaw_label = QLabel("转向控制:")
+        yaw_label.setStyleSheet("font-weight: bold;")
+        yaw_layout.addWidget(yaw_label)
+        
+        cb_yaw = QCheckBox("Y:Yaw转向")
+        cb_yaw.setToolTip("控制原地转向/航向保持")
+        cb_yaw.setChecked(True)
+        cb_yaw.stateChanged.connect(lambda state: self.on_loop_toggle("Y", state))
+        self.loop_checks["Y"] = cb_yaw
+        yaw_layout.addWidget(cb_yaw)
+        
+        yaw_layout.addStretch()
+        loop_layout.addLayout(yaw_layout)
+        
+        # 分隔线
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        line2.setStyleSheet("color: #444;")
+        loop_layout.addWidget(line2)
+        
+        # 增益精调 (高级)
+        gain_label = QLabel("增益精调 (0.0-1.0):")
+        gain_label.setStyleSheet("font-size: 11px; color: #888;")
+        loop_layout.addWidget(gain_label)
+        
+        gain_layout = QHBoxLayout()
+        self.gain_loop_combo = QComboBox()
+        self.gain_loop_combo.addItems(["A:角度", "B:角速度", "C:位移", "D:速度", "H:总输出", "Y:Yaw"])
+        gain_layout.addWidget(self.gain_loop_combo)
+        
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(0.0, 1.0)
+        self.gain_spin.setSingleStep(0.1)
+        self.gain_spin.setValue(1.0)
+        self.gain_spin.setDecimals(2)
+        gain_layout.addWidget(self.gain_spin)
+        
+        self.gain_set_btn = QPushButton("设置增益")
+        self.gain_set_btn.clicked.connect(self.set_loop_gain)
+        gain_layout.addWidget(self.gain_set_btn)
+        
+        gain_layout.addStretch()
+        loop_layout.addLayout(gain_layout)
+        
+        loop_group.setLayout(loop_layout)
+        layout.addWidget(loop_group)
+        
         # 状态显示
         status_group = QGroupBox("当前状态")
         status_layout = QGridLayout()
@@ -1557,11 +2056,222 @@ class BalanceControlPanel(QWidget):
         status_group.setLayout(status_layout)
         layout.addWidget(status_group)
         
+        # ========== 任务频率监控 (新增) ==========
+        freq_group = QGroupBox("📈 任务频率监控")
+        freq_layout = QGridLayout()
+        
+        # 表头
+        freq_layout.addWidget(QLabel("任务"), 0, 0)
+        freq_layout.addWidget(QLabel("目标频率"), 0, 1)
+        freq_layout.addWidget(QLabel("实际频率"), 0, 2)
+        freq_layout.addWidget(QLabel("状态"), 0, 3)
+        
+        # IMU 读取
+        freq_layout.addWidget(QLabel("IMU 读取:"), 1, 0)
+        freq_layout.addWidget(QLabel("200 Hz"), 1, 1)
+        self.freq_imu_label = QLabel("-- Hz")
+        self.freq_imu_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        freq_layout.addWidget(self.freq_imu_label, 1, 2)
+        self.freq_imu_status = QLabel("--")
+        freq_layout.addWidget(self.freq_imu_status, 1, 3)
+        
+        # 平衡控制
+        freq_layout.addWidget(QLabel("平衡控制:"), 2, 0)
+        freq_layout.addWidget(QLabel("200 Hz"), 2, 1)
+        self.freq_ctrl_label = QLabel("-- Hz")
+        self.freq_ctrl_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        freq_layout.addWidget(self.freq_ctrl_label, 2, 2)
+        self.freq_ctrl_status = QLabel("--")
+        freq_layout.addWidget(self.freq_ctrl_status, 2, 3)
+        
+        # 电机通信 (轮)
+        freq_layout.addWidget(QLabel("轮电机通信:"), 3, 0)
+        freq_layout.addWidget(QLabel("500 Hz"), 3, 1)
+        self.freq_motor_label = QLabel("-- Hz")
+        self.freq_motor_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        freq_layout.addWidget(self.freq_motor_label, 3, 2)
+        self.freq_motor_status = QLabel("--")
+        freq_layout.addWidget(self.freq_motor_status, 3, 3)
+        
+        # 腿电机
+        freq_layout.addWidget(QLabel("腿电机控制:"), 4, 0)
+        freq_layout.addWidget(QLabel("50 Hz"), 4, 1)
+        self.freq_leg_label = QLabel("-- Hz")
+        self.freq_leg_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        freq_layout.addWidget(self.freq_leg_label, 4, 2)
+        self.freq_leg_status = QLabel("--")
+        freq_layout.addWidget(self.freq_leg_status, 4, 3)
+        
+        # 刷新按钮
+        freq_btn_layout = QHBoxLayout()
+        self.freq_refresh_btn = QPushButton("🔄 刷新频率")
+        self.freq_refresh_btn.clicked.connect(self.refresh_task_freq)
+        freq_btn_layout.addWidget(self.freq_refresh_btn)
+        
+        self.freq_auto_check = QCheckBox("自动刷新 (1秒)")
+        self.freq_auto_check.setChecked(False)
+        self.freq_auto_check.stateChanged.connect(self.toggle_auto_freq_refresh)
+        freq_btn_layout.addWidget(self.freq_auto_check)
+        
+        freq_btn_layout.addStretch()
+        
+        freq_v_layout = QVBoxLayout()
+        freq_v_layout.addLayout(freq_layout)
+        freq_v_layout.addLayout(freq_btn_layout)
+        freq_group.setLayout(freq_v_layout)
+        layout.addWidget(freq_group)
+        
+        # 创建自动刷新定时器
+        self.freq_timer = QTimer()
+        self.freq_timer.timeout.connect(self.refresh_task_freq)
+        
+        # ========== 延迟诊断面板 (紧凑版) ==========
+        latency_group = QGroupBox("⏱️ 延迟诊断")
+        latency_group.setStyleSheet("QGroupBox { font-size: 11px; }")
+        latency_layout = QGridLayout()
+        latency_layout.setSpacing(2)  # 减小间距
+        
+        # 小字号样式
+        small_label_style = "font-size: 10px;"
+        small_value_style = "font-size: 10px; font-weight: bold; color: #00ccff;"
+        
+        # 表头
+        for col, text in enumerate(["延迟项", "us", "ms", "状态"]):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(small_label_style + "color: #888;")
+            latency_layout.addWidget(lbl, 0, col)
+        
+        # IMU -> 控制
+        lbl = QLabel("IMU→Ctrl:")
+        lbl.setStyleSheet(small_label_style)
+        latency_layout.addWidget(lbl, 1, 0)
+        self.latency_imu_ctrl_us = QLabel("--")
+        self.latency_imu_ctrl_us.setStyleSheet(small_value_style)
+        latency_layout.addWidget(self.latency_imu_ctrl_us, 1, 1)
+        self.latency_imu_ctrl_ms = QLabel("--")
+        self.latency_imu_ctrl_ms.setStyleSheet(small_label_style)
+        latency_layout.addWidget(self.latency_imu_ctrl_ms, 1, 2)
+        self.latency_imu_ctrl_status = QLabel("--")
+        self.latency_imu_ctrl_status.setStyleSheet(small_label_style)
+        latency_layout.addWidget(self.latency_imu_ctrl_status, 1, 3)
+        
+        # 控制计算
+        lbl = QLabel("计算:")
+        lbl.setStyleSheet(small_label_style)
+        latency_layout.addWidget(lbl, 2, 0)
+        self.latency_ctrl_calc_us = QLabel("--")
+        self.latency_ctrl_calc_us.setStyleSheet(small_value_style)
+        latency_layout.addWidget(self.latency_ctrl_calc_us, 2, 1)
+        self.latency_ctrl_calc_ms = QLabel("--")
+        self.latency_ctrl_calc_ms.setStyleSheet(small_label_style)
+        latency_layout.addWidget(self.latency_ctrl_calc_ms, 2, 2)
+        self.latency_ctrl_calc_status = QLabel("--")
+        self.latency_ctrl_calc_status.setStyleSheet(small_label_style)
+        latency_layout.addWidget(self.latency_ctrl_calc_status, 2, 3)
+        
+        # 控制 -> 电机
+        lbl = QLabel("Ctrl→Motor:")
+        lbl.setStyleSheet(small_label_style)
+        latency_layout.addWidget(lbl, 3, 0)
+        self.latency_ctrl_motor_us = QLabel("--")
+        self.latency_ctrl_motor_us.setStyleSheet(small_value_style)
+        latency_layout.addWidget(self.latency_ctrl_motor_us, 3, 1)
+        self.latency_ctrl_motor_ms = QLabel("--")
+        self.latency_ctrl_motor_ms.setStyleSheet(small_label_style)
+        latency_layout.addWidget(self.latency_ctrl_motor_ms, 3, 2)
+        self.latency_ctrl_motor_status = QLabel("--")
+        self.latency_ctrl_motor_status.setStyleSheet(small_label_style)
+        latency_layout.addWidget(self.latency_ctrl_motor_status, 3, 3)
+        
+        # 总延迟 (稍大字号)
+        lbl = QLabel("📊 IMU总延迟:")
+        lbl.setStyleSheet("font-size: 11px; font-weight: bold;")
+        latency_layout.addWidget(lbl, 4, 0)
+        self.latency_total_us = QLabel("--")
+        self.latency_total_us.setStyleSheet("font-size: 12px; font-weight: bold; color: #ffcc00;")
+        latency_layout.addWidget(self.latency_total_us, 4, 1)
+        self.latency_total_ms = QLabel("--")
+        self.latency_total_ms.setStyleSheet("font-size: 12px; font-weight: bold; color: #ffcc00;")
+        latency_layout.addWidget(self.latency_total_ms, 4, 2)
+        self.latency_total_status = QLabel("--")
+        self.latency_total_status.setStyleSheet("font-size: 10px; font-weight: bold;")
+        latency_layout.addWidget(self.latency_total_status, 4, 3)
+        
+        # 统计信息
+        lbl = QLabel("Avg/Min/Max:")
+        lbl.setStyleSheet(small_label_style + "color: #888;")
+        latency_layout.addWidget(lbl, 5, 0)
+        self.latency_stats_label = QLabel("-- / -- / --")
+        self.latency_stats_label.setStyleSheet(small_value_style)
+        latency_layout.addWidget(self.latency_stats_label, 5, 1, 1, 3)
+        
+        # WiFi 延迟 (合并显示)
+        lbl = QLabel("📶 WiFi延迟:")
+        lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #00aaff;")
+        latency_layout.addWidget(lbl, 6, 0)
+        self.wifi_latency_total_us = QLabel("--")
+        self.wifi_latency_total_us.setStyleSheet("font-size: 12px; font-weight: bold; color: #00ff88;")
+        latency_layout.addWidget(self.wifi_latency_total_us, 6, 1)
+        self.wifi_latency_total_ms = QLabel("--")
+        self.wifi_latency_total_ms.setStyleSheet("font-size: 12px; color: #00ff88;")
+        latency_layout.addWidget(self.wifi_latency_total_ms, 6, 2)
+        self.wifi_latency_status = QLabel("--")
+        self.wifi_latency_status.setStyleSheet("font-size: 10px;")
+        latency_layout.addWidget(self.wifi_latency_status, 6, 3)
+        
+        lbl = QLabel("WiFi统计:")
+        lbl.setStyleSheet(small_label_style + "color: #888;")
+        latency_layout.addWidget(lbl, 7, 0)
+        self.wifi_latency_stats_label = QLabel("-- / -- / --")
+        self.wifi_latency_stats_label.setStyleSheet(small_value_style)
+        latency_layout.addWidget(self.wifi_latency_stats_label, 7, 1, 1, 3)
+        
+        # 按钮行 (紧凑)
+        latency_btn_layout = QHBoxLayout()
+        self.latency_refresh_btn = QPushButton("刷新")
+        self.latency_refresh_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.latency_refresh_btn.clicked.connect(self.refresh_latency)
+        latency_btn_layout.addWidget(self.latency_refresh_btn)
+        
+        self.latency_auto_check = QCheckBox("自动")
+        self.latency_auto_check.setStyleSheet("font-size: 10px;")
+        self.latency_auto_check.setChecked(False)
+        self.latency_auto_check.stateChanged.connect(self.toggle_auto_latency_refresh)
+        latency_btn_layout.addWidget(self.latency_auto_check)
+        
+        latency_btn_layout.addStretch()
+        
+        latency_v_layout = QVBoxLayout()
+        latency_v_layout.setSpacing(2)
+        latency_v_layout.addLayout(latency_layout)
+        latency_v_layout.addLayout(latency_btn_layout)
+        latency_group.setLayout(latency_v_layout)
+        layout.addWidget(latency_group)
+        
+        # 创建延迟自动刷新定时器
+        self.latency_timer = QTimer()
+        self.latency_timer.timeout.connect(self.refresh_latency)
+        
         layout.addStretch()
     
     def send_cmd(self, cmd):
         if self.parent_window and self.parent_window.is_connected():
             self.parent_window.send_command(cmd)
+    
+    def send_roll_cmd(self, state):
+        """发送 Roll 控制命令"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        cmd = f"balance roll {state}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+            if state == "on":
+                self.roll_status.setText("状态: 已开启")
+                self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+            else:
+                self.roll_status.setText("状态: 已关闭")
+                self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
     
     def do_balance_init(self):
         self.send_cmd("balance init")
@@ -1577,6 +2287,482 @@ class BalanceControlPanel(QWidget):
         self.init_status.setStyleSheet("color: green; font-weight: bold;")
         self.sys_status_label.setText("就绪")
         self.sys_status_label.setStyleSheet("font-weight: bold; color: green;")
+    
+    def set_loop_preset(self, preset):
+        """设置环路预设"""
+        self.send_cmd(f"balance loop {preset}")
+        # 更新复选框状态
+        if preset == "full":
+            for cb in self.loop_checks.values():
+                cb.blockSignals(True)
+                cb.setChecked(True)
+                cb.blockSignals(False)
+        elif preset == "none":
+            for cb in self.loop_checks.values():
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.blockSignals(False)
+        elif preset == "simple":
+            # simple = A + B only
+            simple_on = {"A", "B"}
+            for code, cb in self.loop_checks.items():
+                cb.blockSignals(True)
+                cb.setChecked(code in simple_on)
+                cb.blockSignals(False)
+    
+    def on_loop_toggle(self, loop_code, state):
+        """单个环路开关切换"""
+        if state == Qt.Checked:
+            self.send_cmd(f"balance loop {loop_code} on")
+        else:
+            self.send_cmd(f"balance loop {loop_code} off")
+    
+    def set_loop_gain(self):
+        """设置环路增益"""
+        loop_text = self.gain_loop_combo.currentText()
+        loop_code = loop_text.split(":")[0]  # "A:角度" -> "A"
+        gain = self.gain_spin.value()
+        self.send_cmd(f"balance loop {loop_code} {gain}")
+    
+    def refresh_task_freq(self):
+        """刷新任务频率"""
+        self.send_cmd("balance freq")
+    
+    def refresh_latency(self):
+        """刷新延迟诊断"""
+        self.send_cmd("balance latency")
+    
+    def toggle_auto_freq_refresh(self, state):
+        """切换自动刷新"""
+        if state == Qt.Checked:
+            self.freq_timer.start(1000)  # 1秒刷新一次
+        else:
+            self.freq_timer.stop()
+    
+    def toggle_auto_latency_refresh(self, state):
+        """切换延迟自动刷新"""
+        if state == Qt.Checked:
+            self.latency_timer.start(1000)  # 1秒刷新一次
+        else:
+            self.latency_timer.stop()
+    
+    def update_task_freq(self, imu_hz, ctrl_hz, motor_hz, leg_hz):
+        """更新任务频率显示 (由主窗口解析串口数据后调用)"""
+        # IMU
+        self.freq_imu_label.setText(f"{imu_hz:.1f} Hz")
+        self._update_freq_status(self.freq_imu_status, imu_hz, 200, 10)
+        
+        # Control
+        self.freq_ctrl_label.setText(f"{ctrl_hz:.1f} Hz")
+        self._update_freq_status(self.freq_ctrl_status, ctrl_hz, 200, 10)
+        
+        # Motor
+        self.freq_motor_label.setText(f"{motor_hz:.1f} Hz")
+        self._update_freq_status(self.freq_motor_status, motor_hz, 500, 25)
+        
+        # Leg
+        self.freq_leg_label.setText(f"{leg_hz:.1f} Hz")
+        self._update_freq_status(self.freq_leg_status, leg_hz, 50, 5)
+    
+    def _update_freq_status(self, label, actual, target, tolerance):
+        """更新频率状态指示"""
+        if actual == 0:
+            label.setText("⚫ 停止")
+            label.setStyleSheet("color: gray;")
+        elif abs(actual - target) <= tolerance:
+            label.setText("🟢 正常")
+            label.setStyleSheet("color: #00ff00;")
+        elif actual < target - tolerance:
+            label.setText("🟡 偏低")
+            label.setStyleSheet("color: #ffaa00;")
+        else:
+            label.setText("🔴 偏高")
+            label.setStyleSheet("color: #ff4444;")
+    
+    def update_latency(self, imu_to_ctrl_us, ctrl_calc_us, ctrl_to_motor_us, total_us, avg_us=None, min_us=None, max_us=None):
+        """更新延迟显示 (由主窗口解析串口数据后调用)"""
+        # IMU -> 控制
+        self.latency_imu_ctrl_us.setText(f"{imu_to_ctrl_us:.0f} us")
+        self.latency_imu_ctrl_ms.setText(f"{imu_to_ctrl_us/1000:.2f} ms")
+        self._update_latency_status(self.latency_imu_ctrl_status, imu_to_ctrl_us, 3000, 5000)
+        
+        # 控制计算
+        self.latency_ctrl_calc_us.setText(f"{ctrl_calc_us:.0f} us")
+        self.latency_ctrl_calc_ms.setText(f"{ctrl_calc_us/1000:.2f} ms")
+        self._update_latency_status(self.latency_ctrl_calc_status, ctrl_calc_us, 500, 1000)
+        
+        # 控制 -> 电机
+        self.latency_ctrl_motor_us.setText(f"{ctrl_to_motor_us:.0f} us")
+        self.latency_ctrl_motor_ms.setText(f"{ctrl_to_motor_us/1000:.2f} ms")
+        self._update_latency_status(self.latency_ctrl_motor_status, ctrl_to_motor_us, 3000, 5000)
+        
+        # 总延迟
+        self.latency_total_us.setText(f"{total_us:.0f} us")
+        self.latency_total_ms.setText(f"{total_us/1000:.2f} ms")
+        self._update_latency_status(self.latency_total_status, total_us, 5000, 10000)
+        
+        # 统计信息
+        if avg_us is not None and min_us is not None and max_us is not None:
+            self.latency_stats_label.setText(f"{avg_us:.0f} / {min_us:.0f} / {max_us:.0f} us")
+            # 根据最大值设置颜色
+            if max_us <= 8000:
+                self.latency_stats_label.setStyleSheet("font-weight: bold; color: #00ff00;")
+            elif max_us <= 15000:
+                self.latency_stats_label.setStyleSheet("font-weight: bold; color: #ffaa00;")
+            else:
+                self.latency_stats_label.setStyleSheet("font-weight: bold; color: #ff4444;")
+    
+    def update_wifi_latency(self, wifi_ctrl_us, total_us, avg_us, min_us, max_us):
+        """更新 WiFi 遥控延迟显示"""
+        # WiFi 总延迟
+        self.wifi_latency_total_us.setText(f"{total_us:.0f} us")
+        self.wifi_latency_total_ms.setText(f"{total_us/1000:.2f} ms")
+        # WiFi 延迟阈值: < 20ms 优秀, < 50ms 正常
+        self._update_latency_status(self.wifi_latency_status, total_us, 20000, 50000)
+        
+        # 统计信息
+        self.wifi_latency_stats_label.setText(f"{avg_us:.0f} / {min_us:.0f} / {max_us:.0f} us")
+        if max_us <= 30000:
+            self.wifi_latency_stats_label.setStyleSheet("font-weight: bold; color: #00ff00;")
+        elif max_us <= 80000:
+            self.wifi_latency_stats_label.setStyleSheet("font-weight: bold; color: #ffaa00;")
+        else:
+            self.wifi_latency_stats_label.setStyleSheet("font-weight: bold; color: #ff4444;")
+    
+    def _update_latency_status(self, label, us_value, good_threshold, warn_threshold):
+        """更新延迟状态指示"""
+        if us_value <= good_threshold:
+            label.setText("🟢 优秀")
+            label.setStyleSheet("color: #00ff00; font-weight: bold;")
+        elif us_value <= warn_threshold:
+            label.setText("🟡 正常")
+            label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+        else:
+            label.setText("🔴 需优化")
+            label.setStyleSheet("color: #ff4444; font-weight: bold;")
+
+
+# ============================================================================
+# YAW 调试面板 (独立标签页)
+# ============================================================================
+class YawDebugPanel(QWidget):
+    """YAW 转向调试面板 - 独立标签页"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # ========== 状态监控区 ==========
+        status_group = QGroupBox("🧭 YAW 状态监控")
+        status_layout = QGridLayout()
+        status_layout.setSpacing(10)
+        
+        # 样式定义
+        title_style = "font-size: 14px; font-weight: bold; color: #888;"
+        value_style = "font-size: 24px; font-weight: bold; color: #00ccff;"
+        unit_style = "font-size: 12px; color: #888;"
+        
+        # 第一行: 角度信息
+        row = 0
+        # 目标角度
+        lbl = QLabel("🎯 目标角度")
+        lbl.setStyleSheet(title_style)
+        status_layout.addWidget(lbl, row, 0, Qt.AlignCenter)
+        
+        # 当前角度
+        lbl = QLabel("📍 当前角度")
+        lbl.setStyleSheet(title_style)
+        status_layout.addWidget(lbl, row, 1, Qt.AlignCenter)
+        
+        # 角度误差
+        lbl = QLabel("⚠️ 角度误差")
+        lbl.setStyleSheet(title_style)
+        status_layout.addWidget(lbl, row, 2, Qt.AlignCenter)
+        
+        # 第二行: 角度数值
+        row = 1
+        self.yaw_target_angle = QLabel("--")
+        self.yaw_target_angle.setStyleSheet(value_style)
+        self.yaw_target_angle.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.yaw_target_angle, row, 0)
+        
+        self.yaw_current_angle = QLabel("--")
+        self.yaw_current_angle.setStyleSheet(value_style)
+        self.yaw_current_angle.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.yaw_current_angle, row, 1)
+        
+        self.yaw_angle_error = QLabel("--")
+        self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffcc00;")
+        self.yaw_angle_error.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.yaw_angle_error, row, 2)
+        
+        # 第三行: 控制信息标题
+        row = 2
+        lbl = QLabel("🔧 YAW 输出")
+        lbl.setStyleSheet(title_style)
+        status_layout.addWidget(lbl, row, 0, Qt.AlignCenter)
+        
+        lbl = QLabel("🔄 角速度")
+        lbl.setStyleSheet(title_style)
+        status_layout.addWidget(lbl, row, 1, Qt.AlignCenter)
+        
+        lbl = QLabel("📌 控制模式")
+        lbl.setStyleSheet(title_style)
+        status_layout.addWidget(lbl, row, 2, Qt.AlignCenter)
+        
+        # 第四行: 控制信息数值
+        row = 3
+        self.yaw_output = QLabel("--")
+        self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff8800;")
+        self.yaw_output.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.yaw_output, row, 0)
+        
+        self.yaw_rate = QLabel("--")
+        self.yaw_rate.setStyleSheet(value_style)
+        self.yaw_rate.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.yaw_rate, row, 1)
+        
+        self.yaw_holding_status = QLabel("--")
+        self.yaw_holding_status.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+        self.yaw_holding_status.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.yaw_holding_status, row, 2)
+        
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+        
+        # ========== 诊断区 ==========
+        diag_group = QGroupBox("💡 实时诊断")
+        diag_layout = QVBoxLayout()
+        
+        self.yaw_diagnosis = QLabel("等待数据...")
+        self.yaw_diagnosis.setStyleSheet("font-size: 16px; color: #aaa; padding: 10px;")
+        self.yaw_diagnosis.setWordWrap(True)
+        self.yaw_diagnosis.setAlignment(Qt.AlignCenter)
+        diag_layout.addWidget(self.yaw_diagnosis)
+        
+        diag_group.setLayout(diag_layout)
+        layout.addWidget(diag_group)
+        
+        # ========== 控制区 ==========
+        ctrl_group = QGroupBox("🎮 YAW 控制")
+        ctrl_layout = QHBoxLayout()
+        
+        # YAW 环开关
+        self.yaw_enable_btn = QPushButton("开启 YAW 环")
+        self.yaw_enable_btn.setStyleSheet("font-size: 14px; padding: 10px 20px; background-color: #44aa44;")
+        self.yaw_enable_btn.clicked.connect(lambda: self.send_cmd("balance loop Y on"))
+        ctrl_layout.addWidget(self.yaw_enable_btn)
+        
+        self.yaw_disable_btn = QPushButton("关闭 YAW 环")
+        self.yaw_disable_btn.setStyleSheet("font-size: 14px; padding: 10px 20px; background-color: #aa4444;")
+        self.yaw_disable_btn.clicked.connect(lambda: self.send_cmd("balance loop Y off"))
+        ctrl_layout.addWidget(self.yaw_disable_btn)
+        
+        # 重置 YAW 角度
+        self.yaw_reset_btn = QPushButton("重置目标角度")
+        self.yaw_reset_btn.setStyleSheet("font-size: 14px; padding: 10px 20px; background-color: #4488aa;")
+        self.yaw_reset_btn.clicked.connect(lambda: self.send_cmd("balance yaw reset"))
+        ctrl_layout.addWidget(self.yaw_reset_btn)
+        
+        ctrl_layout.addStretch()
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+        
+        # ========== PID 参数快捷调节 ==========
+        pid_group = QGroupBox("🔧 YAW PID 参数快捷调节")
+        pid_layout = QGridLayout()
+        
+        # YAW 角度 PID (E)
+        row = 0
+        lbl = QLabel("角度 PID (E):")
+        lbl.setStyleSheet("font-weight: bold;")
+        pid_layout.addWidget(lbl, row, 0)
+        
+        pid_layout.addWidget(QLabel("P:"), row, 1)
+        self.yaw_angle_p = QDoubleSpinBox()
+        self.yaw_angle_p.setRange(0, 100)
+        self.yaw_angle_p.setDecimals(3)
+        self.yaw_angle_p.setSingleStep(0.1)
+        pid_layout.addWidget(self.yaw_angle_p, row, 2)
+        
+        pid_layout.addWidget(QLabel("I:"), row, 3)
+        self.yaw_angle_i = QDoubleSpinBox()
+        self.yaw_angle_i.setRange(0, 100)
+        self.yaw_angle_i.setDecimals(3)
+        self.yaw_angle_i.setSingleStep(0.01)
+        pid_layout.addWidget(self.yaw_angle_i, row, 4)
+        
+        pid_layout.addWidget(QLabel("D:"), row, 5)
+        self.yaw_angle_d = QDoubleSpinBox()
+        self.yaw_angle_d.setRange(0, 100)
+        self.yaw_angle_d.setDecimals(3)
+        self.yaw_angle_d.setSingleStep(0.001)
+        pid_layout.addWidget(self.yaw_angle_d, row, 6)
+        
+        self.yaw_angle_set_btn = QPushButton("设置")
+        self.yaw_angle_set_btn.clicked.connect(self.set_yaw_angle_pid)
+        pid_layout.addWidget(self.yaw_angle_set_btn, row, 7)
+        
+        self.yaw_angle_read_btn = QPushButton("读取")
+        self.yaw_angle_read_btn.clicked.connect(lambda: self.send_cmd("E?"))
+        pid_layout.addWidget(self.yaw_angle_read_btn, row, 8)
+        
+        # YAW 角速度 PID (F)
+        row = 1
+        lbl = QLabel("角速度 PID (F):")
+        lbl.setStyleSheet("font-weight: bold;")
+        pid_layout.addWidget(lbl, row, 0)
+        
+        pid_layout.addWidget(QLabel("P:"), row, 1)
+        self.yaw_gyro_p = QDoubleSpinBox()
+        self.yaw_gyro_p.setRange(0, 100)
+        self.yaw_gyro_p.setDecimals(3)
+        self.yaw_gyro_p.setSingleStep(0.1)
+        pid_layout.addWidget(self.yaw_gyro_p, row, 2)
+        
+        pid_layout.addWidget(QLabel("I:"), row, 3)
+        self.yaw_gyro_i = QDoubleSpinBox()
+        self.yaw_gyro_i.setRange(0, 100)
+        self.yaw_gyro_i.setDecimals(3)
+        self.yaw_gyro_i.setSingleStep(0.01)
+        pid_layout.addWidget(self.yaw_gyro_i, row, 4)
+        
+        pid_layout.addWidget(QLabel("D:"), row, 5)
+        self.yaw_gyro_d = QDoubleSpinBox()
+        self.yaw_gyro_d.setRange(0, 100)
+        self.yaw_gyro_d.setDecimals(3)
+        self.yaw_gyro_d.setSingleStep(0.001)
+        pid_layout.addWidget(self.yaw_gyro_d, row, 6)
+        
+        self.yaw_gyro_set_btn = QPushButton("设置")
+        self.yaw_gyro_set_btn.clicked.connect(self.set_yaw_gyro_pid)
+        pid_layout.addWidget(self.yaw_gyro_set_btn, row, 7)
+        
+        self.yaw_gyro_read_btn = QPushButton("读取")
+        self.yaw_gyro_read_btn.clicked.connect(lambda: self.send_cmd("F?"))
+        pid_layout.addWidget(self.yaw_gyro_read_btn, row, 8)
+        
+        pid_group.setLayout(pid_layout)
+        layout.addWidget(pid_group)
+        
+        # ========== 说明区 ==========
+        help_group = QGroupBox("📚 YAW 控制说明")
+        help_layout = QVBoxLayout()
+        
+        help_text = QLabel("""
+<b>控制模式说明:</b>
+• <b>🔒 方向保持</b>: 遥控器松手时，自动锁定当前朝向，通过角度PID+角速度阻尼保持方向
+• <b>🔄 角速度跟踪</b>: 遥控器有输入时，跟踪目标角速度实现转弯
+
+<b>调参建议:</b>
+• 误差大但输出小 → 增大角度 P
+• 误差小但振荡 → 减小角度 P 或增大角速度 P (阻尼)
+• 转弯响应慢 → 增大角速度 P
+• 转弯时抖动 → 减小角速度 P
+
+<b>控制输出:</b> 左轮 = LQR_u + YAW输出, 右轮 = LQR_u - YAW输出
+        """)
+        help_text.setStyleSheet("font-size: 12px; color: #aaa;")
+        help_text.setWordWrap(True)
+        help_layout.addWidget(help_text)
+        
+        help_group.setLayout(help_layout)
+        layout.addWidget(help_group)
+        
+        layout.addStretch()
+    
+    def send_cmd(self, cmd):
+        if self.parent_window and self.parent_window.is_connected():
+            self.parent_window.send_command(cmd)
+            self.parent_window.log(f"发送: {cmd}")
+    
+    def set_yaw_angle_pid(self):
+        p = self.yaw_angle_p.value()
+        i = self.yaw_angle_i.value()
+        d = self.yaw_angle_d.value()
+        self.send_cmd(f"EP{p}")
+        self.send_cmd(f"EI{i}")
+        self.send_cmd(f"ED{d}")
+    
+    def set_yaw_gyro_pid(self):
+        p = self.yaw_gyro_p.value()
+        i = self.yaw_gyro_i.value()
+        d = self.yaw_gyro_d.value()
+        self.send_cmd(f"FP{p}")
+        self.send_cmd(f"FI{i}")
+        self.send_cmd(f"FD{d}")
+    
+    def update_yaw_debug(self, target_angle, current_angle, error, output, holding, yaw_rate):
+        """更新 YAW 调试数据"""
+        # 目标角度
+        self.yaw_target_angle.setText(f"{target_angle:.1f}°")
+        
+        # 当前角度
+        self.yaw_current_angle.setText(f"{current_angle:.1f}°")
+        
+        # 角度误差 (根据大小设置颜色)
+        self.yaw_angle_error.setText(f"{error:.2f}°")
+        if abs(error) < 1.0:
+            self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #00ff00;")
+        elif abs(error) < 5.0:
+            self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffcc00;")
+        else:
+            self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff4444;")
+        
+        # YAW 输出 (根据大小设置颜色)
+        self.yaw_output.setText(f"{output:.3f}")
+        if abs(output) < 0.1:
+            self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #00ff00;")
+        elif abs(output) < 0.5:
+            self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff8800;")
+        else:
+            self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff4444;")
+        
+        # 保持模式状态
+        if holding:
+            self.yaw_holding_status.setText("🔒 方向保持")
+            self.yaw_holding_status.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+        else:
+            self.yaw_holding_status.setText("🔄 角速度跟踪")
+            self.yaw_holding_status.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffaa00;")
+        
+        # 角速度
+        self.yaw_rate.setText(f"{yaw_rate:.2f} rad/s")
+        
+        # 诊断建议
+        diagnosis = self._diagnose_yaw(error, output, holding, yaw_rate)
+        self.yaw_diagnosis.setText(diagnosis)
+    
+    def _diagnose_yaw(self, error, output, holding, yaw_rate):
+        """根据 YAW 状态给出诊断建议"""
+        issues = []
+        
+        if holding:
+            # 方向保持模式下的诊断
+            if abs(error) > 5.0:
+                issues.append(f"❌ 误差大 ({error:.1f}°)，角度P可能太小")
+            if abs(error) > 1.0 and abs(output) < 0.05:
+                issues.append("❌ 有误差但输出小，检查角度P是否为0")
+            if abs(yaw_rate) > 0.5 and abs(output) < 0.1:
+                issues.append("⚠️ 角速度大但阻尼小，检查角速度P")
+            if abs(output) > 0.3 and abs(error) < 1.0:
+                issues.append("⚠️ 误差小但输出大，可能振荡，减小P")
+        else:
+            # 角速度跟踪模式
+            if abs(output) > 0.5:
+                issues.append("ℹ️ 转向输出较大")
+        
+        if not issues:
+            if holding:
+                return "✅ 方向保持正常 - 误差小，输出稳定"
+            else:
+                return "✅ 转向跟踪中 - 正在响应遥控器输入"
+        
+        return "\n".join(issues)
 
 
 # ============================================================================
@@ -1596,6 +2782,7 @@ class SensorPanel(QWidget):
         # 电源监控
         power_group = QGroupBox("⚡ 电源监控")
         power_layout = QVBoxLayout()
+        
         
         btn_layout = QHBoxLayout()
         self.power_btn = QPushButton("读取电源状态")
@@ -1766,6 +2953,10 @@ class PIDTunerUI(QMainWindow):
         self.speed_adaptive_panel = None
         self.debug_mode = False
         
+        # YAW 调试数据缓存
+        self._yaw_target_angle = 0.0
+        self._yaw_current_angle = 0.0
+        
         self.init_ui()
     
     def init_ui(self):
@@ -1853,8 +3044,8 @@ class PIDTunerUI(QMainWindow):
         self.tab_widget.addTab(self.speed_adaptive_panel, "M - 速度自适应P")
         
         # 腿部控制面板
-        self.leg_control_panel = LegControlPanel(self)
-        self.tab_widget.addTab(self.leg_control_panel, "🦿 腿部控制")
+        self.leg_panel = LegControlPanel(self)
+        self.tab_widget.addTab(self.leg_panel, "🦿 腿部控制")
         
         # Web监控面板
         self.web_monitor = WebMonitorPanel(self)
@@ -1864,6 +3055,10 @@ class PIDTunerUI(QMainWindow):
         # 平衡控制面板
         self.balance_panel = BalanceControlPanel(self)
         self.tab_widget.addTab(self.balance_panel, "🎮 平衡控制")
+        
+        # YAW 调试面板 (独立标签页)
+        self.yaw_panel = YawDebugPanel(self)
+        self.tab_widget.addTab(self.yaw_panel, "🧭 YAW调试")
         
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
@@ -2078,6 +3273,154 @@ class PIDTunerUI(QMainWindow):
                     self.motor_panel.update_motor_status(motor_id, pos, spd, cur, online)
             except:
                 pass
+        
+        # ===== 腿部运动学测试结果解析 =====
+        
+        # FK 测试结果: FK (left): Hip=xxx, Knee=xxx -> Length=xxxm, Angle=xxxdeg
+        fk_match = re.search(r'FK\s*\((\w+)\):\s*Hip=([-\d.]+),\s*Knee=([-\d.]+)\s*->\s*Length=([-\d.]+)m,\s*Angle=([-\d.]+)deg', line)
+        if fk_match:
+            side = fk_match.group(1)
+            hip = float(fk_match.group(2))
+            knee = float(fk_match.group(3))
+            length = float(fk_match.group(4))
+            angle = float(fk_match.group(5))
+            result = f"FK ({side}): Hip={hip:.1f}°, Knee={knee:.1f}° → L={length:.3f}m, θ={angle:.1f}°"
+            if hasattr(self, 'leg_panel'):
+                self.leg_panel.update_test_result(result)
+            self.log(f"✓ {result}", is_receive=True)
+        
+        # IK 测试结果: IK (left): Length=xxxm, Angle=xxxdeg -> Hip=xxx, Knee=xxx
+        ik_match = re.search(r'IK\s*\((\w+)\):\s*Length=([-\d.]+)m,\s*Angle=([-\d.]+)deg\s*->\s*Hip=([-\d.]+),\s*Knee=([-\d.]+)', line)
+        if ik_match:
+            side = ik_match.group(1)
+            length = float(ik_match.group(2))
+            angle = float(ik_match.group(3))
+            hip = float(ik_match.group(4))
+            knee = float(ik_match.group(5))
+            result = f"IK ({side}): L={length:.3f}m, θ={angle:.1f}° → Hip={hip:.1f}°, Knee={knee:.1f}°"
+            if hasattr(self, 'leg_panel'):
+                self.leg_panel.update_test_result(result)
+            self.log(f"✓ {result}", is_receive=True)
+        
+        # IK 失败: IK failed (target unreachable)
+        if "IK failed" in line or "target unreachable" in line:
+            if hasattr(self, 'leg_panel'):
+                self.leg_panel.update_test_result("❌ IK 失败: 目标不可达")
+            self.log(f"⚠ {line}", is_error=True)
+        
+        # FK 失败
+        if "FK failed" in line:
+            if hasattr(self, 'leg_panel'):
+                self.leg_panel.update_test_result("❌ FK 失败")
+            self.log(f"⚠ {line}", is_error=True)
+        
+        # 腿部状态解析: LEG_STATE: L_Len=xxx L_Ang=xxx L_Hip=xxx L_Knee=xxx R_Len=xxx ...
+        leg_state_match = re.search(
+            r'LEG_STATE:\s*L_Len=([-\d.]+)\s*L_Ang=([-\d.]+)\s*L_Hip=([-\d.]+)\s*L_Knee=([-\d.]+)\s*'
+            r'R_Len=([-\d.]+)\s*R_Ang=([-\d.]+)\s*R_Hip=([-\d.]+)\s*R_Knee=([-\d.]+)', line)
+        if leg_state_match:
+            try:
+                left_state = {
+                    'length': float(leg_state_match.group(1)),
+                    'angle': float(leg_state_match.group(2)),
+                    'hip': float(leg_state_match.group(3)),
+                    'knee': float(leg_state_match.group(4))
+                }
+                right_state = {
+                    'length': float(leg_state_match.group(5)),
+                    'angle': float(leg_state_match.group(6)),
+                    'hip': float(leg_state_match.group(7)),
+                    'knee': float(leg_state_match.group(8))
+                }
+                if hasattr(self, 'leg_panel'):
+                    self.leg_panel.update_leg_state(left_state, right_state)
+            except:
+                pass
+        
+        # 目标设置成功: Target set: Length=xxxm, Angle=xxxdeg
+        target_match = re.search(r'Target set:\s*Length=([-\d.]+)m,\s*Angle=([-\d.]+)deg', line)
+        if target_match:
+            self.log(f"✓ {line}", is_receive=True)
+        
+        # ===== 任务频率解析 =====
+        # 格式: FREQ:IMU=xxx,CTRL=xxx,MOTOR=xxx,LEG=xxx
+        freq_match = re.search(r'FREQ:IMU=([-\d.]+),CTRL=([-\d.]+),MOTOR=([-\d.]+),LEG=([-\d.]+)', line)
+        if freq_match:
+            try:
+                imu_hz = float(freq_match.group(1))
+                ctrl_hz = float(freq_match.group(2))
+                motor_hz = float(freq_match.group(3))
+                leg_hz = float(freq_match.group(4))
+                if hasattr(self, 'balance_panel'):
+                    self.balance_panel.update_task_freq(imu_hz, ctrl_hz, motor_hz, leg_hz)
+                self.log(f"📈 频率: IMU={imu_hz:.0f}Hz, Ctrl={ctrl_hz:.0f}Hz, Motor={motor_hz:.0f}Hz, Leg={leg_hz:.0f}Hz", is_receive=True)
+            except:
+                pass
+        
+        # ===== 延迟诊断解析 =====
+        # 格式: LATENCY:IMU_CTRL=xxx,CALC=xxx,CTRL_MOTOR=xxx,TOTAL=xxx,AVG=xxx,MIN=xxx,MAX=xxx
+        latency_match = re.search(r'LATENCY:IMU_CTRL=([-\d.]+),CALC=([-\d.]+),CTRL_MOTOR=([-\d.]+),TOTAL=([-\d.]+)(?:,AVG=([-\d.]+),MIN=([-\d.]+),MAX=([-\d.]+))?', line)
+        if latency_match:
+            try:
+                imu_ctrl_us = float(latency_match.group(1))
+                calc_us = float(latency_match.group(2))
+                ctrl_motor_us = float(latency_match.group(3))
+                total_us = float(latency_match.group(4))
+                # 可选的统计字段
+                avg_us = float(latency_match.group(5)) if latency_match.group(5) else total_us
+                min_us = float(latency_match.group(6)) if latency_match.group(6) else total_us
+                max_us = float(latency_match.group(7)) if latency_match.group(7) else total_us
+                if hasattr(self, 'balance_panel'):
+                    self.balance_panel.update_latency(imu_ctrl_us, calc_us, ctrl_motor_us, total_us, avg_us, min_us, max_us)
+                self.log(f"⏱️ IMU延迟: Total={total_us:.0f}us (Avg={avg_us:.0f}, Min={min_us:.0f}, Max={max_us:.0f}us)", is_receive=True)
+            except:
+                pass
+        
+        # ===== WiFi 遥控延迟解析 =====
+        # 格式: WIFI_LATENCY:WIFI_CTRL=xxx,TOTAL=xxx,AVG=xxx,MIN=xxx,MAX=xxx
+        wifi_latency_match = re.search(r'WIFI_LATENCY:WIFI_CTRL=([-\d.]+),TOTAL=([-\d.]+),AVG=([-\d.]+),MIN=([-\d.]+),MAX=([-\d.]+)', line)
+        if wifi_latency_match:
+            try:
+                wifi_ctrl_us = float(wifi_latency_match.group(1))
+                wifi_total_us = float(wifi_latency_match.group(2))
+                wifi_avg_us = float(wifi_latency_match.group(3))
+                wifi_min_us = float(wifi_latency_match.group(4))
+                wifi_max_us = float(wifi_latency_match.group(5))
+                if hasattr(self, 'balance_panel'):
+                    self.balance_panel.update_wifi_latency(wifi_ctrl_us, wifi_total_us, wifi_avg_us, wifi_min_us, wifi_max_us)
+                self.log(f"📶 WiFi延迟: Total={wifi_total_us:.0f}us (Avg={wifi_avg_us:.0f}, Min={wifi_min_us:.0f}, Max={wifi_max_us:.0f}us)", is_receive=True)
+            except:
+                pass
+        
+        # ===== YAW 调试数据解析 =====
+        # 格式: #YAW_DBG,out=xxx,err=xxx,hold=x,rate=xxx
+        yaw_dbg_match = re.search(r'#YAW_DBG,out=([-\d.]+),err=([-\d.]+),hold=(\d),rate=([-\d.]+)', line)
+        if yaw_dbg_match:
+            try:
+                yaw_output = float(yaw_dbg_match.group(1))
+                yaw_error = float(yaw_dbg_match.group(2))
+                yaw_holding = int(yaw_dbg_match.group(3)) == 1
+                yaw_rate = float(yaw_dbg_match.group(4))
+                # 更新 YAW 调试面板
+                if hasattr(self, 'yaw_panel'):
+                    self.yaw_panel.update_yaw_debug(
+                        self._yaw_target_angle, self._yaw_current_angle,
+                        yaw_error, yaw_output, yaw_holding, yaw_rate
+                    )
+            except:
+                pass
+            return  # 不在日志显示
+        
+        # 格式: #DATA,Y,target_angle,current_angle (YAW 角度数据)
+        if line.startswith("#DATA,Y,"):
+            parts = line.split(',')
+            if len(parts) == 4:
+                try:
+                    self._yaw_target_angle = float(parts[2].strip())
+                    self._yaw_current_angle = float(parts[3].strip())
+                except:
+                    pass
+            return  # 不在日志显示
     
     def log(self, msg, is_receive=False, is_error=False):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]

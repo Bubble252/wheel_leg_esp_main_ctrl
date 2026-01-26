@@ -8,6 +8,7 @@ idf_component_register(
         esp_http_server 
         esp_event 
         esp_netif 
+        esp_timer
         json 
         nvs_flash
     REQUIRES

@@ -19,6 +19,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"  // 用于精确时间测量
 #include "cJSON.h"
 #include "nvs_flash.h"
 #include "hal/brownout_ll.h"  // 用于禁用欠压检测
@@ -146,6 +147,7 @@ static void parse_json_command(const char *json_str) {
     
     // 更新时间戳和计数
     g_remote_data.last_update_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    g_remote_data.receive_time_us = esp_timer_get_time();  // 精确微秒时间戳
     g_remote_data.msg_count++;
     
     // 打印接收到的命令

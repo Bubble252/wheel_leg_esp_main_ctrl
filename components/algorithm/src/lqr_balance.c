@@ -276,7 +276,13 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     if (lqr_check_emergency(ctrl, input->pitch)) {
         ctrl->state = LQR_STATE_EMERGENCY;
         output->state = LQR_STATE_EMERGENCY;
-        ESP_LOGW(TAG, "Emergency stop! pitch=%.2f", input->pitch);
+        // 限流打印：每秒最多打印一次
+        static uint32_t last_emergency_log = 0;
+        uint32_t now = (uint32_t)(esp_log_timestamp());
+        if (now - last_emergency_log > 1000) {
+            ESP_LOGW(TAG, "Emergency stop! pitch=%.2f", input->pitch);
+            last_emergency_log = now;
+        }
         return ESP_ERR_INVALID_STATE;
     }
     

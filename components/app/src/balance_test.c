@@ -23,8 +23,10 @@
 #include "types.h"
 #include "can_motor.h"
 #include "imu_driver.h"
+#include "wit_reg.h"      // RRATE_200HZ 定义
 #include "wifi_remote.h"
 #include "lqr_balance.h"
+#include "leg_kinematics.h"
 #include "power_detect.h"
 #include "commander_parser.h"
 
@@ -48,9 +50,10 @@ static const char *TAG = "BAL_TEST";
 #undef IMU_READ_PERIOD_MS
 #undef BALANCE_CTRL_PERIOD_MS
 #undef MOTOR_COMM_PERIOD_MS
-#define IMU_READ_PERIOD_MS          2       // 500Hz IMU 读取
+#define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (≈300Hz)
 #define BALANCE_CTRL_PERIOD_MS      5       // 200Hz 平衡控制
-#define MOTOR_COMM_PERIOD_MS        2       // 500Hz 电机通信
+#define MOTOR_COMM_PERIOD_MS        5       // 200Hz 电机通信 (与控制同步)
+#define LEG_MOTOR_DIVIDER           4       // 腿电机分频 (200Hz / 4 = 50Hz)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 
 // 任务栈大小 - 覆盖 config.h 中的默认值
@@ -88,6 +91,7 @@ typedef struct {
     float yaw;              // 偏航角 (度)
     float yaw_rate;         // 偏航角速度 (度/秒)
     uint32_t timestamp;     // 时间戳 (ms)
+    uint64_t read_time_us;  // 精确读取时间 (us) - 用于延迟测量
     bool valid;             // 数据有效
 } shared_imu_data_t;
 
@@ -99,6 +103,7 @@ typedef struct {
     int16_t joy_y_last;     // 上一次摇杆 Y
     bool go;                // 使能开关
     uint32_t last_update;   // 最后更新时间 (ms)
+    uint64_t receive_time_us; // 精确接收时间 (us) - 用于延迟测量
 } shared_remote_data_t;
 
 // 轮电机命令 (由 task_balance_ctrl 写入, task_motor_comm 读取)
@@ -157,13 +162,39 @@ static bool g_tasks_running = false;
 static balance_test_stats_t g_stats = {0};
 static uint32_t g_imu_count_per_sec = 0;
 static uint32_t g_ctrl_count_per_sec = 0;
+static uint32_t g_motor_count_per_sec = 0;
+static uint32_t g_leg_count_per_sec = 0;
 static uint32_t g_last_stat_time = 0;
+
+// 延迟诊断 (微秒级) - 精确测量
+// 核心思路: 追踪实际被使用的 IMU 数据从读取到电机发送的真实延迟
+static volatile uint64_t g_used_imu_time_us = 0;      // 控制任务实际使用的 IMU 数据的读取时间
+static volatile uint64_t g_ctrl_start_time_us = 0;    // 控制计算开始时间
+static volatile uint64_t g_ctrl_end_time_us = 0;      // 控制计算结束时间
+static volatile uint64_t g_motor_send_time_us = 0;    // 电机命令发送时间
+static float g_latency_imu_to_ctrl_us = 0.0f;         // IMU数据等待时间 (数据读取 → 控制开始使用)
+static float g_latency_ctrl_calc_us = 0.0f;           // 控制计算耗时
+static float g_latency_ctrl_to_motor_us = 0.0f;       // 控制输出等待时间 (控制完成 → 电机发送)
+static float g_latency_total_us = 0.0f;               // 总延迟 (IMU读取 → 电机发送)
+static uint32_t g_latency_sample_count = 0;           // 延迟采样计数
+static float g_latency_total_avg_us = 0.0f;           // 总延迟平均值
+static float g_latency_total_max_us = 0.0f;           // 总延迟最大值
+static float g_latency_total_min_us = 999999.0f;      // 总延迟最小值
+
+// WiFi 遥控延迟诊断 (微秒级)
+static volatile uint64_t g_used_wifi_time_us = 0;     // 控制任务实际使用的 WiFi 数据的接收时间
+static float g_latency_wifi_to_ctrl_us = 0.0f;        // WiFi数据等待时间 (WiFi接收 → 控制使用)
+static float g_latency_wifi_total_us = 0.0f;          // WiFi总延迟 (WiFi接收 → 电机发送)
+static float g_latency_wifi_avg_us = 0.0f;            // WiFi延迟平均值
+static float g_latency_wifi_max_us = 0.0f;            // WiFi延迟最大值
+static float g_latency_wifi_min_us = 999999.0f;       // WiFi延迟最小值
+static uint32_t g_latency_wifi_sample_count = 0;      // WiFi延迟采样计数
 
 // LQR 内部状态 (来自 shibo_wheel_leg)
 static float g_lqr_distance = 0.0f;         // 累积位移 (机器人前进方向为正)
 static float g_lqr_speed = 0.0f;            // 当前速度 (机器人前进方向为正)
 static float g_distance_zeropoint = 0.0f;   // 位移零点
-static float g_angle_zeropoint = 7.4f;      // 角度零点 (需要根据实际机器人调整)
+static float g_angle_zeropoint = 0.0f;      // 角度零点 (需要根据实际机器人调整)
 static int g_move_stop_flag = 0;            // 停止标志
 static int g_uncontrolable = 0;             // 失控标志
 
@@ -179,8 +210,13 @@ static uint8_t g_plot_divider = 10;         // 输出分频 (每N次控制循环
 static uint8_t g_plot_counter = 0;          // 分频计数器
 static float g_last_lqr_u = 0.0f;           // 保存 LQR 输出用于波形显示
 
+// 环路使能控制 (用于单环调试)
+static uint8_t g_loop_enable_mask = LOOP_FULL;  // 默认全部启用
+static bool g_yaw_control_enabled = true;       // YAW 控制独立开关
+static bool g_loop_manual_mode = false;         // 手动模式 (禁止自动切换 simple/full)
+
 // ============================================================================
-// 腿部电机控制 (固定角度模式)
+// 腿部电机控制
 // ============================================================================
 static bool g_leg_control_enabled = false;  // 腿部电机使能
 static can_motor_handle_t g_motor_left_hip = NULL;    // ID=1 左大腿
@@ -188,12 +224,18 @@ static can_motor_handle_t g_motor_left_knee = NULL;   // ID=2 左小腿
 static can_motor_handle_t g_motor_right_hip = NULL;   // ID=4 右大腿
 static can_motor_handle_t g_motor_right_knee = NULL;  // ID=5 右小腿
 
-// 腿部电机目标角度 (度) - 可通过命令修改
+// 腿部电机目标角度 (度) - 由 leg_ctrl_init() 通过逆运动学计算
 static float g_leg_left_hip_angle = 0.0f;    // 左大腿角度
 static float g_leg_left_knee_angle = 0.0f;   // 左小腿角度
 static float g_leg_right_hip_angle = 0.0f;   // 右大腿角度
 static float g_leg_right_knee_angle = 0.0f;  // 右小腿角度
-static float g_leg_move_speed = 50.0f;       // 腿部电机运动速度 (rpm)
+static float g_leg_move_speed = 50.0f;        // 腿部电机运动速度 (rpm)
+
+// 腿部目标状态 (运动学空间)
+static float g_leg_left_target_length = 0.14f;   // 左腿目标腿长 (米)
+static float g_leg_left_target_angle = -90.0f;   // 左腿目标身体夹角 (度), -90=垂直向下
+static float g_leg_right_target_length = 0.14f;  // 右腿目标腿长 (米)
+static float g_leg_right_target_angle = -90.0f;  // 右腿目标身体夹角 (度), -90=垂直向下
 
 // Roll 闭环控制开关 (与腿长相关，纯轮测试时禁用)
 static bool g_roll_control_enabled = false;  // 默认禁用
@@ -501,6 +543,167 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     
     // K - Roll 角度: target=0, control=当前 Roll
     printf("#DATA,K,0.0,%.2f\n", input->roll);
+    
+    // YAW 调试输出 - target=目标角度, control=当前累积角度
+    printf("#DATA,Y,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
+    
+    // YAW 输出和状态
+    printf("#YAW_DBG,out=%.3f,err=%.2f,hold=%d,rate=%.2f\n", 
+           g_yaw_output, 
+           g_yaw_angle_total - g_lqr_ctrl.yaw_angle_target,
+           g_lqr_ctrl.yaw_holding ? 1 : 0,
+           input->yaw_rate);
+}
+
+// ============================================================================
+// 环路使能控制 (用于单环调试)
+// ============================================================================
+
+/**
+ * @brief 同步环路使能掩码到 LQR 控制器
+ */
+static void sync_loop_enable_to_lqr(void) {
+    if (!g_initialized) return;
+    
+    float angle_en    = (g_loop_enable_mask & LOOP_ANGLE)    ? 1.0f : 0.0f;
+    float gyro_en     = (g_loop_enable_mask & LOOP_GYRO)     ? 1.0f : 0.0f;
+    float distance_en = (g_loop_enable_mask & LOOP_DISTANCE) ? 1.0f : 0.0f;
+    float speed_en    = (g_loop_enable_mask & LOOP_SPEED)    ? 1.0f : 0.0f;
+    float lqr_u_en    = (g_loop_enable_mask & LOOP_LQR_U)    ? 1.0f : 0.0f;
+    
+    lqr_set_loop_enable(&g_lqr_ctrl, angle_en, gyro_en, distance_en, speed_en, lqr_u_en);
+    
+    // YAW 控制独立管理
+    bool yaw_was_enabled = g_yaw_control_enabled;
+    g_yaw_control_enabled = (g_loop_enable_mask & LOOP_YAW) ? true : false;
+    
+    // 如果 YAW 从关闭变为开启，重置状态
+    if (!yaw_was_enabled && g_yaw_control_enabled) {
+        g_lqr_ctrl.yaw_holding = false;
+        g_lqr_ctrl.yaw_angle_target = g_yaw_angle_total;
+        pid_reset(&g_lqr_ctrl.pid_yaw_angle);
+        pid_reset(&g_lqr_ctrl.pid_yaw_gyro);
+        ESP_LOGI(TAG, "YAW enabled via mask, target locked to %.2f", g_yaw_angle_total);
+    }
+}
+
+void balance_test_set_loop_enable(uint8_t mask) {
+    g_loop_enable_mask = mask;
+    sync_loop_enable_to_lqr();
+    
+    // 使用预设模式时退出手动模式
+    if (mask == LOOP_FULL || mask == LOOP_SIMPLE || mask == LOOP_NONE) {
+        g_loop_manual_mode = false;
+        ESP_LOGI(TAG, "Loop enable mask: 0x%02X (auto mode)", mask);
+    } else {
+        g_loop_manual_mode = true;
+        ESP_LOGI(TAG, "Loop enable mask: 0x%02X (manual mode)", mask);
+    }
+    balance_test_print_loop_status();
+}
+
+uint8_t balance_test_get_loop_enable(void) {
+    return g_loop_enable_mask;
+}
+
+void balance_test_set_loop_gain(loop_enable_mask_t loop, float enable) {
+    if (!g_initialized) return;
+    
+    // 进入手动模式 (禁止自动切换 simple/full)
+    g_loop_manual_mode = true;
+    
+    // Clamp to 0.0~1.0
+    if (enable < 0.0f) enable = 0.0f;
+    if (enable > 1.0f) enable = 1.0f;
+    
+    // 直接设置到 LQR 参数 (支持渐变)
+    switch (loop) {
+        case LOOP_ANGLE:
+            g_lqr_ctrl.params.angle_enable = enable;
+            if (enable > 0.5f) g_loop_enable_mask |= LOOP_ANGLE;
+            else g_loop_enable_mask &= ~LOOP_ANGLE;
+            break;
+        case LOOP_GYRO:
+            g_lqr_ctrl.params.gyro_enable = enable;
+            if (enable > 0.5f) g_loop_enable_mask |= LOOP_GYRO;
+            else g_loop_enable_mask &= ~LOOP_GYRO;
+            break;
+        case LOOP_DISTANCE:
+            g_lqr_ctrl.params.distance_enable = enable;
+            if (enable > 0.5f) g_loop_enable_mask |= LOOP_DISTANCE;
+            else g_loop_enable_mask &= ~LOOP_DISTANCE;
+            break;
+        case LOOP_SPEED:
+            g_lqr_ctrl.params.speed_enable = enable;
+            if (enable > 0.5f) g_loop_enable_mask |= LOOP_SPEED;
+            else g_loop_enable_mask &= ~LOOP_SPEED;
+            break;
+        case LOOP_LQR_U:
+            g_lqr_ctrl.params.lqr_u_enable = enable;
+            if (enable > 0.5f) g_loop_enable_mask |= LOOP_LQR_U;
+            else g_loop_enable_mask &= ~LOOP_LQR_U;
+            break;
+        case LOOP_YAW:
+            g_yaw_control_enabled = (enable > 0.5f);
+            if (enable > 0.5f) {
+                g_loop_enable_mask |= LOOP_YAW;
+                // 启用 YAW 时，重置状态，让它重新锁定当前角度
+                g_lqr_ctrl.yaw_holding = false;
+                g_lqr_ctrl.yaw_angle_target = g_yaw_angle_total;
+                pid_reset(&g_lqr_ctrl.pid_yaw_angle);
+                pid_reset(&g_lqr_ctrl.pid_yaw_gyro);
+                ESP_LOGI(TAG, "YAW enabled, target locked to %.2f", g_yaw_angle_total);
+            } else {
+                g_loop_enable_mask &= ~LOOP_YAW;
+            }
+            break;
+        default:
+            ESP_LOGW(TAG, "Unknown loop: 0x%02X", loop);
+            return;
+    }
+    
+    ESP_LOGI(TAG, "Loop 0x%02X gain set to %.2f (manual mode)", loop, enable);
+}
+
+float balance_test_get_loop_gain(loop_enable_mask_t loop) {
+    if (!g_initialized) return 0.0f;
+    
+    switch (loop) {
+        case LOOP_ANGLE:    return g_lqr_ctrl.params.angle_enable;
+        case LOOP_GYRO:     return g_lqr_ctrl.params.gyro_enable;
+        case LOOP_DISTANCE: return g_lqr_ctrl.params.distance_enable;
+        case LOOP_SPEED:    return g_lqr_ctrl.params.speed_enable;
+        case LOOP_LQR_U:    return g_lqr_ctrl.params.lqr_u_enable;
+        case LOOP_YAW:      return g_yaw_control_enabled ? 1.0f : 0.0f;
+        default:            return 0.0f;
+    }
+}
+
+void balance_test_print_loop_status(void) {
+    printf("\n=== Loop Enable Status ===\n");
+    printf("Mode: %s\n", g_loop_manual_mode ? "MANUAL (user control)" : "AUTO (simple/full switch)");
+    printf("  [%c] A - Angle (pitch)      : %.2f\n", 
+           (g_loop_enable_mask & LOOP_ANGLE) ? 'X' : ' ',
+           g_initialized ? g_lqr_ctrl.params.angle_enable : 0.0f);
+    printf("  [%c] B - Gyro (pitch_rate)  : %.2f\n", 
+           (g_loop_enable_mask & LOOP_GYRO) ? 'X' : ' ',
+           g_initialized ? g_lqr_ctrl.params.gyro_enable : 0.0f);
+    printf("  [%c] C - Distance           : %.2f\n", 
+           (g_loop_enable_mask & LOOP_DISTANCE) ? 'X' : ' ',
+           g_initialized ? g_lqr_ctrl.params.distance_enable : 0.0f);
+    printf("  [%c] D - Speed              : %.2f\n", 
+           (g_loop_enable_mask & LOOP_SPEED) ? 'X' : ' ',
+           g_initialized ? g_lqr_ctrl.params.speed_enable : 0.0f);
+    printf("  [%c] H - LQR_U (integral)   : %.2f\n", 
+           (g_loop_enable_mask & LOOP_LQR_U) ? 'X' : ' ',
+           g_initialized ? g_lqr_ctrl.params.lqr_u_enable : 0.0f);
+    printf("  [%c] Y - YAW (turning)      : %s\n", 
+           (g_loop_enable_mask & LOOP_YAW) ? 'X' : ' ',
+           g_yaw_control_enabled ? "ON" : "OFF");
+    printf("==========================\n");
+    printf("Mask: 0x%02X\n", g_loop_enable_mask);
+    printf("Presets: simple=0x03, full=0x3F\n");
+    printf("Tip: Use 'balance loop full' to return to auto mode\n\n");
 }
 
 // ============================================================================
@@ -514,23 +717,40 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
 void balance_test_set_leg_control(bool enable) {
     if (enable && !g_leg_control_enabled) {
         // 使能腿部电机
+        int enabled_count = 0;
         if (g_motor_left_hip) {
             can_motor_set_mode(g_motor_left_hip, MODE_POS_FILTER);
             can_motor_enter_closed_loop(g_motor_left_hip);
+            ESP_LOGI(TAG, "  Left Hip (ID1) enabled");
+            enabled_count++;
+        } else {
+            ESP_LOGW(TAG, "  Left Hip (ID1) NOT available");
         }
         if (g_motor_left_knee) {
             can_motor_set_mode(g_motor_left_knee, MODE_POS_FILTER);
             can_motor_enter_closed_loop(g_motor_left_knee);
+            ESP_LOGI(TAG, "  Left Knee (ID2) enabled");
+            enabled_count++;
+        } else {
+            ESP_LOGW(TAG, "  Left Knee (ID2) NOT available");
         }
         if (g_motor_right_hip) {
             can_motor_set_mode(g_motor_right_hip, MODE_POS_FILTER);
             can_motor_enter_closed_loop(g_motor_right_hip);
+            ESP_LOGI(TAG, "  Right Hip (ID4) enabled");
+            enabled_count++;
+        } else {
+            ESP_LOGW(TAG, "  Right Hip (ID4) NOT available");
         }
         if (g_motor_right_knee) {
             can_motor_set_mode(g_motor_right_knee, MODE_POS_FILTER);
             can_motor_enter_closed_loop(g_motor_right_knee);
+            ESP_LOGI(TAG, "  Right Knee (ID5) enabled");
+            enabled_count++;
+        } else {
+            ESP_LOGW(TAG, "  Right Knee (ID5) NOT available");
         }
-        ESP_LOGI(TAG, "Leg motors ENABLED");
+        ESP_LOGI(TAG, "Leg motors ENABLED (%d/4 motors)", enabled_count);
     } else if (!enable && g_leg_control_enabled) {
         // 禁用腿部电机
         if (g_motor_left_hip) can_motor_set_idle(g_motor_left_hip);
@@ -689,6 +909,19 @@ esp_err_t balance_test_init(void) {
         ESP_LOGI(TAG, "Leg motors created: L_Hip=ID%d, L_Knee=ID%d, R_Hip=ID%d, R_Knee=ID%d",
                  MOTOR_ID_LEFT_HIP, MOTOR_ID_LEFT_KNEE, 
                  MOTOR_ID_RIGHT_HIP, MOTOR_ID_RIGHT_KNEE);
+        
+        // 腿电机开机校零：将当前位置设为 0°
+        // 注意：开机前需确保腿部在标定位置！
+        ESP_LOGI(TAG, "Setting leg motors origin (current position -> 0)...");
+        can_motor_set_origin(g_motor_left_hip);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        can_motor_set_origin(g_motor_left_knee);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        can_motor_set_origin(g_motor_right_hip);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        can_motor_set_origin(g_motor_right_knee);
+        vTaskDelay(pdMS_TO_TICKS(50));  // 等待电机处理
+        ESP_LOGI(TAG, "Leg motors origin set complete");
     }
     
     // 初始化 IMU
@@ -696,6 +929,14 @@ esp_err_t balance_test_init(void) {
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "IMU init failed");
         return ret;
+    }
+    
+    // 设置 IMU 输出频率为 200Hz (匹配 ESP32 读取频率)
+    ret = imu_set_output_rate(RRATE_200HZ);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "IMU set output rate failed, using default");
+    } else {
+        ESP_LOGI(TAG, "IMU output rate set to 200Hz");
     }
     
     // 初始化 LQR 控制器 (使用默认参数)
@@ -719,6 +960,9 @@ esp_err_t balance_test_init(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi remote init failed, continuing anyway");
     }
+    
+    // 初始化腿部控制 (计算初始电机角度)
+    leg_ctrl_init();
     
     g_state = BALANCE_TEST_READY;
     g_initialized = true;
@@ -818,16 +1062,21 @@ void balance_test_stop(void) {
     can_motor_set_idle(g_motor_left);
     can_motor_set_idle(g_motor_right);
     
-    // 删除任务
-    if (g_task_imu) { vTaskDelete(g_task_imu); g_task_imu = NULL; }
-    if (g_task_balance) { vTaskDelete(g_task_balance); g_task_balance = NULL; }
-    if (g_task_motor) { vTaskDelete(g_task_motor); g_task_motor = NULL; }
-    if (g_task_watchdog) { vTaskDelete(g_task_watchdog); g_task_watchdog = NULL; }
+    // 设置退出标志，等待任务自行退出
+    g_tasks_running = false;
+    
+    // 等待任务自行退出 (最长等待 500ms)
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // 任务会自行删除并清空句柄，这里只是确保清空
+    g_task_imu = NULL;
+    g_task_balance = NULL;
+    g_task_motor = NULL;
+    g_task_watchdog = NULL;
     
     // 停止 WiFi
     wifi_remote_stop();
     
-    g_tasks_running = false;
     g_state = BALANCE_TEST_IDLE;
     
     ESP_LOGI(TAG, "Balance test tasks stopped");
@@ -954,6 +1203,8 @@ void balance_test_print_status(void) {
     }
     ESP_LOGI(TAG, "Control freq: %.1f Hz", g_stats.control_freq_hz);
     ESP_LOGI(TAG, "IMU freq: %.1f Hz", g_stats.imu_freq_hz);
+    ESP_LOGI(TAG, "Motor comm freq: %.1f Hz", g_stats.motor_freq_hz);
+    ESP_LOGI(TAG, "Leg motor freq: %.1f Hz", g_stats.leg_freq_hz);
     
     // IMU 数据
     xSemaphoreTake(g_imu_mutex, portMAX_DELAY);
@@ -996,9 +1247,12 @@ static void task_imu_read(void *arg) {
     
     ESP_LOGI(TAG, "[task_imu_read] Started on Core %d", xPortGetCoreID());
     
-    while (1) {
+    while (g_tasks_running) {
         // 读取 IMU 数据
         if (imu_read_data(&imu) == ESP_OK && imu.is_valid) {
+            // 在获取锁之前记录精确时间，减少互斥锁带来的时间偏差
+            uint64_t read_time = esp_timer_get_time();
+            
             xSemaphoreTake(g_imu_mutex, portMAX_DELAY);
             g_imu_data.pitch = imu.pitch;
             g_imu_data.pitch_rate = imu.gyro_y;
@@ -1007,6 +1261,7 @@ static void task_imu_read(void *arg) {
             g_imu_data.yaw = imu.yaw;
             g_imu_data.yaw_rate = imu.gyro_z;
             g_imu_data.timestamp = imu.timestamp;
+            g_imu_data.read_time_us = read_time;  // 记录精确读取时间到数据结构中
             g_imu_data.valid = true;
             xSemaphoreGive(g_imu_mutex);
             
@@ -1016,6 +1271,10 @@ static void task_imu_read(void *arg) {
         
         vTaskDelayUntil(&last_wake, period);
     }
+    
+    ESP_LOGI(TAG, "[task_imu_read] Stopped");
+    g_task_imu = NULL;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -1029,12 +1288,30 @@ static void task_balance_ctrl(void *arg) {
     
     ESP_LOGI(TAG, "[task_balance_ctrl] Started on Core %d", xPortGetCoreID());
     
-    while (1) {
-        // 更新遥控数据
+    while (g_tasks_running) {
+        // 更新遥控数据 (在计时之前)
         update_remote_from_wifi();
         
-        // 计算平衡控制输出
+        // 记录控制开始时间 (在读取IMU数据之前)
+        uint64_t ctrl_start = esp_timer_get_time();
+        
+        // 计算平衡控制输出 (内部会保存实际使用的 IMU 时间戳到 g_used_imu_time_us)
         compute_balance_output(dt);
+        
+        // 记录控制结束时间
+        uint64_t ctrl_end = esp_timer_get_time();
+        
+        // 计算延迟 (更精确的方式)
+        // IMU→控制: 从IMU数据读取到开始使用的等待时间
+        if (g_used_imu_time_us > 0) {
+            g_latency_imu_to_ctrl_us = (float)(ctrl_start - g_used_imu_time_us);
+        }
+        // 控制计算: 纯粹的计算耗时
+        g_latency_ctrl_calc_us = (float)(ctrl_end - ctrl_start);
+        
+        // 保存时间点供电机任务使用
+        g_ctrl_start_time_us = ctrl_start;
+        g_ctrl_end_time_us = ctrl_end;
         
         // 更新统计
         g_stats.control_loop_count++;
@@ -1045,13 +1322,21 @@ static void task_balance_ctrl(void *arg) {
         if (now - g_last_stat_time >= 1000) {
             g_stats.imu_freq_hz = (float)g_imu_count_per_sec;
             g_stats.control_freq_hz = (float)g_ctrl_count_per_sec;
+            g_stats.motor_freq_hz = (float)g_motor_count_per_sec;
+            g_stats.leg_freq_hz = (float)g_leg_count_per_sec;
             g_imu_count_per_sec = 0;
             g_ctrl_count_per_sec = 0;
+            g_motor_count_per_sec = 0;
+            g_leg_count_per_sec = 0;
             g_last_stat_time = now;
         }
         
         vTaskDelayUntil(&last_wake, period);
     }
+    
+    ESP_LOGI(TAG, "[task_balance_ctrl] Stopped");
+    g_task_balance = NULL;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -1060,13 +1345,18 @@ static void task_balance_ctrl(void *arg) {
 static void task_motor_comm(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(MOTOR_COMM_PERIOD_MS);
+    static uint8_t leg_divider_count = 0;  // 腿电机分频计数器
     
     ESP_LOGI(TAG, "[task_motor_comm] Started on Core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "  Wheel motor: %dHz, Leg motor: %dHz", 
+             1000 / MOTOR_COMM_PERIOD_MS, 
+             1000 / MOTOR_COMM_PERIOD_MS / LEG_MOTOR_DIVIDER);
     
-    while (1) {
-        // 处理 CAN 接收
+    while (g_tasks_running) {
+        // 处理 CAN 接收 (每次都处理，保证缓冲区不溢出)
         can_motor_process_rx();
         
+        // ======== 轮电机: 200Hz (每次都执行) ========
         // 读取轮电机状态
         xSemaphoreTake(g_wheel_state_mutex, portMAX_DELAY);
         g_wheel_state.left_position = can_motor_read_position(g_motor_left);
@@ -1078,16 +1368,27 @@ static void task_motor_comm(void *arg) {
         g_wheel_state.timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
         xSemaphoreGive(g_wheel_state_mutex);
         
-        // 发送电机力矩命令
+        // 发送轮电机力矩命令
         apply_motor_commands();
+        g_motor_count_per_sec++;
         
-        // 发送腿部电机位置命令 (固定角度)
-        apply_leg_motor_commands();
+        // ======== 腿电机: 50Hz (分频执行) ========
+        leg_divider_count++;
+        if (leg_divider_count >= LEG_MOTOR_DIVIDER) {
+            leg_divider_count = 0;
+            // 发送腿部电机位置命令 (固定角度)
+            apply_leg_motor_commands();
+            g_leg_count_per_sec++;
+        }
         
         g_stats.motor_cmd_count++;
         
         vTaskDelayUntil(&last_wake, period);
     }
+    
+    ESP_LOGI(TAG, "[task_motor_comm] Stopped");
+    g_task_motor = NULL;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -1099,7 +1400,7 @@ static void task_remote_watchdog(void *arg) {
     
     ESP_LOGI(TAG, "[task_remote_watchdog] Started on Core %d", xPortGetCoreID());
     
-    while (1) {
+    while (g_tasks_running) {
         // 检查遥控超时
         if (wifi_remote_check_timeout(REMOTE_TIMEOUT_MS)) {
             // 超时，禁用遥控输入
@@ -1117,6 +1418,10 @@ static void task_remote_watchdog(void *arg) {
         
         vTaskDelayUntil(&last_wake, period);
     }
+    
+    ESP_LOGI(TAG, "[task_remote_watchdog] Stopped");
+    g_task_watchdog = NULL;
+    vTaskDelete(NULL);
 }
 
 // ============================================================================
@@ -1140,6 +1445,7 @@ static void update_remote_from_wifi(void) {
     g_remote_data.joy_y = wifi_data->joy_y;
     g_remote_data.go = wifi_data->go;
     g_remote_data.last_update = wifi_data->last_update_ms;
+    g_remote_data.receive_time_us = wifi_data->receive_time_us;  // 复制精确时间戳
     
     xSemaphoreGive(g_remote_mutex);
     
@@ -1170,9 +1476,15 @@ static void compute_balance_output(float dt) {
     memcpy(&imu, &g_imu_data, sizeof(imu));
     xSemaphoreGive(g_imu_mutex);
     
+    // 保存实际使用的 IMU 数据时间戳 (用于精确延迟测量)
+    g_used_imu_time_us = imu.read_time_us;
+    
     xSemaphoreTake(g_remote_mutex, portMAX_DELAY);
     memcpy(&remote, &g_remote_data, sizeof(remote));
     xSemaphoreGive(g_remote_mutex);
+    
+    // 保存实际使用的 WiFi 数据时间戳 (用于精确延迟测量)
+    g_used_wifi_time_us = remote.receive_time_us;
     
     xSemaphoreTake(g_wheel_state_mutex, portMAX_DELAY);
     memcpy(&wheel, &g_wheel_state, sizeof(wheel));
@@ -1244,7 +1556,7 @@ static void compute_balance_output(float dt) {
         .lqr_speed = g_lqr_speed,               // 当前速度 (已考虑电机方向)
         .yaw_total = g_yaw_angle_total,         // YAW 累积角度 (用于方向保持)
         .target_speed = remote.joy_y * 0.1f,    // joy_y (-100~100) -> target speed
-        .target_yaw_rate = remote.joy_x * 0.02f,  // joy_x -> target yaw rate
+        .target_yaw_rate = -remote.joy_x * 0.01f,  // joy_x -> target yaw rate
         .dt = dt,
     };
     
@@ -1286,24 +1598,35 @@ static void compute_balance_output(float dt) {
     // ======== 计算 LQR 输出 ========
     lqr_output_t output = {0};
     
-    if (!remote.go || g_uncontrolable != 0) {
-        // 未使能或失控，切换到简单平衡模式 (仅角度+角速度环)
-        lqr_set_simple_balance_mode(&g_lqr_ctrl);
-    } else {
-        // 正常控制，使用完整平衡模式
-        lqr_set_full_balance_mode(&g_lqr_ctrl);
+    // 自动模式下根据状态切换 simple/full 模式
+    // 手动模式下保持用户设置的环路使能状态
+    if (!g_loop_manual_mode) {
+        if (!remote.go || g_uncontrolable != 0) {
+            // 未使能或失控，切换到简单平衡模式 (仅角度+角速度环)
+            lqr_set_simple_balance_mode(&g_lqr_ctrl);
+        } else {
+            // 正常控制，使用完整平衡模式
+            lqr_set_full_balance_mode(&g_lqr_ctrl);
+        }
     }
+    // 手动模式: 环路使能状态由 g_loop_enable_mask 控制，已在 balance_test_set_loop_gain() 中设置
     
     // 统一调用 LQR 平衡循环
     esp_err_t ret = lqr_balance_loop(&g_lqr_ctrl, &input, &output);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "LQR balance loop failed");
+        // 限流打印：每秒最多打印一次
+        static uint32_t last_fail_log = 0;
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now - last_fail_log > 1000) {
+            ESP_LOGW(TAG, "LQR balance loop failed");
+            last_fail_log = now;
+        }
         output.left_wheel_torque = 0;
         output.right_wheel_torque = 0;
         g_last_lqr_u = 0;
     } else {
-        // ======== YAW 轴转向控制 (仅在正常模式下) ========
-        if (remote.go && g_uncontrolable == 0) {
+        // ======== YAW 轴转向控制 (仅在正常模式下且 YAW 环使能) ========
+        if (remote.go && g_uncontrolable == 0 && g_yaw_control_enabled) {
             // 使用 lqr_yaw_loop 计算 YAW 控制量
             // input.target_yaw_rate 已经在前面设置为 remote.joy_x * 0.02f
             lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
@@ -1317,7 +1640,7 @@ static void compute_balance_output(float dt) {
             output.left_wheel_torque = lqr_u + g_yaw_output;
             output.right_wheel_torque = lqr_u - g_yaw_output;
         } else {
-            // 简单模式下，直接使用 LQR 输出，无 YAW 控制
+            // 简单模式/YAW禁用时，直接使用 LQR 输出，无 YAW 控制
             float lqr_u = output.lqr_u;
             output.left_wheel_torque = lqr_u;
             output.right_wheel_torque = lqr_u;
@@ -1353,6 +1676,60 @@ static void apply_motor_commands(void) {
     } else {
         can_motor_set_torque(g_motor_left, 0);
         can_motor_set_torque(g_motor_right, 0);
+    }
+    
+    // 记录电机命令发送时间
+    g_motor_send_time_us = esp_timer_get_time();
+    
+    // 计算控制到电机的延迟
+    if (g_ctrl_end_time_us > 0) {
+        g_latency_ctrl_to_motor_us = (float)(g_motor_send_time_us - g_ctrl_end_time_us);
+    }
+    
+    // 计算 IMU 总延迟 (使用实际使用的 IMU 数据时间戳 -> 电机发送)
+    if (g_used_imu_time_us > 0) {
+        float total = (float)(g_motor_send_time_us - g_used_imu_time_us);
+        g_latency_total_us = total;
+        
+        // 更新统计数据
+        g_latency_sample_count++;
+        if (g_latency_sample_count == 1) {
+            g_latency_total_avg_us = total;
+            g_latency_total_min_us = total;
+            g_latency_total_max_us = total;
+        } else {
+            // 指数移动平均 (alpha = 0.02 ~ 50次平均)
+            g_latency_total_avg_us = g_latency_total_avg_us * 0.98f + total * 0.02f;
+            if (total < g_latency_total_min_us) g_latency_total_min_us = total;
+            if (total > g_latency_total_max_us) g_latency_total_max_us = total;
+        }
+    }
+    
+    // 计算 WiFi 遥控延迟 (WiFi接收 -> 电机发送)
+    if (g_used_wifi_time_us > 0) {
+        // WiFi → 控制延迟
+        g_latency_wifi_to_ctrl_us = (float)(g_ctrl_start_time_us - g_used_wifi_time_us);
+        
+        // WiFi 总延迟
+        float wifi_total = (float)(g_motor_send_time_us - g_used_wifi_time_us);
+        g_latency_wifi_total_us = wifi_total;
+        
+        // 更新统计 (只在有新 WiFi 数据时更新，避免统计旧数据)
+        static uint64_t last_wifi_time = 0;
+        if (g_used_wifi_time_us != last_wifi_time && wifi_total < 1000000.0f) {  // 小于1秒才是有效数据
+            last_wifi_time = g_used_wifi_time_us;
+            g_latency_wifi_sample_count++;
+            
+            if (g_latency_wifi_sample_count == 1) {
+                g_latency_wifi_avg_us = wifi_total;
+                g_latency_wifi_min_us = wifi_total;
+                g_latency_wifi_max_us = wifi_total;
+            } else {
+                g_latency_wifi_avg_us = g_latency_wifi_avg_us * 0.95f + wifi_total * 0.05f;
+                if (wifi_total < g_latency_wifi_min_us) g_latency_wifi_min_us = wifi_total;
+                if (wifi_total > g_latency_wifi_max_us) g_latency_wifi_max_us = wifi_total;
+            }
+        }
     }
 }
 
@@ -1404,6 +1781,47 @@ void balance_test_process_cmd(const char *cmd_str) {
     else if (strcmp(token, "status") == 0) {
         balance_test_print_status();
     }
+    else if (strcmp(token, "freq") == 0) {
+        // 查询任务频率 - 输出格式便于 Qt 解析
+        printf("FREQ:IMU=%.1f,CTRL=%.1f,MOTOR=%.1f,LEG=%.1f\n",
+               g_stats.imu_freq_hz, g_stats.control_freq_hz,
+               g_stats.motor_freq_hz, g_stats.leg_freq_hz);
+    }
+    else if (strcmp(token, "latency") == 0) {
+        // 查询控制回路延迟
+        printf("=== Control Loop Latency (Precise) ===\n");
+        printf("IMU -> Ctrl:    %.1f us (%.2f ms)\n", g_latency_imu_to_ctrl_us, g_latency_imu_to_ctrl_us / 1000.0f);
+        printf("Ctrl calc:      %.1f us (%.2f ms)\n", g_latency_ctrl_calc_us, g_latency_ctrl_calc_us / 1000.0f);
+        printf("Ctrl -> Motor:  %.1f us (%.2f ms)\n", g_latency_ctrl_to_motor_us, g_latency_ctrl_to_motor_us / 1000.0f);
+        printf("Total (IMU->Motor):\n");
+        printf("  Current: %.1f us (%.2f ms)\n", g_latency_total_us, g_latency_total_us / 1000.0f);
+        printf("  Average: %.1f us (%.2f ms)\n", g_latency_total_avg_us, g_latency_total_avg_us / 1000.0f);
+        printf("  Min:     %.1f us (%.2f ms)\n", g_latency_total_min_us, g_latency_total_min_us / 1000.0f);
+        printf("  Max:     %.1f us (%.2f ms)\n", g_latency_total_max_us, g_latency_total_max_us / 1000.0f);
+        printf("  Samples: %lu\n", g_latency_sample_count);
+        printf("---\n");
+        printf("Task periods: IMU=%dms, Ctrl=%dms, Motor=%dms\n", 
+               IMU_READ_PERIOD_MS, BALANCE_CTRL_PERIOD_MS, MOTOR_COMM_PERIOD_MS);
+        // 输出便于 UI 解析的格式 (添加统计信息)
+        printf("LATENCY:IMU_CTRL=%.1f,CALC=%.1f,CTRL_MOTOR=%.1f,TOTAL=%.1f,AVG=%.1f,MIN=%.1f,MAX=%.1f\n",
+               g_latency_imu_to_ctrl_us, g_latency_ctrl_calc_us, 
+               g_latency_ctrl_to_motor_us, g_latency_total_us,
+               g_latency_total_avg_us, g_latency_total_min_us, g_latency_total_max_us);
+        
+        // WiFi 遥控延迟
+        printf("\n=== WiFi Remote Latency ===\n");
+        printf("WiFi -> Ctrl:   %.1f us (%.2f ms)\n", g_latency_wifi_to_ctrl_us, g_latency_wifi_to_ctrl_us / 1000.0f);
+        printf("WiFi Total (WiFi->Motor):\n");
+        printf("  Current: %.1f us (%.2f ms)\n", g_latency_wifi_total_us, g_latency_wifi_total_us / 1000.0f);
+        printf("  Average: %.1f us (%.2f ms)\n", g_latency_wifi_avg_us, g_latency_wifi_avg_us / 1000.0f);
+        printf("  Min:     %.1f us (%.2f ms)\n", g_latency_wifi_min_us, g_latency_wifi_min_us / 1000.0f);
+        printf("  Max:     %.1f us (%.2f ms)\n", g_latency_wifi_max_us, g_latency_wifi_max_us / 1000.0f);
+        printf("  Samples: %lu\n", g_latency_wifi_sample_count);
+        // WiFi 延迟 UI 解析格式
+        printf("WIFI_LATENCY:WIFI_CTRL=%.1f,TOTAL=%.1f,AVG=%.1f,MIN=%.1f,MAX=%.1f\n",
+               g_latency_wifi_to_ctrl_us, g_latency_wifi_total_us,
+               g_latency_wifi_avg_us, g_latency_wifi_min_us, g_latency_wifi_max_us);
+    }
     else if (strcmp(token, "zero") == 0) {
         token = strtok(NULL, " \t\n\r");
         if (token) {
@@ -1448,19 +1866,26 @@ void balance_test_process_cmd(const char *cmd_str) {
         token = strtok(NULL, " \t\n\r");
         if (token == NULL) {
             printf("Leg control: %s\n", g_leg_control_enabled ? "enabled" : "disabled");
-            printf("Leg angles: L_Hip=%.1f, L_Knee=%.1f, R_Hip=%.1f, R_Knee=%.1f\n",
+            printf("Motor angles: L_Hip=%.1f, L_Knee=%.1f, R_Hip=%.1f, R_Knee=%.1f\n",
                    g_leg_left_hip_angle, g_leg_left_knee_angle,
                    g_leg_right_hip_angle, g_leg_right_knee_angle);
+            printf("Target state: L(%.3fm, %.1fdeg) R(%.3fm, %.1fdeg)\n",
+                   g_leg_left_target_length, g_leg_left_target_angle,
+                   g_leg_right_target_length, g_leg_right_target_angle);
             printf("Leg speed: %.1f rpm\n", g_leg_move_speed);
-            printf("Usage: balance leg [on|off|set <lh> <lk> <rh> <rk>|speed <rpm>]\n");
+            printf("Usage: balance leg [on|off|status|set|target|speed|test]\n");
         } else if (strcmp(token, "on") == 0) {
             balance_test_set_leg_control(true);
             printf("Leg motors enabled\n");
         } else if (strcmp(token, "off") == 0) {
             balance_test_set_leg_control(false);
             printf("Leg motors disabled\n");
+        } else if (strcmp(token, "status") == 0) {
+            // 显示详细腿部状态
+            leg_ctrl_print_status();
         } else if (strcmp(token, "set") == 0) {
             // balance leg set <left_hip> <left_knee> <right_hip> <right_knee>
+            // 直接设置电机角度 (原始模式)
             float lh = 0, lk = 0, rh = 0, rk = 0;
             token = strtok(NULL, " \t\n\r");
             if (token) lh = atof(token);
@@ -1471,8 +1896,66 @@ void balance_test_process_cmd(const char *cmd_str) {
             token = strtok(NULL, " \t\n\r");
             if (token) rk = atof(token);
             balance_test_set_leg_angles(lh, lk, rh, rk);
-            printf("Leg angles set: L_Hip=%.1f, L_Knee=%.1f, R_Hip=%.1f, R_Knee=%.1f\n",
+            printf("Motor angles set: L_Hip=%.1f, L_Knee=%.1f, R_Hip=%.1f, R_Knee=%.1f\n",
                    lh, lk, rh, rk);
+        } else if (strcmp(token, "target") == 0) {
+            // balance leg target <length> <angle> [left|right|both]
+            // 使用运动学设置目标腿长和身体夹角
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Usage: balance leg target <length_m> <angle_deg> [left|right|both]\n");
+                printf("  length: leg length in meters (%.3f ~ %.3f)\n", LEG_LENGTH_MIN, LEG_LENGTH_MAX);
+                printf("  angle: body angle in degrees (%.1f ~ %.1f), forward=positive\n", 
+                       LEG_BODY_ANGLE_MIN, LEG_BODY_ANGLE_MAX);
+                printf("Example: balance leg target 0.15 0 both\n");
+            } else {
+                float length = atof(token);
+                float angle = 0;
+                char side = 'b';  // default both
+                
+                token = strtok(NULL, " \t\n\r");
+                if (token) angle = atof(token);
+                
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    if (strcmp(token, "left") == 0 || strcmp(token, "l") == 0) side = 'l';
+                    else if (strcmp(token, "right") == 0 || strcmp(token, "r") == 0) side = 'r';
+                }
+                
+                esp_err_t ret = ESP_OK;
+                if (side == 'l') {
+                    ret = leg_ctrl_set_target(true, length, angle);
+                } else if (side == 'r') {
+                    ret = leg_ctrl_set_target(false, length, angle);
+                } else {
+                    ret = leg_ctrl_set_both(length, angle, length, angle);
+                }
+                
+                if (ret == ESP_OK) {
+                    printf("Target set: Length=%.3fm, Angle=%.1fdeg\n", length, angle);
+                    
+                    // 立即发送一次电机命令 (方便调试，不需要等待 task_motor_comm)
+                    if (g_leg_control_enabled) {
+                        if (g_motor_left_hip) {
+                            can_motor_set_position(g_motor_left_hip, g_leg_left_hip_angle, g_leg_move_speed);
+                        }
+                        if (g_motor_left_knee) {
+                            can_motor_set_position(g_motor_left_knee, g_leg_left_knee_angle, g_leg_move_speed);
+                        }
+                        if (g_motor_right_hip) {
+                            can_motor_set_position(g_motor_right_hip, g_leg_right_hip_angle, g_leg_move_speed);
+                        }
+                        if (g_motor_right_knee) {
+                            can_motor_set_position(g_motor_right_knee, g_leg_right_knee_angle, g_leg_move_speed);
+                        }
+                        printf("Motor commands sent immediately\n");
+                    } else {
+                        printf("Note: Leg control disabled, use 'balance leg on' to enable\n");
+                    }
+                } else {
+                    printf("Failed to set target (out of range)\n");
+                }
+            }
         } else if (strcmp(token, "speed") == 0) {
             token = strtok(NULL, " \t\n\r");
             if (token) {
@@ -1483,9 +1966,64 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Current leg speed: %.1f rpm\n", g_leg_move_speed);
                 printf("Usage: balance leg speed <rpm>\n");
             }
+        } else if (strcmp(token, "test") == 0) {
+            // 测试运动学正逆解 (调用 algorithm 模块)
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Usage: balance leg test fk <hip> <knee> [left|right]\n");
+                printf("       balance leg test ik <length> <angle> [left|right]\n");
+            } else if (strcmp(token, "fk") == 0) {
+                // 正运动学测试
+                float hip = 0, knee = 0;
+                bool is_left = true;
+                token = strtok(NULL, " \t\n\r");
+                if (token) hip = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) knee = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token && (strcmp(token, "right") == 0 || strcmp(token, "r") == 0)) {
+                    is_left = false;
+                }
+                
+                leg_joint_state_t joint = { .hip_angle = hip, .knee_angle = knee };
+                leg_workspace_state_t ws;
+                if (leg_kin_forward(&joint, is_left, NULL, &ws) == ESP_OK) {
+                    printf("FK (%s): Hip=%.1f, Knee=%.1f -> Length=%.3fm, Angle=%.1fdeg\n",
+                           is_left ? "left" : "right", hip, knee, ws.leg_length, ws.body_angle);
+                } else {
+                    printf("FK failed\n");
+                }
+            } else if (strcmp(token, "ik") == 0) {
+                // 逆运动学测试
+                float length = 0.15f, angle = 0;
+                bool is_left = true;
+                token = strtok(NULL, " \t\n\r");
+                if (token) length = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) angle = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token && (strcmp(token, "right") == 0 || strcmp(token, "r") == 0)) {
+                    is_left = false;
+                }
+                
+                leg_workspace_state_t ws = { .leg_length = length, .body_angle = angle };
+                leg_joint_state_t joint;
+                if (leg_kin_inverse(&ws, is_left, NULL, &joint) == ESP_OK) {
+                    printf("IK (%s): Length=%.3fm, Angle=%.1fdeg -> Hip=%.1f, Knee=%.1f\n",
+                           is_left ? "left" : "right", length, angle, joint.hip_angle, joint.knee_angle);
+                } else {
+                    printf("IK failed (target unreachable)\n");
+                }
+            }
         } else {
             printf("Unknown leg command: %s\n", token);
-            printf("Usage: balance leg [on|off|set <lh> <lk> <rh> <rk>|speed <rpm>]\n");
+            printf("Usage: balance leg [on|off|status|set|target|speed|test]\n");
+            printf("  on/off  - Enable/disable leg motors\n");
+            printf("  status  - Show detailed leg status\n");
+            printf("  set <lh> <lk> <rh> <rk> - Set motor angles directly\n");
+            printf("  target <length> <angle> [left|right|both] - Set using kinematics\n");
+            printf("  speed <rpm> - Set leg motor speed\n");
+            printf("  test fk/ik ... - Test kinematics\n");
         }
     }
     // ===== Roll 闭环控制开关 =====
@@ -1556,8 +2094,302 @@ void balance_test_process_cmd(const char *cmd_str) {
             }
         }
     }
+    // ===== 环路使能控制命令 =====
+    else if (strcmp(token, "loop") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            balance_test_print_loop_status();
+            printf("Usage: balance loop [status|simple|full|none|<mask>]\n");
+            printf("       balance loop <A|B|C|D|H|Y> [on|off|<0.0-1.0>]\n");
+            printf("  Loops: A=Angle B=Gyro C=Dist D=Speed H=LQR_U Y=Yaw\n");
+        } else if (strcmp(token, "status") == 0) {
+            balance_test_print_loop_status();
+        } else if (strcmp(token, "simple") == 0) {
+            balance_test_set_loop_enable(LOOP_SIMPLE);
+            printf("Simple balance mode: Angle + Gyro only\n");
+        } else if (strcmp(token, "full") == 0) {
+            balance_test_set_loop_enable(LOOP_FULL);
+            printf("Full balance mode: All loops enabled\n");
+        } else if (strcmp(token, "none") == 0) {
+            balance_test_set_loop_enable(LOOP_NONE);
+            printf("All loops DISABLED (motor will output 0)\n");
+        } else if (token[0] == '0' && token[1] == 'x') {
+            // 十六进制掩码 (如 0x03)
+            uint8_t mask = (uint8_t)strtol(token, NULL, 16);
+            balance_test_set_loop_enable(mask);
+        } else if (strlen(token) == 1) {
+            // 单个环路控制 (A/B/C/D/H/Y)
+            loop_enable_mask_t loop = LOOP_NONE;
+            switch (token[0]) {
+                case 'A': case 'a': loop = LOOP_ANGLE; break;
+                case 'B': case 'b': loop = LOOP_GYRO; break;
+                case 'C': case 'c': loop = LOOP_DISTANCE; break;
+                case 'D': case 'd': loop = LOOP_SPEED; break;
+                case 'H': case 'h': loop = LOOP_LQR_U; break;
+                case 'Y': case 'y': loop = LOOP_YAW; break;
+                default:
+                    printf("Unknown loop: %s\n", token);
+                    printf("Valid loops: A=Angle B=Gyro C=Dist D=Speed H=LQR_U Y=Yaw\n");
+                    return;
+            }
+            
+            // 获取 on/off/value
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                // 显示当前状态
+                float gain = balance_test_get_loop_gain(loop);
+                printf("Loop %c: %.2f (%s)\n", 
+                       "ABCDHY"[__builtin_ctz(loop)], 
+                       gain, gain > 0.5f ? "ON" : "OFF");
+            } else if (strcmp(token, "on") == 0) {
+                balance_test_set_loop_gain(loop, 1.0f);
+            } else if (strcmp(token, "off") == 0) {
+                balance_test_set_loop_gain(loop, 0.0f);
+            } else {
+                float val = atof(token);
+                balance_test_set_loop_gain(loop, val);
+            }
+        } else {
+            printf("Unknown loop command: %s\n", token);
+            printf("Usage: balance loop [status|simple|full|none|0x<mask>]\n");
+            printf("       balance loop <A|B|C|D|H|Y> [on|off|<0.0-1.0>]\n");
+        }
+    }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|leg|roll|mzero]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|leg|roll|mzero|loop]\n");
     }
 }
+
+// ============================================================================
+// 腿部控制上层接口 (调用 leg_kinematics 模块)
+// ============================================================================
+
+/**
+ * @brief 初始化腿部控制
+ */
+void leg_ctrl_init(void) {
+    // 设置初始目标为站立姿态 (垂直向下)
+    g_leg_left_target_length = 0.14f;
+    g_leg_left_target_angle = -90.0f;  // 垂直向下
+    g_leg_right_target_length = 0.14f;
+    g_leg_right_target_angle = -90.0f; // 垂直向下
+    
+    // 用逆运动学计算初始电机角度
+    leg_workspace_state_t workspace;
+    leg_joint_state_t joint;
+    
+    // 左腿
+    workspace.leg_length = g_leg_left_target_length;
+    workspace.body_angle = g_leg_left_target_angle;
+    if (leg_kin_inverse(&workspace, true, NULL, &joint) == ESP_OK) {
+        g_leg_left_hip_angle = joint.hip_angle;
+        g_leg_left_knee_angle = joint.knee_angle;
+        ESP_LOGI(TAG, "Left leg init: L=%.3f, A=%.1f -> Hip=%.1f, Knee=%.1f",
+                 workspace.leg_length, workspace.body_angle,
+                 g_leg_left_hip_angle, g_leg_left_knee_angle);
+    }
+    
+    // 右腿
+    workspace.leg_length = g_leg_right_target_length;
+    workspace.body_angle = g_leg_right_target_angle;
+    if (leg_kin_inverse(&workspace, false, NULL, &joint) == ESP_OK) {
+        g_leg_right_hip_angle = joint.hip_angle;
+        g_leg_right_knee_angle = joint.knee_angle;
+        ESP_LOGI(TAG, "Right leg init: L=%.3f, A=%.1f -> Hip=%.1f, Knee=%.1f",
+                 workspace.leg_length, workspace.body_angle,
+                 g_leg_right_hip_angle, g_leg_right_knee_angle);
+    }
+    
+    // 打印运动学参数
+    leg_kin_print_params(NULL, true);
+    leg_kin_print_params(NULL, false);
+    
+    ESP_LOGI(TAG, "Leg control initialized");
+}
+
+/**
+ * @brief 主动请求腿部电机位置更新
+ * @param is_left 是否为左腿
+ * @return ESP_OK 成功
+ */
+static esp_err_t leg_ctrl_request_position(bool is_left) {
+    can_motor_handle_t hip, knee;
+    
+    if (is_left) {
+        hip = g_motor_left_hip;
+        knee = g_motor_left_knee;
+    } else {
+        hip = g_motor_right_hip;
+        knee = g_motor_right_knee;
+    }
+    
+    if (hip == NULL || knee == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // 请求读取位置寄存器
+    extern esp_err_t can_motor_request_status(can_motor_handle_t motor);
+    can_motor_request_status(hip);
+    can_motor_request_status(knee);
+    
+    // 等待 CAN 回复并处理
+    vTaskDelay(pdMS_TO_TICKS(20));  // 给 CAN 接收任务时间处理回复
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief 读取当前腿部状态 (从编码器)
+ * @note 会自动请求电机位置更新，确保读取到最新数据
+ */
+esp_err_t leg_ctrl_get_state(bool is_left, leg_state_t *state) {
+    if (state == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 先请求位置更新
+    leg_ctrl_request_position(is_left);
+    
+    leg_joint_state_t joint;
+    
+    if (is_left) {
+        if (g_motor_left_hip == NULL || g_motor_left_knee == NULL) {
+            state->valid = false;
+            return ESP_ERR_INVALID_STATE;
+        }
+        joint.hip_angle = can_motor_read_position(g_motor_left_hip);
+        joint.knee_angle = can_motor_read_position(g_motor_left_knee);
+    } else {
+        if (g_motor_right_hip == NULL || g_motor_right_knee == NULL) {
+            state->valid = false;
+            return ESP_ERR_INVALID_STATE;
+        }
+        joint.hip_angle = can_motor_read_position(g_motor_right_hip);
+        joint.knee_angle = can_motor_read_position(g_motor_right_knee);
+    }
+    
+    state->joint = joint;
+    state->is_left = is_left;
+    
+    // 调用运动学正解
+    esp_err_t ret = leg_kin_forward(&joint, is_left, NULL, &state->workspace);
+    state->valid = (ret == ESP_OK);
+    
+    return ret;
+}
+
+/**
+ * @brief 设置目标腿部状态 (腿长 + 身体夹角)
+ */
+esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle) {
+    // 限幅到可达范围
+    leg_kin_clamp_workspace(&leg_length, &body_angle, NULL);
+    
+    // 检查可达性
+    if (!leg_kin_is_reachable(leg_length, body_angle, NULL)) {
+        ESP_LOGW(TAG, "Target unreachable: L=%.3f, A=%.1f", leg_length, body_angle);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 调用运动学逆解
+    leg_workspace_state_t workspace = { .leg_length = leg_length, .body_angle = body_angle };
+    leg_joint_state_t joint;
+    
+    esp_err_t ret = leg_kin_inverse(&workspace, is_left, NULL, &joint);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    // 更新目标
+    if (is_left) {
+        g_leg_left_target_length = leg_length;
+        g_leg_left_target_angle = body_angle;
+        g_leg_left_hip_angle = joint.hip_angle;
+        g_leg_left_knee_angle = joint.knee_angle;
+    } else {
+        g_leg_right_target_length = leg_length;
+        g_leg_right_target_angle = body_angle;
+        g_leg_right_hip_angle = joint.hip_angle;
+        g_leg_right_knee_angle = joint.knee_angle;
+    }
+    
+    ESP_LOGI(TAG, "%s leg target: L=%.3fm, A=%.1fdeg -> Hip=%.1f, Knee=%.1f",
+             is_left ? "Left" : "Right", leg_length, body_angle, 
+             joint.hip_angle, joint.knee_angle);
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief 设置双腿目标状态
+ */
+esp_err_t leg_ctrl_set_both(float left_length, float left_angle,
+                             float right_length, float right_angle) {
+    esp_err_t ret1 = leg_ctrl_set_target(true, left_length, left_angle);
+    esp_err_t ret2 = leg_ctrl_set_target(false, right_length, right_angle);
+    
+    if (ret1 != ESP_OK) return ret1;
+    if (ret2 != ESP_OK) return ret2;
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief 打印当前腿部状态
+ */
+void leg_ctrl_print_status(void) {
+    leg_state_t left, right;
+    
+    // 获取当前状态
+    bool left_valid = (leg_ctrl_get_state(true, &left) == ESP_OK && left.valid);
+    bool right_valid = (leg_ctrl_get_state(false, &right) == ESP_OK && right.valid);
+    
+    // 输出机器可解析格式 (供 Qt 面板使用)
+    // 格式: LEG_STATE: L_Len=xxx L_Ang=xxx L_Hip=xxx L_Knee=xxx R_Len=xxx R_Ang=xxx R_Hip=xxx R_Knee=xxx
+    printf("LEG_STATE: L_Len=%.3f L_Ang=%.1f L_Hip=%.1f L_Knee=%.1f R_Len=%.3f R_Ang=%.1f R_Hip=%.1f R_Knee=%.1f\n",
+           left_valid ? left.workspace.leg_length : 0.0f,
+           left_valid ? left.workspace.body_angle : 0.0f,
+           left_valid ? left.joint.hip_angle : 0.0f,
+           left_valid ? left.joint.knee_angle : 0.0f,
+           right_valid ? right.workspace.leg_length : 0.0f,
+           right_valid ? right.workspace.body_angle : 0.0f,
+           right_valid ? right.joint.hip_angle : 0.0f,
+           right_valid ? right.joint.knee_angle : 0.0f);
+    
+    // 输出人类可读格式
+    printf("=== Leg Control Status ===\n");
+    printf("Control: %s\n", g_leg_control_enabled ? "ENABLED" : "DISABLED");
+    printf("Speed: %.1f rpm\n\n", g_leg_move_speed);
+    
+    // 左腿
+    if (left_valid) {
+        printf("Left Leg (current):\n");
+        printf("  Motor: Hip=%.1f deg, Knee=%.1f deg\n", 
+               left.joint.hip_angle, left.joint.knee_angle);
+        printf("  State: Length=%.3f m, BodyAngle=%.1f deg\n", 
+               left.workspace.leg_length, left.workspace.body_angle);
+    } else {
+        printf("Left Leg: NOT AVAILABLE\n");
+    }
+    printf("  Target: Length=%.3f m, BodyAngle=%.1f deg\n", 
+           g_leg_left_target_length, g_leg_left_target_angle);
+    printf("  Target Motor: Hip=%.1f, Knee=%.1f\n\n", 
+           g_leg_left_hip_angle, g_leg_left_knee_angle);
+    
+    // 右腿
+    if (right_valid) {
+        printf("Right Leg (current):\n");
+        printf("  Motor: Hip=%.1f deg, Knee=%.1f deg\n", 
+               right.joint.hip_angle, right.joint.knee_angle);
+        printf("  State: Length=%.3f m, BodyAngle=%.1f deg\n", 
+               right.workspace.leg_length, right.workspace.body_angle);
+    } else {
+        printf("Right Leg: NOT AVAILABLE\n");
+    }
+    printf("  Target: Length=%.3f m, BodyAngle=%.1f deg\n", 
+           g_leg_right_target_length, g_leg_right_target_angle);
+    printf("  Target Motor: Hip=%.1f, Knee=%.1f\n", 
+           g_leg_right_hip_angle, g_leg_right_knee_angle);
+}
+

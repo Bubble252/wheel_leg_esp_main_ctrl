@@ -1085,24 +1085,139 @@ void balance_ctrl_update(const imu_data_t *imu, float target_speed, float target
                          float *left_wheel_out, float *right_wheel_out);
 ```
 
-#### leg_kinematics (腿部运动学)
+#### leg_kinematics (腿部运动学) - v2.3 实现
 
-**职责**:
-- 正运动学: 关节角度 → 足端位置
-- 逆运动学: 足端位置 → 关节角度
-- VMC (虚拟模型控制) 支持
+**文件位置:**
+- `components/algorithm/include/leg_kinematics.h`
+- `components/algorithm/src/leg_kinematics.c`
+
+**机构说明:**
+```
+       机身 (Body)
+          │
+   ┌──────┴──────┐
+   │  Hip Motor  │  ← 大腿电机 (θ1)
+   └──────┬──────┘
+          │ L1 = 0.10m (大腿长度)
+          │
+   ┌──────┴──────┐
+   │ Knee Motor  │  ← 小腿电机 (θ2)
+   └──────┬──────┘
+          │ L2 = 0.10m (小腿长度)
+          │
+   ┌──────┴──────┐
+   │ Wheel Motor │  ← 轮电机
+   └─────────────┘
+```
+
+**工作空间定义:**
+- **腿长** (leg_length): 大腿电机轴心到轮电机轴心的直线距离 [0.11m ~ 0.17m]
+- **身体夹角** (body_angle): 该直线与机身垂直向下方向的夹角 [-160° ~ -20°]，垂直向下=-90°
+
+**电机零点偏移:**
+| 腿 | 髋关节偏移 | 膝关节偏移 | 说明 |
+|---|---|---|---|
+| 左腿 | -25° | +120° | 电机Hip=-115°,Knee=30°时腿垂直向下且大小腿呈90° |
+| 右腿 | +25° | -120° | 镜像对称 |
+
+**运动学角度定义:**
+- `theta1`: 大腿相对机身的角度，向前为正
+- `theta2`: 小腿相对大腿的角度，0°=伸直，顺时针(弯曲)为负
+
+**API 函数:**
 
 ```c
-// 正运动学
-void leg_forward_kinematics(float hip_angle, float knee_angle, 
-                            float *foot_x, float *foot_y);
+// 获取默认腿部参数
+void leg_kin_get_default_params(bool is_left, leg_kin_params_t *params);
 
-// 逆运动学
-bool leg_inverse_kinematics(float foot_x, float foot_y,
-                            float *hip_angle, float *knee_angle);
+// 正运动学: 关节空间 -> 工作空间
+// 输入: 电机角度 (hip_angle, knee_angle)
+// 输出: 腿长 + 身体夹角
+esp_err_t leg_kin_forward(const leg_joint_state_t *joint, bool is_left,
+                          const leg_kin_params_t *params,
+                          leg_workspace_state_t *workspace);
 
-// 雅可比矩阵计算 (用于力矩映射)
-void leg_jacobian(float hip_angle, float knee_angle, float jacobian[2][2]);
+// 逆运动学: 工作空间 -> 关节空间
+// 输入: 目标腿长 + 身体夹角
+// 输出: 电机角度 (hip_angle, knee_angle)
+esp_err_t leg_kin_inverse(const leg_workspace_state_t *workspace, bool is_left,
+                          const leg_kin_params_t *params,
+                          leg_joint_state_t *joint);
+
+// 检查工作空间目标是否可达
+bool leg_kin_is_reachable(float leg_length, float body_angle, 
+                          const leg_kin_params_t *params);
+
+// 限制工作空间目标到可达范围
+void leg_kin_clamp_workspace(float *leg_length, float *body_angle,
+                             const leg_kin_params_t *params);
+
+// 计算雅可比矩阵 (用于 VMC)
+// J[0]=∂L/∂θ1, J[1]=∂L/∂θ2, J[2]=∂α/∂θ1, J[3]=∂α/∂θ2
+esp_err_t leg_kin_jacobian(const leg_joint_state_t *joint, bool is_left,
+                           const leg_kin_params_t *params, float J[4]);
+```
+
+**数学公式:**
+
+正运动学:
+```
+θ1 = hip_motor - hip_offset    (大腿相对机身角度)
+θ2 = knee_motor - knee_offset  (小腿相对大腿角度, 0=伸直)
+
+L = sqrt(L1² + L2² + 2·L1·L2·cos(θ2))     (余弦定理)
+β = atan2(L2·sin(θ2), L1 + L2·cos(θ2))    (小腿引起的角度偏移)
+α = θ1 + β                                (身体夹角)
+```
+
+逆运动学:
+```
+θ2 = acos((L² - L1² - L2²) / (2·L1·L2))   (余弦定理求膝关节角)
+β = atan2(L2·sin(θ2), L1 + L2·cos(θ2))
+θ1 = α - β
+
+hip_motor = θ1 + hip_offset
+knee_motor = θ2 + knee_offset
+```
+
+**应用层封装 (balance_test.c):**
+
+```c
+// 初始化腿部控制
+void leg_ctrl_init(void);
+
+// 读取当前腿部状态 (从编码器)
+esp_err_t leg_ctrl_get_state(bool is_left, leg_state_t *state);
+
+// 设置目标腿部状态 (腿长 + 身体夹角)
+esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle);
+
+// 设置双腿目标状态
+esp_err_t leg_ctrl_set_both(float left_length, float left_angle,
+                             float right_length, float right_angle);
+
+// 打印当前腿部状态
+void leg_ctrl_print_status(void);
+```
+
+**串口命令:**
+
+| 命令 | 说明 |
+|------|------|
+| `balance leg on/off` | 使能/禁用腿部电机 |
+| `balance leg status` | 查询腿部状态 (输出 LEG_STATE 格式) |
+| `balance leg set <lh> <lk> <rh> <rk>` | 直接设置电机角度 (度) |
+| `balance leg target <L> <A> [left\|right\|both]` | 运动学目标设置 |
+| `balance leg speed <rpm>` | 设置腿部移动速度 |
+| `balance leg test fk <hip> <knee> [left\|right]` | 正运动学测试 |
+| `balance leg test ik <L> <A> [left\|right]` | 逆运动学测试 |
+
+**数据输出格式 (供 Qt 面板解析):**
+
+```
+LEG_STATE: L_Len=0.150 L_Ang=0.0 L_Hip=-105.0 L_Knee=60.0 R_Len=0.150 R_Ang=0.0 R_Hip=105.0 R_Knee=-60.0
+FK (left): Hip=-105.0, Knee=60.0 -> Length=0.150m, Angle=0.0deg
+IK (left): Length=0.150m, Angle=0.0deg -> Hip=-105.0, Knee=60.0
 ```
 
 ### 6.3 control/ - 控制逻辑层
@@ -1616,11 +1731,11 @@ balance plot div 5  # 设置输出分频 (200Hz / 5 = 40Hz)
 - [x] 测试 Web 遥控器连接
 
 ### Phase 3: 控制算法
-- [ ] 实现腿部正逆运动学 (algorithm/leg_kinematics)
+- [x] 实现腿部正逆运动学 (algorithm/leg_kinematics) ← **v2.3 完成**
 - [x] 实现滤波器 (algorithm/filter)
 - [x] 实现 LQR 平衡控制算法 (algorithm/lqr_balance)
 - [x] 实现平衡测试模块 (app/balance_test) ← **NEW**
-- [ ] 实现腿部控制器 (control/leg_controller)
+- [ ] 实现腿部控制器 (control/leg_controller) → VMC 待实现
 
 ### Phase 4: 任务管理
 - [x] 创建 FreeRTOS 任务框架 (balance_test.c)
@@ -1658,6 +1773,9 @@ balance plot div 5  # 设置输出分频 (200Hz / 5 = 40Hz)
 | 2026-01-22 | v1.9 | 完善电机驱动API：新增 PVT指令、相对位置、低速模式、电压/错误读取、擦除参数等 |
 | 2026-01-22 | v2.0 | 新增 Qt 调参面板与 Commander 通信协议完整文档 |
 | 2026-01-22 | v2.1 | 位移/速度计算加入轮子半径 (r=0.03m)，单位改为 m 和 m/s |
+| 2026-01-24 | v2.2 | 串口命令处理改为独立任务 (console_task)，支持与平衡控制并行运行 |
+| 2026-01-24 | v2.3 | 新增腿部运动学模块 (leg_kinematics)，更新 Qt 腿部控制面板 |
+| 2026-01-24 | v2.3.1 | 新增 Qt 平衡面板环路调试控制 (单环/组合调试) |
 
 ---
 
@@ -1845,22 +1963,30 @@ pid_tuner.py
 │   ├── 高度范围设置
 │   └── 实时Kp计算预览
 │
-├── LegControlPanel         # 腿部控制面板
-│   ├── Roll 控制开关
-│   ├── 腿部电机使能
-│   ├── 关节角度设置
-│   └── 预设姿态按钮
+├── LegControlPanel         # 腿部控制面板 (v2.3 重构)
+│   ├── 腿部电机使能 (on/off/status)
+│   ├── 运动学控制 (腿长 + 身体夹角, 带滑块)
+│   ├── 直接角度控制 (髋/膝电机角度)
+│   ├── 预设姿态 (站立/半蹲/蹲下/伸直/前倾/后倾)
+│   ├── 运动学测试 (FK/IK)
+│   └── 腿部状态显示 (双腿腿长/夹角/关节角度)
 │
 ├── WebMonitorPanel         # Web 遥控器监控面板
 │   ├── Go/Dir/JoyX/JoyY/Height 显示
 │   └── 命令历史
 │
-├── BalanceControlPanel     # 平衡控制面板 (新增)
+├── BalanceControlPanel     # 平衡控制面板 (v2.3 更新)
 │   ├── 初始化控制 (balance init)
 │   ├── 运行控制 (start/stop)
 │   ├── 使能控制 (enable/disable/estop)
+│   ├── Roll 平衡控制 (侧倾补偿)
 │   ├── 角度零点设置
-│   └── 波形输出控制
+│   ├── 波形输出控制
+│   └── 🆕 环路调试控制 (单环/组合调试)
+│       ├── 快捷预设 (Full/Simple/None)
+│       ├── LQR 各环独立开关 (A:角度/B:角速度/C:位移/D:速度/H:总输出)
+│       ├── Yaw 转向控制
+│       └── 增益精调 (0.0-1.0)
 │
 ├── MotorControlPanel       # 电机控制面板 (新增)
 │   ├── 全局控制 (扫描/使能/停止/读取)
@@ -2106,6 +2232,14 @@ python3 pid_tuner.py
 | 开启波形 | `balance plot on` | 使能波形输出 |
 | 关闭波形 | `balance plot off` | 禁用波形输出 |
 | 设置分频 | `balance plot div <N>` | 波形输出分频 |
+| Roll 开启 | `balance roll on` | 开启侧倾补偿 |
+| Roll 关闭 | `balance roll off` | 关闭侧倾补偿 |
+| 环路全开 | `balance loop full` | 启用所有环路 (ABCDHY) |
+| 环路简单 | `balance loop simple` | 仅角度+角速度环 (AB) |
+| 环路全关 | `balance loop none` | 关闭所有环路 |
+| 环路状态 | `balance loop status` | 显示当前环路状态 |
+| 环路开关 | `balance loop <X> on/off` | X=A/B/C/D/H/Y |
+| 环路增益 | `balance loop <X> <0.0-1.0>` | 设置环路增益 |
 
 #### 12.6.2 电机控制面板
 

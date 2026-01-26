@@ -77,14 +77,19 @@ void app_main(void)
 
 #if MOTOR_TEST_MODE
     // ============================================
-    // 电机测试模式
+    // 电机测试模式 (非阻塞，串口命令在独立任务中处理)
     // ============================================
     ESP_LOGI(TAG, "=================================");
     ESP_LOGI(TAG, "  MOTOR TEST MODE");
     ESP_LOGI(TAG, "  Type 'help' for commands");
     ESP_LOGI(TAG, "=================================");
     
-    motor_test_start();  // 阻塞在这里，处理命令行
+    motor_test_start();  // 非阻塞，启动任务后返回
+    
+    // app_main 返回后释放栈空间 (~3KB)
+    // 串口命令在 console_task 中处理
+    ESP_LOGI(TAG, "app_main() finished, console running in background");
+    ESP_LOGI(TAG, "Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
     
 #else
     // ============================================

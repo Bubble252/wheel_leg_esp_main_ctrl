@@ -15,8 +15,23 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 static const char *TAG = "CAN_MOTOR";
+
+// ============================================================================
+// 角度安全处理配置
+// ============================================================================
+
+// 单次位置命令最大角度变化量 (度)
+// 设为 0 表示不限制步长，只计算最短路径
+// 注意：步长限制只对高频连续调用有效，单次命令应设为 0
+#define MOTOR_MAX_ANGLE_STEP        0.0f
+
+// 是否启用角度跨越保护 (最短路径计算)
+// 警告：此功能仅适用于编码器在 ±180° 内回绕的电机
+// 对于多圈累计编码器（如当前使用的电机），必须设为 0！
+#define MOTOR_ANGLE_WRAP_PROTECTION 0
 
 // ============================================================================
 // 内部数据结构
@@ -33,6 +48,84 @@ struct can_motor {
 // 全局电机实例数组
 static can_motor_handle_t g_motors[MOTOR_COUNT] = {NULL};
 static bool g_can_initialized = false;
+
+// ============================================================================
+// 角度安全处理辅助函数
+// ============================================================================
+
+/**
+ * @brief 将角度规范化到 [-180, 180) 范围
+ * @param angle 输入角度 (度)
+ * @return 规范化后的角度
+ */
+static float normalize_angle_180(float angle) {
+    // 使用 fmodf 处理大角度，避免循环次数过多
+    angle = fmodf(angle, 360.0f);
+    if (angle >= 180.0f) {
+        angle -= 360.0f;
+    } else if (angle < -180.0f) {
+        angle += 360.0f;
+    }
+    return angle;
+}
+
+/**
+ * @brief 计算从当前角度到目标角度的最短路径增量
+ * @param current 当前角度 (度)
+ * @param target 目标角度 (度)
+ * @return 最短路径增量 (范围 [-180, 180])
+ * 
+ * @example 
+ *   shortest_angle_delta(330, -40) = -10  (而不是 -370)
+ *   shortest_angle_delta(-30, 40) = 70
+ *   shortest_angle_delta(10, 350) = -20   (而不是 340)
+ */
+static float shortest_angle_delta(float current, float target) {
+    float delta = target - current;
+    return normalize_angle_180(delta);
+}
+
+/**
+ * @brief 限制角度变化量
+ * @param delta 原始变化量
+ * @param max_step 最大允许变化量
+ * @return 限制后的变化量
+ */
+static float clamp_angle_delta(float delta, float max_step) {
+    if (delta > max_step) {
+        return max_step;
+    } else if (delta < -max_step) {
+        return -max_step;
+    }
+    return delta;
+}
+
+/**
+ * @brief 计算安全的目标角度 (最短路径 + 变化量限制)
+ * @param current 当前电机角度 (度)
+ * @param target 期望目标角度 (度)
+ * @param max_step 单次最大变化量 (度), 0 表示不限制
+ * @return 安全的目标角度
+ */
+static float compute_safe_target_angle(float current, float target, float max_step) {
+#if MOTOR_ANGLE_WRAP_PROTECTION
+    // 计算最短路径增量
+    float delta = shortest_angle_delta(current, target);
+    
+    // 应用变化量限制
+    if (max_step > 0.0f) {
+        delta = clamp_angle_delta(delta, max_step);
+    }
+    
+    // 返回基于当前位置的新目标
+    return current + delta;
+#else
+    // 保护功能禁用时，直接返回原始目标
+    (void)current;
+    (void)max_step;
+    return target;
+#endif
+}
 
 // ============================================================================
 // 内部函数
@@ -453,9 +546,22 @@ esp_err_t can_motor_set_speed(can_motor_handle_t motor, float speed_rpm) {
 esp_err_t can_motor_set_position(can_motor_handle_t motor, float angle_deg, float speed_rpm) {
     if (motor == NULL) return ESP_ERR_INVALID_ARG;
     
-    // 先设置位置
-    int32_t pos_raw = (int32_t)(angle_deg * SCALE_POSITION);
+    // 获取当前电机位置
+    float current_pos = motor->state.position;
+    
+    // 计算安全的目标角度 (最短路径 + 变化量限制)
+    float safe_target = compute_safe_target_angle(current_pos, angle_deg, MOTOR_MAX_ANGLE_STEP);
+    
+    // 发送位置命令
+    int32_t pos_raw = (int32_t)(safe_target * SCALE_POSITION);
     esp_err_t ret = write_reg_2(motor, REG_SET_ABS_POS, pos_raw);
+    
+    // 调试: 如果目标被修正，打印警告 (可注释掉)
+    // float delta_diff = fabsf(angle_deg - safe_target);
+    // if (delta_diff > 1.0f) {
+    //     ESP_LOGD(TAG, "Motor %d: target %.1f -> safe %.1f (current=%.1f)", 
+    //              motor->motor_id, angle_deg, safe_target, current_pos);
+    // }
     
     return ret;
 }
@@ -469,9 +575,13 @@ esp_err_t can_motor_set_torque(can_motor_handle_t motor, float torque) {
 esp_err_t can_motor_pv_cmd(can_motor_handle_t motor, float position_deg, float speed_rpm) {
     if (motor == NULL) return ESP_ERR_INVALID_ARG;
     
+    // 获取当前电机位置并计算安全目标
+    float current_pos = motor->state.position;
+    float safe_target = compute_safe_target_angle(current_pos, position_deg, MOTOR_MAX_ANGLE_STEP);
+    
     uint8_t data[8] = {0};
     
-    int32_t pos_raw = (int32_t)(position_deg * SCALE_POSITION);
+    int32_t pos_raw = (int32_t)(safe_target * SCALE_POSITION);
     int16_t speed_raw = (int16_t)speed_rpm;  // 速度不放大
     
     // PV 指令格式: [0x24, PosH, PosM, PosM, PosL, SpdH, SpdL, 0x00]
@@ -490,9 +600,13 @@ esp_err_t can_motor_pv_cmd(can_motor_handle_t motor, float position_deg, float s
 esp_err_t can_motor_pvt_cmd(can_motor_handle_t motor, float position_deg, float speed_rpm, uint8_t torque_percent) {
     if (motor == NULL) return ESP_ERR_INVALID_ARG;
     
+    // 获取当前电机位置并计算安全目标
+    float current_pos = motor->state.position;
+    float safe_target = compute_safe_target_angle(current_pos, position_deg, MOTOR_MAX_ANGLE_STEP);
+    
     uint8_t data[8] = {0};
     
-    int32_t pos_raw = (int32_t)(position_deg * SCALE_POSITION);
+    int32_t pos_raw = (int32_t)(safe_target * SCALE_POSITION);
     int16_t speed_raw = (int16_t)speed_rpm;  // 速度不放大
     
     // PVT 指令格式: [0x25, PosH, PosM, PosM, PosL, SpdH, SpdL, Torque%]

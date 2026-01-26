@@ -49,8 +49,13 @@ static const char *TAG = "MOTOR_TEST";
 static can_motor_handle_t g_motors[MOTOR_COUNT] = {NULL};
 static TaskHandle_t g_rx_task = NULL;
 static TaskHandle_t g_status_task = NULL;
+static TaskHandle_t g_console_task = NULL;  // 串口命令任务
 static bool g_running = false;
 static bool g_show_status = false;
+static bool g_console_initialized = false;  // USB Serial 初始化标志
+
+// 前向声明
+static void process_command(char *cmd);
 
 // ============================================================================
 // CAN 接收任务 - 绑定到 CPU1 避免影响 CPU0 的 IDLE 任务
@@ -60,6 +65,57 @@ static void can_rx_task(void *arg) {
         can_motor_process_rx();
         vTaskDelay(pdMS_TO_TICKS(10));  // 10ms 间隔，足够让出 CPU
     }
+    vTaskDelete(NULL);
+}
+
+// ============================================================================
+// 串口命令任务 - 绑定到 CPU0，低优先级，不影响实时控制
+// ============================================================================
+static void console_task(void *arg) {
+    char line[128];
+    int idx = 0;
+    uint8_t rx_buf[8];
+    
+    ESP_LOGI(TAG, "[console_task] Started on Core %d", xPortGetCoreID());
+    
+    printf("\nmotor> ");
+    fflush(stdout);
+    
+    while (g_running) {
+        // 从 USB Serial JTAG 读取 (非阻塞，超时20ms)
+        int len = usb_serial_jtag_read_bytes(rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(20));
+        
+        for (int i = 0; i < len; i++) {
+            int c = rx_buf[i];
+            if (c == '\n' || c == '\r') {
+                printf("\n");
+                line[idx] = '\0';
+                if (idx > 0) {
+                    process_command(line);
+                }
+                idx = 0;
+                printf("motor> ");
+                fflush(stdout);
+            } else if (c == '\b' || c == 127) {  // Backspace
+                if (idx > 0) {
+                    idx--;
+                    printf("\b \b");
+                    fflush(stdout);
+                }
+            } else if (c >= 32 && c < 127 && idx < sizeof(line) - 1) {
+                line[idx++] = c;
+                printf("%c", c);  // 回显
+                fflush(stdout);
+            }
+        }
+        
+        // 没有数据时让出 CPU
+        if (len == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    
+    ESP_LOGI(TAG, "[console_task] Stopped");
     vTaskDelete(NULL);
 }
 
@@ -768,16 +824,16 @@ static void process_command(char *cmd) {
     }
     // ========== Commander 协议直接解析 (用于PID调参面板) ==========
     else if (strlen(token) >= 2 && 
-             ((token[0] >= 'A' && token[0] <= 'M') || token[0] == 'K') &&
+             (token[0] >= 'A' && token[0] <= 'M') &&
              (token[1] == 'P' || token[1] == 'I' || token[1] == 'D' || 
               token[1] == 'L' || token[1] == 'R' || token[1] == 'T' ||
               token[1] == 'H' || token[1] == 'M' || token[1] == '?')) {
         // 看起来像 Commander 命令 (如 AP1.5, BD0.01, MH1.0, A?)
-        if (commander_process_line(cmd)) {
-            // 命令处理成功，同步参数到 LQR 控制器
-            // 这里可以添加回调来更新 LQR 控制器参数
+        // 注意: 使用 token 而不是 cmd，因为 strtok 已修改 cmd
+        if (commander_process_line(token)) {
+            // 命令处理成功，参数会通过回调同步到 LQR 控制器
         } else {
-            printf("Invalid Commander command: %s\n", cmd);
+            printf("Invalid Commander command: %s\n", token);
         }
     }
     else {
@@ -789,15 +845,24 @@ static void process_command(char *cmd) {
 // 公共接口
 // ============================================================================
 
-esp_err_t motor_test_start(void) {
-    ESP_LOGI(TAG, "Starting motor test mode...");
+/**
+ * @brief 初始化串口控制台 (仅初始化一次)
+ */
+static esp_err_t init_console(void) {
+    if (g_console_initialized) {
+        return ESP_OK;  // 已初始化
+    }
     
-    // ========== 初始化 USB Serial JTAG 用于串口输入 ==========
+    // 初始化 USB Serial JTAG 用于串口输入
     usb_serial_jtag_driver_config_t usb_serial_config = {
         .rx_buffer_size = 256,
         .tx_buffer_size = 256,
     };
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_serial_config));
+    esp_err_t ret = usb_serial_jtag_driver_install(&usb_serial_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "USB Serial JTAG install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
     
     // 将 stdin/stdout 重定向到 USB Serial JTAG
     usb_serial_jtag_vfs_use_driver();
@@ -805,7 +870,20 @@ esp_err_t motor_test_start(void) {
     // 设置 stdin 为非阻塞模式
     fcntl(fileno(stdin), F_SETFL, O_NONBLOCK);
     
+    g_console_initialized = true;
     ESP_LOGI(TAG, "USB Serial JTAG console initialized");
+    
+    return ESP_OK;
+}
+
+esp_err_t motor_test_start(void) {
+    ESP_LOGI(TAG, "Starting motor test mode...");
+    
+    // 初始化控制台
+    esp_err_t ret = init_console();
+    if (ret != ESP_OK) {
+        return ret;
+    }
     
     // 初始化并打开电机电源 (IO8)
     gpio_config_t io_conf = {
@@ -821,7 +899,7 @@ esp_err_t motor_test_start(void) {
     vTaskDelay(pdMS_TO_TICKS(100));  // 等待电源稳定
     
     // 初始化 CAN 总线
-    esp_err_t ret = can_bus_init(CAN_TX_PIN, CAN_RX_PIN);
+    ret = can_bus_init(CAN_TX_PIN, CAN_RX_PIN);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CAN bus init failed: %s", esp_err_to_name(ret));
         return ret;
@@ -837,52 +915,20 @@ esp_err_t motor_test_start(void) {
     
     g_running = true;
     
-    // 启动 CAN 接收任务 - 绑定到 CPU1，优先级2（低于IDLE任务的优先级）
+    // 启动 CAN 接收任务 - 绑定到 CPU1，优先级2
     xTaskCreatePinnedToCore(can_rx_task, "can_rx", 2048, NULL, 2, &g_rx_task, 1);
     
-    // 启动状态显示任务 - 绑定到 CPU1
+    // 启动状态显示任务 - 绑定到 CPU1，优先级2
     xTaskCreatePinnedToCore(status_display_task, "status", 2048, NULL, 2, &g_status_task, 1);
+    
+    // 启动串口命令任务 - 绑定到 CPU0，优先级5 (低于实时控制任务)
+    xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 5, &g_console_task, 0);
     
     // 打印帮助
     print_help();
     
-    // 在主循环中运行命令行
-    char line[128];
-    int idx = 0;
-    uint8_t rx_buf[8];
-    printf("motor> ");
-    fflush(stdout);
-    
-    while (g_running) {
-        // 直接从 USB Serial JTAG 读取
-        int len = usb_serial_jtag_read_bytes(rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(20));
-        for (int i = 0; i < len; i++) {
-            int c = rx_buf[i];
-            if (c == '\n' || c == '\r') {
-                printf("\n");
-                line[idx] = '\0';
-                if (idx > 0) {
-                    process_command(line);
-                }
-                idx = 0;
-                printf("motor> ");
-                fflush(stdout);
-            } else if (c == '\b' || c == 127) {  // Backspace
-                if (idx > 0) {
-                    idx--;
-                    printf("\b \b");
-                    fflush(stdout);
-                }
-            } else if (c >= 32 && c < 127 && idx < sizeof(line) - 1) {
-                line[idx++] = c;
-                printf("%c", c);  // 回显
-                fflush(stdout);
-            }
-        }
-        if (len == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
+    ESP_LOGI(TAG, "Motor test started (non-blocking)");
+    ESP_LOGI(TAG, "Tasks: can_rx(CPU1), status(CPU1), console(CPU0)");
     
     return ESP_OK;
 }
@@ -894,7 +940,12 @@ void motor_test_stop(void) {
     can_motor_all_set_idle();
     
     // 等待任务结束
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // 任务会自行删除，清空句柄
+    g_rx_task = NULL;
+    g_status_task = NULL;
+    g_console_task = NULL;
     
     // 销毁电机实例
     for (int i = 0; i < MOTOR_COUNT; i++) {
