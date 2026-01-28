@@ -16,25 +16,25 @@ static const char *TAG = "LQR_BALANCE";
 // ============== 默认参数 ==============
 static const lqr_params_t default_params = {
     // 角度环 PID
-    .angle_kp = 1.0f,
-    .angle_ki = 0.0f,
-    .angle_kd = 0.0f,
+    .angle_kp = 0.7f,
+    .angle_ki = 0.1f,
+    .angle_kd = 0.00001f,
     .angle_limit = 10.0f,
     
     // 角速度环 PID
-    .gyro_kp = 0.0f,
+    .gyro_kp = 0.05f,
     .gyro_ki = 0.0f,
     .gyro_kd = 0.0f,
     .gyro_limit = 8.0f,
     
     // 位移环 PID
-    .distance_kp = 0.0f,
+    .distance_kp = 0.5f,
     .distance_ki = 0.0f,
     .distance_kd = 0.0f,
     .distance_limit = 8.0f,
     
     // 速度环 PID
-    .speed_kp = 0.0f,
+    .speed_kp = 0.5f,
     .speed_ki = 0.0f,
     .speed_kd = 0.0f,
     .speed_limit = 8.0f,
@@ -42,18 +42,18 @@ static const lqr_params_t default_params = {
     .speed_kp_max = 1.0f,
     
     // LQR 输出 PID
-    .lqr_u_kp = 0.0f,
-    .lqr_u_ki = 0.0f,
+    .lqr_u_kp = 1.0f,
+    .lqr_u_ki = 1.0f,
     .lqr_u_kd = 0.0f,
     .lqr_u_limit = 8.0f,
     
     // 偏航控制 PID
-    .yaw_angle_kp = 0.0f,
+    .yaw_angle_kp = 0.4f,
     .yaw_angle_ki = 0.0f,
     .yaw_angle_kd = 0.0f,
     .yaw_angle_limit = 5.0f,
     
-    .yaw_gyro_kp = 0.0f,
+    .yaw_gyro_kp = 0.05f,
     .yaw_gyro_ki = 0.0f,
     .yaw_gyro_kd = 0.0f,
     .yaw_gyro_limit = 3.0f,
@@ -71,7 +71,7 @@ static const lqr_params_t default_params = {
     .zeropoint_limit = 5.0f,
     
     // 角度零点
-    .angle_zeropoint = 0.1f,
+    .angle_zeropoint = -0.1f,
     
     // 低通滤波器
     .lpf_joyy_tf = 0.2f,
@@ -341,9 +341,12 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     
     // ===== 更新位移零点 (重心自动调整) =====
     // 当速度接近目标时，调整位移零点以补偿重心偏移
+    float zeropoint_adjust_raw = 0.0f;
+    float zeropoint_adjust_filtered = 0.0f;
     if (fabsf(speed_error) < 0.5f && fabsf(lqr_speed) < 1.0f) {
-        float zeropoint_adjust = pid_compute(&ctrl->pid_zeropoint, 0.0f, angle_error, dt);
-        ctrl->distance_zeropoint += lpf_compute_dt(&ctrl->lpf_zeropoint, zeropoint_adjust, dt);
+        zeropoint_adjust_raw = pid_compute(&ctrl->pid_zeropoint, 0.0f, angle_error, dt);
+        zeropoint_adjust_filtered = lpf_compute_dt(&ctrl->lpf_zeropoint, zeropoint_adjust_raw, dt);
+        ctrl->distance_zeropoint += zeropoint_adjust_filtered;
     }
     
     // ===== 保存输出 =====
@@ -355,6 +358,9 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     output->distance_control = distance_control;
     output->speed_control = speed_control;
     output->lqr_u = lqr_u;
+    output->filtered_target_speed = filtered_target_speed;  // 滤波后的目标速度
+    output->zeropoint_adjust_raw = zeropoint_adjust_raw;    // 零点调整原始值
+    output->zeropoint_adjust_filtered = zeropoint_adjust_filtered; // 零点调整滤波后
     
     output->state = LQR_STATE_BALANCING;
     output->wheel_on_ground = true;

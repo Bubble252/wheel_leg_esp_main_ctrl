@@ -114,6 +114,30 @@ static esp_err_t sht30_read_bytes(uint8_t *data, size_t len) {
     return ret;
 }
 
+/**
+ * @brief 使用 Repeated START 原子地发送命令并读取数据
+ * 
+ * SHT30 的周期测量读取 (0xE000) 和状态寄存器读取 (0xF32D) 需要使用
+ * Repeated START 条件，即 Write Command → Repeated START → Read Data
+ * 不能在中间产生 STOP 条件
+ */
+static esp_err_t sht30_write_cmd_read(uint16_t cmd, uint8_t *data, size_t len) {
+    if (!g_i2c_dev) {
+        ESP_LOGE(TAG, "I2C device handle is NULL");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    uint8_t cmd_buf[2] = {cmd >> 8, cmd & 0xFF};
+    
+    // 使用 i2c_master_transmit_receive 实现原子的 Write-Read 操作
+    // 内部使用 Repeated START，不会在命令和数据之间产生 STOP
+    esp_err_t ret = i2c_master_transmit_receive(g_i2c_dev, cmd_buf, 2, data, len, 100);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C transmit_receive cmd 0x%04X failed: %s", cmd, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 // ============================================================================
 // 公共函数
 // ============================================================================
@@ -347,16 +371,10 @@ esp_err_t sht30_fetch_data(sht30_data_t *data) {
     if (!data) return ESP_ERR_INVALID_ARG;
     if (!g_periodic_mode) return ESP_ERR_INVALID_STATE;
     
-    // 发送读取命令
-    esp_err_t ret = sht30_write_cmd(SHT30_CMD_FETCH_DATA);
-    if (ret != ESP_OK) {
-        data->valid = false;
-        return ret;
-    }
-    
-    // 读取数据
+    // 使用原子的 Write-Read 操作 (Repeated START)
+    // 发送 Fetch Data 命令 (0xE000) 并立即读取 6 字节数据
     uint8_t buf[6];
-    ret = sht30_read_bytes(buf, 6);
+    esp_err_t ret = sht30_write_cmd_read(SHT30_CMD_FETCH_DATA, buf, 6);
     if (ret != ESP_OK) {
         data->valid = false;
         return ret;
@@ -391,11 +409,9 @@ esp_err_t sht30_read_status(uint16_t *status) {
     if (!g_initialized) return ESP_ERR_INVALID_STATE;
     if (!status) return ESP_ERR_INVALID_ARG;
     
-    esp_err_t ret = sht30_write_cmd(SHT30_CMD_READ_STATUS);
-    if (ret != ESP_OK) return ret;
-    
+    // 使用原子的 Write-Read 操作 (Repeated START)
     uint8_t buf[3];
-    ret = sht30_read_bytes(buf, 3);
+    esp_err_t ret = sht30_write_cmd_read(SHT30_CMD_READ_STATUS, buf, 3);
     if (ret != ESP_OK) return ret;
     
     // 校验 CRC

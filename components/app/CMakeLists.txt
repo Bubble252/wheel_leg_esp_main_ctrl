@@ -6,5 +6,5 @@ idf_component_register(
         "src/sensor_test.c"
         "src/balance_test.c"
     INCLUDE_DIRS "include"
-    REQUIRES freertos common device control algorithm esp_timer console wit_imu wifi_remote
+    REQUIRES freertos common device control algorithm esp_timer console wit_imu wifi_remote pi_comm
 )

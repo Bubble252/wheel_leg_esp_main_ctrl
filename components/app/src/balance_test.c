@@ -53,7 +53,7 @@ static const char *TAG = "BAL_TEST";
 #define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (≈300Hz)
 #define BALANCE_CTRL_PERIOD_MS      5       // 200Hz 平衡控制
 #define MOTOR_COMM_PERIOD_MS        5       // 200Hz 电机通信 (与控制同步)
-#define LEG_MOTOR_DIVIDER           4       // 腿电机分频 (200Hz / 4 = 50Hz)
+#define LEG_MOTOR_DIVIDER           10      // 腿电机分频 (200Hz / 10 = 20Hz)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 
 // 任务栈大小 - 覆盖 config.h 中的默认值
@@ -197,6 +197,14 @@ static float g_distance_zeropoint = 0.0f;   // 位移零点
 static float g_angle_zeropoint = 0.0f;      // 角度零点 (需要根据实际机器人调整)
 static int g_move_stop_flag = 0;            // 停止标志
 static int g_uncontrolable = 0;             // 失控标志
+
+// 轮速加速度计算 (用于离地检测调试)
+static float g_left_wheel_speed_rad = 0.0f;     // 左轮速度 (rad/s)
+static float g_right_wheel_speed_rad = 0.0f;    // 右轮速度 (rad/s)
+static float g_left_wheel_accel = 0.0f;         // 左轮加速度 (rad/s²)
+static float g_right_wheel_accel = 0.0f;        // 右轮加速度 (rad/s²)
+static float g_prev_left_wheel_speed = 0.0f;    // 上次左轮速度
+static float g_prev_right_wheel_speed = 0.0f;   // 上次右轮速度
 
 // YAW 轴控制 (带过零处理)
 static float g_yaw_angle_last = 0.0f;       // 上一次 YAW 角度 (用于过零处理)
@@ -535,19 +543,47 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     // C - 位移: target=目标位移, control=当前位移
     printf("#DATA,C,%.2f,%.2f\n", g_distance_zeropoint, g_lqr_distance);
     
-    // D - 速度: target=目标速度, control=当前速度
+    // D - 速度: target=目标速度(原始), control=当前速度
+    // 注: 蓝色=原始目标速度, 红色=当前速度
     printf("#DATA,D,%.2f,%.2f\n", input->target_speed, input->lqr_speed);
+    
+    // E - YAW 角度: target=目标角度, control=当前累积角度
+    printf("#DATA,E,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
+    
+    // F - YAW 角速度: target=目标角速度, control=当前角速度
+    printf("#DATA,F,%.2f,%.2f\n", input->target_yaw_rate, input->yaw_rate);
+    
+    // G - 摇杆滤波: target=滤波前(原始), control=滤波后
+    printf("#DATA,G,%.2f,%.2f\n", input->target_speed, output->filtered_target_speed);
     
     // H - LQR 输出: target=0, control=LQR_u
     printf("#DATA,H,0.0,%.2f\n", g_last_lqr_u);
     
+    // I - 零点调整: target=0, control=当前零点偏移
+    printf("#DATA,I,0.0,%.3f\n", g_lqr_ctrl.distance_zeropoint);
+    
+    // J - 零点滤波: target=滤波前(原始), control=滤波后
+    printf("#DATA,J,%.4f,%.4f\n", output->zeropoint_adjust_raw, output->zeropoint_adjust_filtered);
+    
     // K - Roll 角度: target=0, control=当前 Roll
     printf("#DATA,K,0.0,%.2f\n", input->roll);
     
-    // YAW 调试输出 - target=目标角度, control=当前累积角度
+    // L - Roll 滤波: target=滤波前(原始 Roll), control=滤波后
+    // 使用控制器内的 lpf_roll 滤波器，但不影响主控制（仅用于显示）
+    float roll_filtered_display = lpf_compute_dt(&g_lqr_ctrl.lpf_roll, input->roll, input->dt);
+    printf("#DATA,L,%.2f,%.2f\n", input->roll, roll_filtered_display);
+    
+    // O - 左轮: target=速度(rad/s), control=加速度(rad/s²)
+    // 用于调试轮子离地检测阈值
+    printf("#DATA,O,%.2f,%.2f\n", g_left_wheel_speed_rad, g_left_wheel_accel);
+    
+    // P - 右轮: target=速度(rad/s), control=加速度(rad/s²)
+    printf("#DATA,P,%.2f,%.2f\n", g_right_wheel_speed_rad, g_right_wheel_accel);
+    
+    // Y - YAW 调试输出 (专用通道，用于 YAW 面板)
     printf("#DATA,Y,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
     
-    // YAW 输出和状态
+    // YAW 输出和状态 (详细调试)
     printf("#YAW_DBG,out=%.3f,err=%.2f,hold=%d,rate=%.2f\n", 
            g_yaw_output, 
            g_yaw_angle_total - g_lqr_ctrl.yaw_angle_target,
@@ -1521,6 +1557,15 @@ static void compute_balance_output(float dt) {
     // 速度: rpm -> rad/s
     float left_vel_rad = wheel.left_speed * 0.10472f;   // rpm to rad/s
     float right_vel_rad = wheel.right_speed * 0.10472f;
+    
+    // ======== 计算轮子加速度 (用于离地检测调试) ========
+    // 加速度 = (当前速度 - 上次速度) / dt
+    g_left_wheel_speed_rad = left_vel_rad;
+    g_right_wheel_speed_rad = right_vel_rad;
+    g_left_wheel_accel = (left_vel_rad - g_prev_left_wheel_speed) / dt;
+    g_right_wheel_accel = (right_vel_rad - g_prev_right_wheel_speed) / dt;
+    g_prev_left_wheel_speed = left_vel_rad;
+    g_prev_right_wheel_speed = right_vel_rad;
     
     // 累积位移和速度 (考虑轮子半径，转换为实际距离/速度)
     // 位移公式: s = r * θ (θ为弧度)

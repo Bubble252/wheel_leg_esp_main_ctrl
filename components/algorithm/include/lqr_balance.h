@@ -186,6 +186,11 @@ typedef struct {
     float yaw_control;          // 偏航控制量
     float roll_control;         // 横滚控制量 (用于腿长控制)
     
+    // 滤波后的值 (调试用)
+    float filtered_target_speed; // 滤波后的目标速度
+    float zeropoint_adjust_raw;  // 零点调整原始值 (滤波前)
+    float zeropoint_adjust_filtered; // 零点调整滤波后值
+    
     // 状态
     lqr_state_t state;          // 当前状态
     bool wheel_on_ground;       // 轮子是否在地面上

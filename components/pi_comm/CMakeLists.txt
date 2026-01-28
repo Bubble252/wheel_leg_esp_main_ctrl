@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "src/pi_comm.c"
+        "src/pi_frame.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        driver
+        freertos
+        esp_common
+)

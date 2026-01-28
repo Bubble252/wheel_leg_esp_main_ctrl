@@ -1,0 +1,4 @@
+# Pi-ESP32 通信工具依赖
+pyserial>=3.5
+PyQt5>=5.15
+pyqtgraph>=0.12

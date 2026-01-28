@@ -390,7 +390,8 @@ class LPFControlPanel(QWidget):
         
         self.max_points = 500
         self.time_data = deque(maxlen=self.max_points)
-        self.value_data = deque(maxlen=self.max_points)
+        self.raw_data = deque(maxlen=self.max_points)       # 滤波前
+        self.filtered_data = deque(maxlen=self.max_points)  # 滤波后
         self.data_counter = 0
         
         self.init_ui()
@@ -440,14 +441,16 @@ class LPFControlPanel(QWidget):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
-        # 波形
-        plot_group = QGroupBox("实时波形")
+        # 波形 (滤波前后对比)
+        plot_group = QGroupBox("实时波形 (蓝色=滤波前, 红色=滤波后)")
         plot_layout = QVBoxLayout()
         
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('k')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-        self.value_curve = self.plot_widget.plot(pen=pg.mkPen(color='g', width=2))
+        self.raw_curve = self.plot_widget.plot(pen=pg.mkPen(color='b', width=2), name='滤波前')
+        self.filtered_curve = self.plot_widget.plot(pen=pg.mkPen(color='r', width=2), name='滤波后')
+        self.plot_widget.addLegend()
         
         plot_layout.addWidget(self.plot_widget)
         
@@ -467,7 +470,7 @@ class LPFControlPanel(QWidget):
             return
         
         tf = self.tf_input.value()
-        cmd = f"{self.commander_id}{tf}"
+        cmd = f"{self.commander_id}T{tf}"
         self.parent_window.send_command(cmd)
         self.parent_window.log(f"发送: {cmd} -> {self.name} Tf={tf}")
     
@@ -483,17 +486,27 @@ class LPFControlPanel(QWidget):
     def update_display(self, tf):
         self.tf_display.setText(f"{tf:.4f}")
     
-    def update_plot(self, value):
+    def update_plot(self, raw_value, filtered_value=None):
+        """更新波形 (支持滤波前后对比)"""
         self.data_counter += 1
         self.time_data.append(self.data_counter)
-        self.value_data.append(value)
-        self.value_curve.setData(list(self.time_data), list(self.value_data))
+        self.raw_data.append(raw_value)
+        
+        if filtered_value is not None:
+            self.filtered_data.append(filtered_value)
+        else:
+            self.filtered_data.append(raw_value)
+        
+        self.raw_curve.setData(list(self.time_data), list(self.raw_data))
+        self.filtered_curve.setData(list(self.time_data), list(self.filtered_data))
     
     def clear_plot(self):
         self.time_data.clear()
-        self.value_data.clear()
+        self.raw_data.clear()
+        self.filtered_data.clear()
         self.data_counter = 0
-        self.value_curve.setData([], [])
+        self.raw_curve.setData([], [])
+        self.filtered_curve.setData([], [])
 
 
 # ============================================================================
@@ -3043,6 +3056,16 @@ class PIDTunerUI(QMainWindow):
         self.speed_adaptive_panel = SpeedAdaptivePanel(self)
         self.tab_widget.addTab(self.speed_adaptive_panel, "M - 速度自适应P")
         
+        # 轮速调试面板 (用于离地检测阈值调试)
+        # O - 左轮: 蓝线=速度(rad/s), 红线=加速度(rad/s²)
+        # P - 右轮: 蓝线=速度(rad/s), 红线=加速度(rad/s²)
+        self.wheel_panels = {}
+        self.wheel_panels['left'] = PIDControlPanel("左轮调试 (蓝=速度rad/s, 红=加速度rad/s²)", "O", self)
+        self.tab_widget.addTab(self.wheel_panels['left'], "O - 左轮调试")
+        
+        self.wheel_panels['right'] = PIDControlPanel("右轮调试 (蓝=速度rad/s, 红=加速度rad/s²)", "P", self)
+        self.tab_widget.addTab(self.wheel_panels['right'], "P - 右轮调试")
+        
         # 腿部控制面板
         self.leg_panel = LegControlPanel(self)
         self.tab_widget.addTab(self.leg_panel, "🦿 腿部控制")
@@ -3173,16 +3196,38 @@ class PIDTunerUI(QMainWindow):
                     target = float(parts[2].strip())
                     control = float(parts[3].strip())
                     
+                    # PID 面板映射
                     panel_map = {
                         'A': 'angle', 'B': 'gyro', 'C': 'distance',
                         'D': 'speed', 'E': 'yaw_angle', 'F': 'yaw_gyro',
                         'H': 'lqr_u', 'I': 'zeropoint', 'K': 'roll_angle'
                     }
                     
+                    # LPF 面板映射
+                    lpf_map = {
+                        'G': 'joyy',      # 摇杆滤波
+                        'J': 'zeropoint', # 零点滤波
+                        'L': 'roll'       # Roll滤波
+                    }
+                    
+                    # 轮速调试面板映射
+                    wheel_map = {
+                        'O': 'left',      # 左轮调试
+                        'P': 'right'      # 右轮调试
+                    }
+                    
                     if panel_id in panel_map:
                         panel_key = panel_map[panel_id]
                         if panel_key in self.pid_panels:
                             self.pid_panels[panel_key].update_plot(target, control)
+                    elif panel_id in lpf_map:
+                        panel_key = lpf_map[panel_id]
+                        if panel_key in self.lpf_panels:
+                            self.lpf_panels[panel_key].update_plot(target, control)
+                    elif panel_id in wheel_map:
+                        panel_key = wheel_map[panel_id]
+                        if panel_key in self.wheel_panels:
+                            self.wheel_panels[panel_key].update_plot(target, control)
                     return
                 except (ValueError, IndexError) as e:
                     self.log(f"解析数据失败: {line} ({e})", is_error=True)

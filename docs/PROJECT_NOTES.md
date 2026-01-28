@@ -1776,6 +1776,8 @@ balance plot div 5  # 设置输出分频 (200Hz / 5 = 40Hz)
 | 2026-01-24 | v2.2 | 串口命令处理改为独立任务 (console_task)，支持与平衡控制并行运行 |
 | 2026-01-24 | v2.3 | 新增腿部运动学模块 (leg_kinematics)，更新 Qt 腿部控制面板 |
 | 2026-01-24 | v2.3.1 | 新增 Qt 平衡面板环路调试控制 (单环/组合调试) |
+| 2026-01-26 | v2.4 | 新增 YAW 调试面板，修复 YAW 使能时角度锁定问题 |
+| 2026-01-26 | v2.5 | 扩展波形通道 (E/F/G/I/J/L/Y)，LPF 面板显示滤波前后对比 |
 
 ---
 
@@ -1907,14 +1909,31 @@ Speed Adaptive P: Low=0.3000 High=1.0000
 #DATA,<ID>,<Target>,<Control>\n
 ```
 
-| 通道 | ID | Target | Control | 说明 |
-|------|-----|--------|---------|------|
-| A | A | 0.0 | pitch角度 | 角度偏差 |
-| B | B | 0.0 | pitch_rate | 角速度 |
-| C | C | distance_zeropoint | lqr_distance | 位移偏差 |
-| D | D | target_speed | lqr_speed | 速度追踪 |
-| H | H | 0.0 | lqr_u | LQR输出 |
-| K | K | 0.0 | roll | Roll角度 |
+| 通道 | ID | Target (蓝色线) | Control (红色线) | 说明 |
+|------|-----|-----------------|------------------|------|
+| **A** | A | 0.0 | pitch角度 | 角度偏差 (目标=0°) |
+| **B** | B | 0.0 | pitch_rate | 角速度 (目标=0) |
+| **C** | C | distance_zeropoint | lqr_distance | 位移偏差 |
+| **D** | D | target_speed (原始) | lqr_speed (实际) | 速度追踪 |
+| **E** | E | yaw_angle_target | yaw_angle_total | YAW角度 (目标 vs 累积) |
+| **F** | F | target_yaw_rate | yaw_rate | YAW角速度 (目标 vs 实际) |
+| **G** | G | target_speed (滤波前) | filtered_target_speed (滤波后) | 摇杆Y滤波效果 |
+| **H** | H | 0.0 | lqr_u | LQR输出 |
+| **I** | I | 0.0 | distance_zeropoint | 零点偏移累积值 |
+| **J** | J | zeropoint_adjust_raw | zeropoint_adjust_filtered | 零点滤波效果 |
+| **K** | K | 0.0 | roll | Roll角度 |
+| **L** | L | roll (滤波前) | roll_filtered (滤波后) | Roll滤波效果 |
+| **Y** | Y | yaw_angle_target | yaw_angle_total | YAW专用通道 (用于YAW面板) |
+
+**LPF 滤波面板 (G/J/L) 显示说明:**
+- **蓝色线**: 滤波前的原始值
+- **红色线**: 滤波后的平滑值
+- 调节 Tf 参数可实时观察滤波效果变化
+
+**YAW 调试输出格式:**
+```
+#YAW_DBG,out=<yaw_output>,err=<angle_error>,hold=<0/1>,rate=<yaw_rate>\n
+```
 
 **波形输出控制命令:**
 ```bash
@@ -1954,9 +1973,21 @@ pid_tuner.py
 │   ├── 查询/发送全部/重置 按钮
 │   └── 波形绘图区 (pyqtgraph)
 │
-├── LPFControlPanel         # LPF 参数调节面板 (3个)
+├── LPFControlPanel         # LPF 参数调节面板 (3个: G/J/L)
 │   ├── Tf 输入框 + 设置按钮
-│   └── 波形绘图区
+│   ├── 波形绘图区 (双曲线)
+│   │   ├── 蓝色线: 滤波前原始值
+│   │   └── 红色线: 滤波后平滑值
+│   └── 实时对比滤波效果
+│
+├── YawDebugPanel           # YAW 调试面板 (v2.4 新增)
+│   ├── 实时状态显示
+│   │   ├── 目标角度 / 当前角度 / 误差
+│   │   ├── 输出量 / 保持模式
+│   │   └── 当前角速度
+│   ├── 自动诊断 (连接/数据/误差/静止检测)
+│   ├── YAW PID 快捷调参 (E: 角度, F: 角速度)
+│   └── 控制说明 (工作模式/常见问题)
 │
 ├── SpeedAdaptivePanel      # 速度自适应面板
 │   ├── Kp_Max/Kp_Min 输入框
