@@ -419,7 +419,7 @@ static void handle_velocity(const pi_frame_t *frame) {
     float vx = read_be_float(&frame->data[0]);
     float yaw_rate = read_be_float(&frame->data[4]);
     
-    ESP_LOGD(TAG, "Velocity: vx=%.3f, yaw_rate=%.3f", vx, yaw_rate);
+    ESP_LOGI(TAG, "Velocity: vx=%.3f, yaw_rate=%.3f", vx, yaw_rate);
     
     if (g_callbacks.on_velocity) {
         g_callbacks.on_velocity(vx, yaw_rate);

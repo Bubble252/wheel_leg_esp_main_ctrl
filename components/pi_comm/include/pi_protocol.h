@@ -284,18 +284,18 @@ typedef struct __attribute__((packed)) {
 #define BE_TO_HOST16(x)  __builtin_bswap16(x)
 #define BE_TO_HOST32(x)  __builtin_bswap32(x)
 
-// 浮点数转换
-static inline float be_to_float(uint32_t be_val) {
-    uint32_t host_val = BE_TO_HOST32(be_val);
+// 浮点数转换 (输入是已转换为 host 字节序的 uint32)
+static inline float be_to_float(uint32_t host_val) {
     float result;
     __builtin_memcpy(&result, &host_val, sizeof(float));
     return result;
 }
 
+// float 转换为 uint32 (host 字节序, 供 write_be32 使用)
 static inline uint32_t float_to_be(float f) {
     uint32_t host_val;
     __builtin_memcpy(&host_val, &f, sizeof(float));
-    return HOST_TO_BE32(host_val);
+    return host_val;  // write_be32 会处理字节序
 }
 
 // 从大端序缓冲区读取

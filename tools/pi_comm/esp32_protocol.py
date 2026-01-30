@@ -273,9 +273,11 @@ class HeartbeatAck:
         cpu_load = data[8]
         status = data[9]
         
-        # 计算 RTT
-        now_ms = int(time.time() * 1000)
-        rtt_ms = now_ms - send_time
+        # 计算 RTT (都是截断后的 32 位值)
+        now_ms = int(time.time() * 1000) & 0xFFFFFFFF
+        rtt_ms = (now_ms - send_time) & 0xFFFFFFFF  # 处理回绕
+        if rtt_ms > 0x7FFFFFFF:  # 如果差值为负，修正
+            rtt_ms = 0
         
         return cls(
             timestamp=timestamp,
@@ -709,8 +711,8 @@ class ESP32Protocol:
         """心跳线程"""
         while self.running:
             try:
-                # 发送心跳
-                self.heartbeat_send_time = int(time.time() * 1000)
+                # 发送心跳 (时间戳截断为 32 位)
+                self.heartbeat_send_time = int(time.time() * 1000) & 0xFFFFFFFF
                 data = struct.pack('>I', self.heartbeat_send_time)
                 self._send_frame(CMD.HEARTBEAT, data)
                 

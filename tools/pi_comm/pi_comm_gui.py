@@ -44,7 +44,7 @@ import serial
 import serial.tools.list_ports
 
 # 导入协议库
-from esp32_protocol import ESP32Protocol, ProtocolConstants
+from esp32_protocol import ESP32Protocol, ProtocolConstants, FrameParser, CMD, StatusReport, HeartbeatAck
 
 
 # ============================================================================
@@ -61,10 +61,12 @@ class SerialThread(QThread):
     
     def __init__(self):
         super().__init__()
-        self.protocol = None
         self.running = False
         self.serial = None
+        self.parser = FrameParser()
         self.send_lock = Lock()
+        self.seq = 0
+        self.heartbeat_send_time = 0
     
     def connect_serial(self, port, baudrate=115200):
         """连接串口"""
@@ -77,14 +79,7 @@ class SerialThread(QThread):
                 stopbits=serial.STOPBITS_ONE,
                 timeout=0.1
             )
-            self.protocol = ESP32Protocol(port, baudrate, connect=False)
-            self.protocol.serial = self.serial
-            
-            # 注册回调
-            self.protocol.register_callback('state', self._on_state)
-            self.protocol.register_callback('heartbeat_ack', self._on_heartbeat_ack)
-            self.protocol.register_callback('param_response', self._on_param_response)
-            
+            self.parser.reset()
             self.running = True
             self.connection_status.emit(True)
             return True
@@ -98,7 +93,6 @@ class SerialThread(QThread):
         if self.serial and self.serial.is_open:
             self.serial.close()
         self.serial = None
-        self.protocol = None
         self.connection_status.emit(False)
     
     def run(self):
@@ -109,11 +103,47 @@ class SerialThread(QThread):
                     if self.serial.in_waiting > 0:
                         data = self.serial.read(self.serial.in_waiting)
                         self.data_received.emit(data)
-                        if self.protocol:
-                            self.protocol._process_rx_data(data)
+                        # 使用 FrameParser 解析数据
+                        frames = self.parser.feed(data)
+                        for seq, cmd, payload in frames:
+                            self._handle_frame(seq, cmd, payload)
                 except Exception as e:
                     self.error_occurred.emit(f"读取错误: {str(e)}")
             self.msleep(10)
+    
+    def _handle_frame(self, seq, cmd, data):
+        """处理接收到的帧"""
+        # 心跳响应
+        if cmd == CMD.HEARTBEAT_ACK:
+            try:
+                ack = HeartbeatAck.from_bytes(data, self.heartbeat_send_time)
+                self.frame_received.emit({'type': 'heartbeat_ack', 'data': ack})
+            except Exception as e:
+                self.error_occurred.emit(f"解析心跳响应失败: {str(e)}")
+            return
+        
+        # 握手响应
+        if cmd == CMD.HANDSHAKE_ACK:
+            self.frame_received.emit({'type': 'handshake_ack', 'data': data})
+            return
+        
+        # 状态上报
+        if cmd == CMD.STATUS_REPORT:
+            try:
+                status = StatusReport.from_bytes(data)
+                self.frame_received.emit({'type': 'state', 'data': status})
+            except Exception as e:
+                self.error_occurred.emit(f"解析状态失败: {str(e)}")
+            return
+        
+        # ACK/NACK
+        if cmd == CMD.ACK:
+            self.frame_received.emit({'type': 'ack', 'data': data})
+            return
+        
+        if cmd == CMD.NACK:
+            self.frame_received.emit({'type': 'nack', 'data': data})
+            return
     
     def send_frame(self, cmd, data=b''):
         """发送数据帧"""
@@ -122,28 +152,29 @@ class SerialThread(QThread):
         
         try:
             with self.send_lock:
-                if self.protocol:
-                    frame = self.protocol._build_frame(cmd, data)
-                    self.serial.write(frame)
-                    return True
+                self.seq = (self.seq + 1) & 0xFF
+                
+                # 构建 payload: SEQ + CMD + DATA
+                payload = bytes([self.seq, cmd]) + data
+                
+                # 计算 CRC
+                from esp32_protocol import crc16_ccitt
+                crc = crc16_ccitt(payload)
+                
+                # 构建帧: HEAD + LEN + PAYLOAD + CRC
+                import struct
+                frame = bytes([0xAA, 0x55, len(payload)]) + payload + struct.pack('>H', crc)
+                
+                self.serial.write(frame)
+                
+                # 记录心跳发送时间 (截断为 32 位)
+                if cmd == CMD.HEARTBEAT:
+                    self.heartbeat_send_time = int(time.time() * 1000) & 0xFFFFFFFF
+                
+                return True
         except Exception as e:
             self.error_occurred.emit(f"发送错误: {str(e)}")
         return False
-    
-    def _on_state(self, state):
-        """收到状态数据回调"""
-        self.frame_received.emit({'type': 'state', 'data': state})
-    
-    def _on_heartbeat_ack(self, timestamp):
-        """收到心跳响应回调"""
-        self.frame_received.emit({'type': 'heartbeat_ack', 'data': timestamp})
-    
-    def _on_param_response(self, param_id, success, value):
-        """收到参数响应回调"""
-        self.frame_received.emit({
-            'type': 'param_response',
-            'data': {'param_id': param_id, 'success': success, 'value': value}
-        })
 
 
 # ============================================================================
@@ -294,7 +325,7 @@ class HeightControlPanel(QWidget):
         preset_layout = QHBoxLayout()
         
         presets = [
-            ("低姿态", 0.11),
+            ("低姿态", 0.07),
             ("中姿态", 0.14),
             ("高姿态", 0.17),
         ]
@@ -325,7 +356,8 @@ class HeightControlPanel(QWidget):
     def send_height(self):
         """发送高度命令"""
         height = self.height_input.value()
-        data = struct.pack('>f', height)
+        duration = 0.5  # 默认过渡时间 0.5秒
+        data = struct.pack('>ff', height, duration)  # height + duration
         self.command_requested.emit(ProtocolConstants.CMD_SET_HEIGHT, data)
 
 
@@ -420,14 +452,16 @@ class AttitudeControlPanel(QWidget):
         """发送Pitch命令"""
         pitch_deg = self.pitch_input.value()
         pitch_rad = pitch_deg * 3.14159265 / 180.0  # 转换为弧度
-        data = struct.pack('>f', pitch_rad)
+        duration = 0.5  # 默认过渡时间 0.5秒
+        data = struct.pack('>ff', pitch_rad, duration)  # pitch + duration
         self.command_requested.emit(ProtocolConstants.CMD_SET_PITCH, data)
     
     def send_roll(self):
         """发送Roll命令"""
         roll_deg = self.roll_input.value()
         roll_rad = roll_deg * 3.14159265 / 180.0
-        data = struct.pack('>f', roll_rad)
+        duration = 0.5  # 默认过渡时间 0.5秒
+        data = struct.pack('>ff', roll_rad, duration)  # roll + duration
         self.command_requested.emit(ProtocolConstants.CMD_SET_ROLL, data)
     
     def send_both(self):
@@ -450,15 +484,15 @@ class PoseControlPanel(QWidget):
     
     command_requested = pyqtSignal(int, bytes)
     
-    # 预设姿态定义
+    # 预设姿态定义: (name, icon, color, pitch_deg, roll_deg, height_m)
     POSES = {
-        0: ("站立", "🧍", "#4CAF50"),
-        1: ("蹲下", "🧎", "#2196F3"),
-        2: ("前倾", "↗️", "#FF9800"),
-        3: ("后仰", "↙️", "#FF5722"),
-        4: ("左倾", "⬅️", "#9C27B0"),
-        5: ("右倾", "➡️", "#E91E63"),
-        6: ("准备跳跃", "🦘", "#00BCD4"),
+        0: ("站立", "🧍", "#4CAF50", 0.0, 0.0, 0.14),
+        1: ("蹲下", "🧎", "#2196F3", 0.0, 0.0, 0.07),
+        2: ("前倾", "↗️", "#FF9800", 10.0, 0.0, 0.14),
+        3: ("后仰", "↙️", "#FF5722", -10.0, 0.0, 0.14),
+        4: ("左倾", "⬅️", "#9C27B0", 0.0, 10.0, 0.14),
+        5: ("右倾", "➡️", "#E91E63", 0.0, -10.0, 0.14),
+        6: ("准备跳跃", "🦘", "#00BCD4", -5.0, 0.0, 0.07),
     }
     
     def __init__(self, parent=None):
@@ -473,7 +507,7 @@ class PoseControlPanel(QWidget):
         pose_layout.setSpacing(10)
         
         row, col = 0, 0
-        for pose_id, (name, icon, color) in self.POSES.items():
+        for pose_id, (name, icon, color, pitch, roll, height) in self.POSES.items():
             btn = QPushButton(f"{icon} {name}")
             btn.setStyleSheet(f"""
                 font-size: 14px; font-weight: bold; padding: 15px;
@@ -509,13 +543,22 @@ class PoseControlPanel(QWidget):
     
     def send_pose(self, pose_id):
         """发送姿态命令"""
-        data = struct.pack('>B', pose_id)
+        if pose_id not in self.POSES:
+            return
+        
+        name, icon, _, pitch_deg, roll_deg, height = self.POSES[pose_id]
+        
+        # 转换为弧度
+        pitch_rad = pitch_deg * 3.14159265 / 180.0
+        roll_rad = roll_deg * 3.14159265 / 180.0
+        duration = 0.5  # 默认过渡时间
+        
+        # pose_cmd_t: pitch(f) + roll(f) + height(f) + duration(f) = 16 bytes
+        data = struct.pack('>ffff', pitch_rad, roll_rad, height, duration)
         self.command_requested.emit(ProtocolConstants.CMD_SET_POSE, data)
         
         # 更新显示
-        if pose_id in self.POSES:
-            name, icon, _ = self.POSES[pose_id]
-            self.current_pose_label.setText(f"{icon} {name}")
+        self.current_pose_label.setText(f"{icon} {name}")
 
 
 # ============================================================================
@@ -621,28 +664,28 @@ class StatusDisplayPanel(QWidget):
         return label
     
     def update_state(self, state):
-        """更新状态显示"""
-        if 'pitch' in state:
-            self.pitch_label.setText(f"{state['pitch'] * 180 / 3.14159:.1f}")
-        if 'roll' in state:
-            self.roll_label.setText(f"{state['roll'] * 180 / 3.14159:.1f}")
-        if 'yaw' in state:
-            self.yaw_label.setText(f"{state['yaw'] * 180 / 3.14159:.1f}")
-        if 'yaw_rate' in state:
-            self.yaw_rate_label.setText(f"{state['yaw_rate']:.2f}")
-        if 'velocity' in state:
-            self.vx_label.setText(f"{state['velocity']:.2f}")
-        if 'leg_length' in state:
-            self.leg_length_label.setText(f"{state['leg_length']:.3f}")
-        if 'battery_voltage' in state:
-            self.battery_label.setText(f"{state['battery_voltage']:.1f}")
-        if 'temperature' in state:
-            self.temp_label.setText(f"{state['temperature']:.1f}")
-        if 'control_state' in state:
-            states = {0: '停止', 1: '运行', 2: '错误', 3: '初始化'}
-            self.control_state_label.setText(states.get(state['control_state'], '未知'))
-        if 'error_code' in state:
-            self.error_label.setText(f"0x{state['error_code']:04X}")
+        """更新状态显示 (state 是 StatusReport 对象)"""
+        # StatusReport 对象有属性: pitch, roll, yaw, vx_actual, yaw_rate_actual,
+        # battery_voltage, height_actual, mode, status, error_code, flags
+        if hasattr(state, 'pitch'):
+            self.pitch_label.setText(f"{state.pitch:.1f}")
+        if hasattr(state, 'roll'):
+            self.roll_label.setText(f"{state.roll:.1f}")
+        if hasattr(state, 'yaw'):
+            self.yaw_label.setText(f"{state.yaw:.1f}")
+        if hasattr(state, 'yaw_rate_actual'):
+            self.yaw_rate_label.setText(f"{state.yaw_rate_actual:.2f}")
+        if hasattr(state, 'vx_actual'):
+            self.vx_label.setText(f"{state.vx_actual:.2f}")
+        if hasattr(state, 'height_actual'):
+            self.leg_length_label.setText(f"{state.height_actual:.3f}")
+        if hasattr(state, 'battery_voltage'):
+            self.battery_label.setText(f"{state.battery_voltage:.1f}")
+        if hasattr(state, 'status'):
+            states = {0: '停止', 1: '运行', 2: '错误', 3: '初始化', 4: '就绪', 5: '急停'}
+            self.control_state_label.setText(states.get(state.status, f'{state.status}'))
+        if hasattr(state, 'error_code'):
+            self.error_label.setText(f"0x{state.error_code:02X}")
 
 
 # ============================================================================
@@ -717,17 +760,18 @@ class WaveformPanel(QWidget):
         layout.addLayout(btn_layout)
     
     def update_data(self, state):
-        """更新波形数据"""
+        """更新波形数据 (state 是 StatusReport 对象)"""
         if self.pause_btn.isChecked():
             return
         
         self.data_counter += 1
         self.time_data.append(self.data_counter)
         
-        pitch_deg = state.get('pitch', 0) * 180 / 3.14159
-        roll_deg = state.get('roll', 0) * 180 / 3.14159
-        vx = state.get('velocity', 0)
-        yaw_rate = state.get('yaw_rate', 0)
+        # StatusReport 对象的属性: pitch, roll, vx_actual, yaw_rate_actual (单位已经是度)
+        pitch_deg = getattr(state, 'pitch', 0)
+        roll_deg = getattr(state, 'roll', 0)
+        vx = getattr(state, 'vx_actual', 0)
+        yaw_rate = getattr(state, 'yaw_rate_actual', 0)
         
         self.pitch_data.append(pitch_deg)
         self.roll_data.append(roll_deg)
@@ -945,9 +989,9 @@ class PiCommMainWindow(QMainWindow):
             self.serial_thread.start()
             self.log(f"✓ 已连接: {port_data} @ {baudrate}")
             
-            # 启动心跳
+            # 启动心跳 (500ms 间隔, ESP32 超时为 2000ms)
             if self.heartbeat_cb.isChecked():
-                self.heartbeat_timer.start(1000)
+                self.heartbeat_timer.start(500)
         else:
             self.log("✗ 连接失败", is_error=True)
     

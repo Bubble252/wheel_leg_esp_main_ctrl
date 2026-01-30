@@ -29,7 +29,7 @@ extern "C" {
 #define PI_COMM_TASK_PRIORITY       5
 #define PI_COMM_TASK_CORE           0
 
-#define PI_COMM_HEARTBEAT_TIMEOUT_MS    300     // 心跳超时 (ms)
+#define PI_COMM_HEARTBEAT_TIMEOUT_MS    2000    // 心跳超时 (ms), 需大于 Python 心跳间隔
 #define PI_COMM_STATUS_REPORT_INTERVAL  50      // 状态上报间隔 (ms)
 
 // ============================================================================

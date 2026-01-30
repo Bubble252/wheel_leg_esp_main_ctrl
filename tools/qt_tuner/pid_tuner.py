@@ -82,6 +82,9 @@ class SerialThread(QThread):
     def run(self):
         self.running = True
         buffer = ""
+        error_count = 0
+        max_errors = 5  # 连续错误次数超过此值则停止打印
+        
         while self.running:
             if self.serial_port and self.serial_port.is_open:
                 try:
@@ -96,8 +99,22 @@ class SerialThread(QThread):
                             line = line.strip()
                             if line:
                                 self.data_received.emit(line)
+                        error_count = 0  # 重置错误计数
+                except OSError as e:
+                    error_count += 1
+                    if error_count <= max_errors:
+                        print(f"串口读取错误: {e}")
+                    elif error_count == max_errors + 1:
+                        print("串口断开，请检查 USB 连接后重新连接串口")
+                    # 串口可能已断开，关闭它
+                    try:
+                        self.serial_port.close()
+                    except:
+                        pass
                 except Exception as e:
-                    print(f"串口读取错误: {e}")
+                    error_count += 1
+                    if error_count <= max_errors:
+                        print(f"串口读取错误: {e}")
             self.msleep(10)
     
     def stop(self):
@@ -861,14 +878,17 @@ class LegControlPanel(QWidget):
     # 运动学参数 (与 leg_kinematics.h 保持一致)
     LEG_THIGH_LENGTH = 0.10  # 大腿长度 (m)
     LEG_SHANK_LENGTH = 0.10  # 小腿长度 (m)
-    LEG_LENGTH_MIN = 0.11    # 最小腿长 (m) - 与 C 代码一致
-    LEG_LENGTH_MAX = 0.17    # 最大腿长 (m) - 与 C 代码一致
+    DEFAULT_LEG_LENGTH_MIN = 0.07    # 默认最小腿长 (m) - 与 C 代码一致
+    DEFAULT_LEG_LENGTH_MAX = 0.17    # 默认最大腿长 (m) - 与 C 代码一致
     LEG_BODY_ANGLE_MIN = -160.0  # 最小身体夹角 (度), 向前蹬腿
     LEG_BODY_ANGLE_MAX = -20.0   # 最大身体夹角 (度), 向后蹬腿
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_window = parent
+        # 可调节的腿长范围
+        self.leg_length_min = self.DEFAULT_LEG_LENGTH_MIN
+        self.leg_length_max = self.DEFAULT_LEG_LENGTH_MAX
         self.init_ui()
     
     def init_ui(self):
@@ -910,6 +930,53 @@ class LegControlPanel(QWidget):
         enable_group.setLayout(enable_layout)
         layout.addWidget(enable_group)
         
+        # ===== 腿长范围设置 =====
+        range_group = QGroupBox("📏 腿长范围设置")
+        range_layout = QGridLayout()
+        range_layout.setSpacing(8)
+        
+        # 最小腿长
+        range_layout.addWidget(QLabel("最小腿长 (m):"), 0, 0)
+        self.leg_min_input = QDoubleSpinBox()
+        self.leg_min_input.setRange(0.05, 0.15)  # 硬件限制范围
+        self.leg_min_input.setValue(self.leg_length_min)
+        self.leg_min_input.setDecimals(3)
+        self.leg_min_input.setSingleStep(0.005)
+        self.leg_min_input.setStyleSheet("font-size: 12px; padding: 3px;")
+        self.leg_min_input.valueChanged.connect(self.on_leg_range_changed)
+        range_layout.addWidget(self.leg_min_input, 0, 1)
+        
+        # 最大腿长
+        range_layout.addWidget(QLabel("最大腿长 (m):"), 0, 2)
+        self.leg_max_input = QDoubleSpinBox()
+        self.leg_max_input.setRange(0.10, 0.20)  # 硬件限制范围
+        self.leg_max_input.setValue(self.leg_length_max)
+        self.leg_max_input.setDecimals(3)
+        self.leg_max_input.setSingleStep(0.005)
+        self.leg_max_input.setStyleSheet("font-size: 12px; padding: 3px;")
+        self.leg_max_input.valueChanged.connect(self.on_leg_range_changed)
+        range_layout.addWidget(self.leg_max_input, 0, 3)
+        
+        # 发送到ESP32按钮
+        self.send_range_btn = QPushButton("📤 发送到ESP32")
+        self.send_range_btn.setStyleSheet("background-color: #9C27B0; color: white; padding: 5px 15px;")
+        self.send_range_btn.clicked.connect(self.send_leg_range_to_esp)
+        range_layout.addWidget(self.send_range_btn, 0, 4)
+        
+        # 重置按钮
+        self.reset_range_btn = QPushButton("🔄 重置")
+        self.reset_range_btn.setToolTip("重置为默认值 (0.07 ~ 0.17)")
+        self.reset_range_btn.clicked.connect(self.reset_leg_range)
+        range_layout.addWidget(self.reset_range_btn, 0, 5)
+        
+        # 说明标签
+        range_hint = QLabel("💡 修改范围后会自动更新下方滑块，发送到ESP32可同步设备端限制")
+        range_hint.setStyleSheet("font-size: 10px; color: #888;")
+        range_layout.addWidget(range_hint, 1, 0, 1, 6)
+        
+        range_group.setLayout(range_layout)
+        layout.addWidget(range_group)
+        
         # ===== 运动学控制 (腿长 + 身体夹角) =====
         kin_group = QGroupBox("📐 运动学控制 (腿长 + 身体夹角)")
         kin_layout = QGridLayout()
@@ -918,7 +985,7 @@ class LegControlPanel(QWidget):
         # 腿长设置
         kin_layout.addWidget(QLabel("腿长 (m):"), 0, 0)
         self.leg_length_input = QDoubleSpinBox()
-        self.leg_length_input.setRange(self.LEG_LENGTH_MIN, self.LEG_LENGTH_MAX)
+        self.leg_length_input.setRange(self.leg_length_min, self.leg_length_max)
         self.leg_length_input.setValue(0.15)
         self.leg_length_input.setDecimals(3)
         self.leg_length_input.setSingleStep(0.005)
@@ -928,7 +995,7 @@ class LegControlPanel(QWidget):
         
         # 腿长滑块
         self.leg_length_slider = QSlider(Qt.Horizontal)
-        self.leg_length_slider.setRange(int(self.LEG_LENGTH_MIN * 1000), int(self.LEG_LENGTH_MAX * 1000))
+        self.leg_length_slider.setRange(int(self.leg_length_min * 1000), int(self.leg_length_max * 1000))
         self.leg_length_slider.setValue(150)
         self.leg_length_slider.valueChanged.connect(lambda v: self.leg_length_input.setValue(v / 1000.0))
         self.leg_length_input.valueChanged.connect(lambda v: self.leg_length_slider.setValue(int(v * 1000)))
@@ -1072,7 +1139,7 @@ class LegControlPanel(QWidget):
         kin_presets = [
             ("站立", 0.14, -90),    # 正常站立，垂直向下
             ("半蹲", 0.12, -90),    # 半蹲
-            ("蹲下", 0.11, -90),    # 蹲下
+            ("蹲下", 0.07, -90),    # 蹲下 (最小腿长)
             ("伸直", 0.17, -90),    # 腿伸直
             ("前蹬", 0.14, -120),   # 向前蹬腿
             ("后蹬", 0.14, -60),    # 向后蹬腿
@@ -1121,7 +1188,7 @@ class LegControlPanel(QWidget):
         ik_layout = QHBoxLayout()
         ik_layout.addWidget(QLabel("IK: L="))
         self.ik_length_input = QDoubleSpinBox()
-        self.ik_length_input.setRange(0.11, 0.17)
+        self.ik_length_input.setRange(0.07, 0.17)
         self.ik_length_input.setValue(0.14)
         self.ik_length_input.setDecimals(3)
         ik_layout.addWidget(self.ik_length_input)
@@ -1212,6 +1279,53 @@ class LegControlPanel(QWidget):
         label.setAlignment(Qt.AlignCenter)
         label.setMinimumWidth(80)
         return label
+    
+    def on_leg_range_changed(self):
+        """腿长范围改变时更新UI控件的范围"""
+        new_min = self.leg_min_input.value()
+        new_max = self.leg_max_input.value()
+        
+        # 确保最小值小于最大值
+        if new_min >= new_max:
+            return
+        
+        self.leg_length_min = new_min
+        self.leg_length_max = new_max
+        
+        # 更新腿长输入框的范围
+        current_value = self.leg_length_input.value()
+        self.leg_length_input.setRange(new_min, new_max)
+        
+        # 如果当前值超出新范围，调整到范围内
+        if current_value < new_min:
+            self.leg_length_input.setValue(new_min)
+        elif current_value > new_max:
+            self.leg_length_input.setValue(new_max)
+        
+        # 更新腿长滑块的范围
+        self.leg_length_slider.setRange(int(new_min * 1000), int(new_max * 1000))
+        
+    def reset_leg_range(self):
+        """重置腿长范围为默认值"""
+        self.leg_min_input.setValue(self.DEFAULT_LEG_LENGTH_MIN)
+        self.leg_max_input.setValue(self.DEFAULT_LEG_LENGTH_MAX)
+        
+    def send_leg_range_to_esp(self):
+        """发送腿长范围到ESP32"""
+        min_len = self.leg_min_input.value()
+        max_len = self.leg_max_input.value()
+        
+        if min_len >= max_len:
+            self.log_message(f"❌ 错误: 最小腿长({min_len})必须小于最大腿长({max_len})")
+            return
+        
+        # 发送设置命令到ESP32
+        cmd = f"balance leg range {min_len:.3f} {max_len:.3f}"
+        if self.parent_window and hasattr(self.parent_window, 'send_command'):
+            self.parent_window.send_command(cmd)
+            self.log_message(f"📤 发送腿长范围: {min_len:.3f}m ~ {max_len:.3f}m")
+        else:
+            self.log_message(f"❌ 无法发送命令，请先连接串口")
     
     def update_ik_preview(self):
         """更新逆运动学预览 (本地计算) - 与 C 代码 leg_kinematics.c 保持一致"""
@@ -3294,16 +3408,40 @@ class PIDTunerUI(QMainWindow):
             self.log(f"✓ {line}", is_receive=True)
         
         # 检测 IMU 数据: Roll=xxx Pitch=xxx Yaw=xxx
-        imu_match = re.search(r'Roll[=:]?\s*([-\d.]+).*Pitch[=:]?\s*([-\d.]+).*Yaw[=:]?\s*([-\d.]+)', line, re.IGNORECASE)
+        # 格式: "Angle: Roll= +0.05 Pitch= -0.63 Yaw= +67.12 (°)"
+        imu_match = re.search(r'Roll[=:]\s*([-+]?\d+\.?\d*)\s+Pitch[=:]\s*([-+]?\d+\.?\d*)\s+Yaw[=:]\s*([-+]?\d+\.?\d*)', line, re.IGNORECASE)
         if imu_match:
             try:
                 roll = float(imu_match.group(1))
                 pitch = float(imu_match.group(2))
                 yaw = float(imu_match.group(3))
-                if hasattr(self, 'imu_panel'):
+                if hasattr(self, 'imu_panel') and self.imu_panel is not None:
                     self.imu_panel.update_imu_data(roll, pitch, yaw, 0, 0, 0)
-            except:
-                pass
+                    # 在状态栏显示 IMU 数据
+                    self.status_label.setText(f"R:{roll:.1f}° P:{pitch:.1f}° Y:{yaw:.1f}°")
+                # 同时更新腿部面板中的 Roll 显示 (如果有)
+                if hasattr(self, 'leg_panel') and self.leg_panel is not None:
+                    if hasattr(self.leg_panel, 'update_roll_display'):
+                        self.leg_panel.update_roll_display(roll)
+            except Exception as e:
+                if self.debug_mode:
+                    self.log(f"IMU 解析错误: {e}", is_error=True)
+        
+        # 检测 Gyro 数据: Gyro: X= +0.18 Y= -0.18 Z= -0.49 (°/s)
+        gyro_match = re.search(r'Gyro:\s*X[=:]\s*([-+]?\d+\.?\d*)\s+Y[=:]\s*([-+]?\d+\.?\d*)\s+Z[=:]\s*([-+]?\d+\.?\d*)', line, re.IGNORECASE)
+        if gyro_match:
+            try:
+                gx = float(gyro_match.group(1))
+                gy = float(gyro_match.group(2))
+                gz = float(gyro_match.group(3))
+                if hasattr(self, 'imu_panel') and self.imu_panel is not None:
+                    # 只更新角速度部分
+                    self.imu_panel.gx_label.setText(f"{gx:.2f}°/s")
+                    self.imu_panel.gy_label.setText(f"{gy:.2f}°/s")
+                    self.imu_panel.gz_label.setText(f"{gz:.2f}°/s")
+            except Exception as e:
+                if self.debug_mode:
+                    self.log(f"Gyro 解析错误: {e}", is_error=True)
         
         # 检测电机状态: M1: pos=xxx spd=xxx cur=xxx ONLINE/OFFLINE
         motor_match = re.search(r'M(\d):\s*pos=([-\d.]+).*spd=([-\d.]+).*cur=([-\d.]+).*?(ONLINE|OFFLINE)', line, re.IGNORECASE)

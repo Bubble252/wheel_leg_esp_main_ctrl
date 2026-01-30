@@ -128,12 +128,13 @@ typedef struct {
  */
 typedef struct {
     // 姿态数据 (来自 IMU)
-    float pitch;            // 俯仰角 (度)
+    float pitch;            // 俯仰角 (度) - 可能经过腿部补偿，用于平衡控制
     float pitch_rate;       // 俯仰角速度 (度/秒)
     float roll;             // 横滚角 (度)
     float roll_rate;        // 横滚角速度 (度/秒)
     float yaw;              // 偏航角 (度)
     float yaw_rate;         // 偏航角速度 (度/秒)
+    float raw_pitch;        // IMU 原始俯仰角 (度) - 用于紧急停止判断，不受腿部补偿影响
     
     // 轮子数据 (来自电机编码器)
     float left_wheel_pos;   // 左轮位置 (弧度)

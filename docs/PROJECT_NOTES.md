@@ -1111,7 +1111,7 @@ void balance_ctrl_update(const imu_data_t *imu, float target_speed, float target
 ```
 
 **工作空间定义:**
-- **腿长** (leg_length): 大腿电机轴心到轮电机轴心的直线距离 [0.11m ~ 0.17m]
+- **腿长** (leg_length): 大腿电机轴心到轮电机轴心的直线距离 [0.07m ~ 0.17m]
 - **身体夹角** (body_angle): 该直线与机身垂直向下方向的夹角 [-160° ~ -20°]，垂直向下=-90°
 
 **电机零点偏移:**

@@ -75,7 +75,7 @@ extern "C" {
 
 // 腿部工作空间限位
 #ifndef LEG_LENGTH_MIN
-#define LEG_LENGTH_MIN              0.11f   // 最小腿长 (米)
+#define LEG_LENGTH_MIN              0.07f   // 最小腿长 (米)
 #endif
 
 #ifndef LEG_LENGTH_MAX

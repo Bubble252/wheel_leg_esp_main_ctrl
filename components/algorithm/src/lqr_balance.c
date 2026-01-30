@@ -273,14 +273,17 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     }
     
     // ===== 检查紧急停止 =====
-    if (lqr_check_emergency(ctrl, input->pitch)) {
+    // 使用 raw_pitch (IMU 原始值) 来判断，不受腿部补偿影响
+    // 如果 raw_pitch 为 0 (未设置)，则回退使用 pitch
+    float pitch_for_emergency = (input->raw_pitch != 0.0f) ? input->raw_pitch : input->pitch;
+    if (lqr_check_emergency(ctrl, pitch_for_emergency)) {
         ctrl->state = LQR_STATE_EMERGENCY;
         output->state = LQR_STATE_EMERGENCY;
         // 限流打印：每秒最多打印一次
         static uint32_t last_emergency_log = 0;
         uint32_t now = (uint32_t)(esp_log_timestamp());
         if (now - last_emergency_log > 1000) {
-            ESP_LOGW(TAG, "Emergency stop! pitch=%.2f", input->pitch);
+            ESP_LOGW(TAG, "Emergency stop! raw_pitch=%.2f (pitch=%.2f)", pitch_for_emergency, input->pitch);
             last_emergency_log = now;
         }
         return ESP_ERR_INVALID_STATE;
@@ -535,11 +538,11 @@ esp_err_t lqr_roll_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr_ro
     
     // ===== 转换为腿长增量 =====
     // Roll 平衡原理:
-    //   - roll > 0 (向右倾): 左腿伸长, 右腿缩短 -> 机身回正
-    //   - roll < 0 (向左倾): 左腿缩短, 右腿伸长 -> 机身回正
-    // 
+    //   - roll > 0 (向右倾): 左腿缩短, 右腿伸长 -> 机身回正
+    //   - roll < 0 (向左倾): 左腿伸长, 右腿缩短 -> 机身回正
+    //
     // roll_control 的符号设计:
-    //   - filtered_roll > 0 -> roll_control > 0 -> 需要左腿伸长
+    //   - filtered_roll > 0 -> roll_control < 0 -> 需要左腿缩短
     float left_leg_delta = roll_control;
     float right_leg_delta = -roll_control;
     

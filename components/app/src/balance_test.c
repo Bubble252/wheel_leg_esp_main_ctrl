@@ -29,6 +29,7 @@
 #include "leg_kinematics.h"
 #include "power_detect.h"
 #include "commander_parser.h"
+#include "pi_comm.h"      // 树莓派串口通信
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -212,6 +213,12 @@ static float g_yaw_angle_total = 0.0f;      // YAW 累积角度 (经过过零处
 static float g_yaw_output = 0.0f;           // YAW 控制输出
 static bool g_yaw_first_run = true;         // YAW 首次运行标志
 
+// Roll 控制 (腿长调节)
+static float g_roll_output = 0.0f;          // Roll 控制原始输出
+static float g_roll_left_delta = 0.0f;      // 左腿长度增量
+static float g_roll_right_delta = 0.0f;     // 右腿长度增量
+static float g_roll_filtered = 0.0f;        // 滤波后的 Roll 角度
+
 // 波形数据输出 (用于 Qt 调参面板)
 static bool g_plot_enabled = false;         // 波形输出使能
 static uint8_t g_plot_divider = 10;         // 输出分频 (每N次控制循环输出一次)
@@ -239,14 +246,26 @@ static float g_leg_right_hip_angle = 0.0f;   // 右大腿角度
 static float g_leg_right_knee_angle = 0.0f;  // 右小腿角度
 static float g_leg_move_speed = 50.0f;        // 腿部电机运动速度 (rpm)
 
+// 腿长范围限制 (可通过 UI 或 CLI 调节)
+static float g_leg_length_min = 0.07f;        // 最小腿长 (m), 默认与 LEG_LENGTH_MIN 一致
+static float g_leg_length_max = 0.17f;        // 最大腿长 (m), 默认与 LEG_LENGTH_MAX 一致
+
 // 腿部目标状态 (运动学空间)
-static float g_leg_left_target_length = 0.14f;   // 左腿目标腿长 (米)
-static float g_leg_left_target_angle = -90.0f;   // 左腿目标身体夹角 (度), -90=垂直向下
-static float g_leg_right_target_length = 0.14f;  // 右腿目标腿长 (米)
-static float g_leg_right_target_angle = -90.0f;  // 右腿目标身体夹角 (度), -90=垂直向下
+// 基础腿长/角度: 用户设定的"高度"，Roll控制不修改这些值
+static float g_leg_base_length = 0.14f;          // 基础腿长 (米) - 决定机器人高度
+static float g_leg_base_angle = -90.0f;          // 基础身体夹角 (度), -90=垂直向下
+
+// 实际发送给电机的目标 (= 基础值 + Roll调整)
+static float g_leg_left_target_length = 0.14f;   // 左腿实际目标腿长 (米)
+static float g_leg_left_target_angle = -90.0f;   // 左腿实际目标身体夹角 (度)
+static float g_leg_right_target_length = 0.14f;  // 右腿实际目标腿长 (米)
+static float g_leg_right_target_angle = -90.0f;  // 右腿实际目标身体夹角 (度), -90=垂直向下
 
 // Roll 闭环控制开关 (与腿长相关，纯轮测试时禁用)
 static bool g_roll_control_enabled = false;  // 默认禁用
+
+// 树莓派通信开关 (调试时可禁用以减少串口占用)
+static bool g_pi_comm_enabled = false;  // 默认禁用
 
 // ============================================================================
 // Commander 参数回调 - 将调参面板的参数同步到 LQR 控制器
@@ -492,6 +511,55 @@ static bool commander_query_callback(char controller_id, commander_pid_params_t 
 // ============================================================================
 // 波形数据输出 (用于 Qt 调参面板绘图)
 // ============================================================================
+
+/**
+ * @brief 更新并上报机器人状态到 Pi
+ * @note 由控制任务周期性调用，pi_comm 内部控制实际上报频率
+ */
+static void update_pi_comm_state(void) {
+    pi_robot_state_t state = {0};
+    
+    // 模式和状态
+    if (g_wheel_cmd.enabled) {
+        state.mode = MODE_STAND;
+        state.status = STATUS_RUNNING;
+    } else {
+        state.mode = MODE_IDLE;
+        state.status = STATUS_IDLE;
+    }
+    
+    // 标志位
+    if (g_wheel_cmd.enabled) {
+        state.flags |= FLAG_MOTOR_ENABLED | FLAG_BALANCE_ACTIVE;
+    }
+    if (g_lqr_ctrl.yaw_holding) {
+        state.flags |= FLAG_YAW_HOLDING;
+    }
+    if (pi_comm_is_connected()) {
+        state.flags |= FLAG_PI_CONNECTED;
+    }
+    
+    // IMU 数据 (度)
+    state.pitch = g_imu_data.pitch;
+    state.roll = g_imu_data.roll;
+    state.yaw = g_imu_data.yaw;
+    
+    // 速度计算: rpm -> rad/s -> m/s
+    // wheel_speed (rpm) * (2π/60) = rad/s, 再乘轮子半径得到线速度
+    const float rpm_to_rad_s = 3.14159f / 30.0f;
+    const float wheel_radius_m = WHEEL_RADIUS / 1000.0f;  // mm -> m
+    float avg_wheel_rpm = (g_wheel_state.left_speed + g_wheel_state.right_speed) / 2.0f;
+    state.vx_actual = avg_wheel_rpm * rpm_to_rad_s * wheel_radius_m;
+    state.yaw_rate_actual = g_imu_data.yaw_rate;
+    
+    // 高度 (取左右腿平均目标值)
+    state.height_actual = (g_leg_left_target_length + g_leg_right_target_length) / 2.0f;
+    
+    // 电池电压 (TODO: 从实际传感器读取)
+    state.battery_voltage = 24.0f;
+    
+    pi_comm_update_state(&state);
+}
 
 /**
  * @brief 使能/禁用波形数据输出
@@ -1000,6 +1068,18 @@ esp_err_t balance_test_init(void) {
     // 初始化腿部控制 (计算初始电机角度)
     leg_ctrl_init();
     
+    // 初始化树莓派串口通信 (Core 0, 仅通信，不影响控制)
+    if (g_pi_comm_enabled) {
+        ret = pi_comm_init();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Pi comm init failed: %s (continuing anyway)", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "Pi comm initialized (UART1: TX=GPIO4, RX=GPIO5, 115200bps)");
+        }
+    } else {
+        ESP_LOGI(TAG, "Pi comm disabled (use 'balance picomm 1' to enable)");
+    }
+    
     g_state = BALANCE_TEST_READY;
     g_initialized = true;
     
@@ -1233,9 +1313,16 @@ void balance_test_print_status(void) {
     ESP_LOGI(TAG, "Roll control: %s", g_roll_control_enabled ? "ENABLED" : "DISABLED");
     ESP_LOGI(TAG, "Leg control: %s", g_leg_control_enabled ? "ENABLED" : "DISABLED");
     if (g_leg_control_enabled) {
+        ESP_LOGI(TAG, "  Leg targets: L=%.3fm/%.1fdeg, R=%.3fm/%.1fdeg",
+                 g_leg_left_target_length, g_leg_left_target_angle,
+                 g_leg_right_target_length, g_leg_right_target_angle);
         ESP_LOGI(TAG, "  Leg angles: L_Hip=%.1f, L_Knee=%.1f, R_Hip=%.1f, R_Knee=%.1f",
                  g_leg_left_hip_angle, g_leg_left_knee_angle,
                  g_leg_right_hip_angle, g_leg_right_knee_angle);
+        if (g_roll_control_enabled) {
+            ESP_LOGI(TAG, "  Roll ctrl: out=%.3f, L_delta=%.4f, R_delta=%.4f, roll_filt=%.2f",
+                     g_roll_output, g_roll_left_delta, g_roll_right_delta, g_roll_filtered);
+        }
     }
     ESP_LOGI(TAG, "Control freq: %.1f Hz", g_stats.control_freq_hz);
     ESP_LOGI(TAG, "IMU freq: %.1f Hz", g_stats.imu_freq_hz);
@@ -1365,6 +1452,11 @@ static void task_balance_ctrl(void *arg) {
             g_motor_count_per_sec = 0;
             g_leg_count_per_sec = 0;
             g_last_stat_time = now;
+        }
+        
+        // 更新 pi_comm 状态 (仅在使能时)
+        if (g_pi_comm_enabled) {
+            update_pi_comm_state();
         }
         
         vTaskDelayUntil(&last_wake, period);
@@ -1586,8 +1678,47 @@ static void compute_balance_output(float dt) {
     g_yaw_angle_last = imu.yaw;
     
     // ======== 准备 LQR 输入 ========
+    // 计算真实倾斜角 theta3: 当腿部使能时，考虑腿部角度补偿
+    // theta3 = pitch(IMU) + body_angle(腿相对机身) + 90
+    // body_angle 定义：腿与机身垂直向下方向的夹角，-90°=垂直向下
+    // 当 body_angle = -90° 时，theta3 = pitch + 0 = pitch (无补偿)
+    // 当腿向前倾斜 body_angle > -90° 时，theta3 > pitch
+    float pitch_for_control = imu.pitch;
+    if (g_leg_control_enabled) {
+        // 使用 FK 从电机编码器获取实际的 body_angle
+        leg_state_t left_leg_state, right_leg_state;
+        float avg_body_angle = -90.0f;  // 默认垂直
+        
+        if (leg_ctrl_get_state(true, &left_leg_state) == ESP_OK && 
+            leg_ctrl_get_state(false, &right_leg_state) == ESP_OK &&
+            left_leg_state.valid && right_leg_state.valid) {
+            // 使用左右腿实际角度的平均值
+            float left_body_angle = left_leg_state.workspace.body_angle;
+            float right_body_angle = right_leg_state.workspace.body_angle;
+            
+            // 安全检查: body_angle 应该在合理范围内 (-160° ~ -20°)
+            // 如果不在范围内，说明电机数据异常，使用默认值
+            if (left_body_angle >= LEG_BODY_ANGLE_MIN && left_body_angle <= LEG_BODY_ANGLE_MAX &&
+                right_body_angle >= LEG_BODY_ANGLE_MIN && right_body_angle <= LEG_BODY_ANGLE_MAX) {
+                avg_body_angle = (left_body_angle + right_body_angle) / 2.0f;
+            } else {
+                // 数据异常，使用默认值并打印警告
+                static uint32_t last_warn_time = 0;
+                uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                if (now - last_warn_time > 2000) {  // 每 2 秒打印一次
+                    ESP_LOGW(TAG, "Invalid body_angle from FK: L=%.1f, R=%.1f, using default -90",
+                             left_body_angle, right_body_angle);
+                    last_warn_time = now;
+                }
+            }
+        }
+        
+        pitch_for_control = imu.pitch + avg_body_angle + 90.0f;
+    }
+    
     lqr_input_t input = {
-        .pitch = imu.pitch,
+        .pitch = pitch_for_control,       // 经过腿部补偿的 pitch，用于平衡控制
+        .raw_pitch = imu.pitch,           // IMU 原始 pitch，用于紧急停止判断
         .pitch_rate = imu.pitch_rate,
         .roll = imu.roll,
         .roll_rate = imu.roll_rate,
@@ -1692,6 +1823,72 @@ static void compute_balance_output(float dt) {
             g_yaw_output = 0.0f;
         }
         g_last_lqr_u = output.lqr_u;  // 保存用于波形显示
+        
+        // ======== Roll 控制 (腿长调节) ========
+        // 仅在腿控制使能且 Roll 控制使能时执行
+        // Roll 控制原理: 在基础腿长上对称调节左右腿长度
+        //   - roll > 0 (右倾) -> 左腿伸长, 右腿缩短
+        //   - roll < 0 (左倾) -> 左腿缩短, 右腿伸长
+        if (g_leg_control_enabled && g_roll_control_enabled) {
+            lqr_roll_output_t roll_output;
+            esp_err_t roll_ret = lqr_roll_loop(&g_lqr_ctrl, &input, &roll_output);
+            
+            if (roll_ret == ESP_OK) {
+                // 保存调试变量
+                g_roll_output = roll_output.roll_control;
+                g_roll_left_delta = roll_output.left_leg_delta;
+                g_roll_right_delta = roll_output.right_leg_delta;
+                g_roll_filtered = roll_output.filtered_roll;
+                
+                // 基于基础腿长对称调节 (不修改基础值)
+                float new_left_length = g_leg_base_length + roll_output.left_leg_delta;
+                float new_right_length = g_leg_base_length + roll_output.right_leg_delta;
+                float left_angle = g_leg_base_angle;
+                float right_angle = g_leg_base_angle;
+                
+                // 使用动态可调的腿长范围做限幅
+                if (new_left_length < g_leg_length_min) new_left_length = g_leg_length_min;
+                if (new_left_length > g_leg_length_max) new_left_length = g_leg_length_max;
+                if (new_right_length < g_leg_length_min) new_right_length = g_leg_length_min;
+                if (new_right_length > g_leg_length_max) new_right_length = g_leg_length_max;
+                
+                // 使用 leg_kinematics 的函数进行工作空间限幅 (几何限制)
+                leg_kin_clamp_workspace(&new_left_length, &left_angle, NULL);
+                leg_kin_clamp_workspace(&new_right_length, &right_angle, NULL);
+                
+                // 更新实际目标 (不调用 leg_ctrl_set_target 以避免修改基础值)
+                // 直接计算 IK 并更新电机角度目标
+                leg_workspace_state_t left_ws = { .leg_length = new_left_length, .body_angle = left_angle };
+                leg_workspace_state_t right_ws = { .leg_length = new_right_length, .body_angle = right_angle };
+                leg_joint_state_t left_joint, right_joint;
+                
+                if (leg_kin_inverse(&left_ws, true, NULL, &left_joint) == ESP_OK) {
+                    g_leg_left_target_length = new_left_length;
+                    g_leg_left_target_angle = left_angle;
+                    g_leg_left_hip_angle = left_joint.hip_angle;
+                    g_leg_left_knee_angle = left_joint.knee_angle;
+                }
+                
+                if (leg_kin_inverse(&right_ws, false, NULL, &right_joint) == ESP_OK) {
+                    g_leg_right_target_length = new_right_length;
+                    g_leg_right_target_angle = right_angle;
+                    g_leg_right_hip_angle = right_joint.hip_angle;
+                    g_leg_right_knee_angle = right_joint.knee_angle;
+                }
+            }
+        } else {
+            // Roll 控制未启用时，使用基础腿长 (左右对称)
+            g_leg_left_target_length = g_leg_base_length;
+            g_leg_right_target_length = g_leg_base_length;
+            g_leg_left_target_angle = g_leg_base_angle;
+            g_leg_right_target_angle = g_leg_base_angle;
+            
+            // 清零调试变量
+            g_roll_output = 0.0f;
+            g_roll_left_delta = 0.0f;
+            g_roll_right_delta = 0.0f;
+            g_roll_filtered = 0.0f;
+        }
     }
     
     // ======== 输出波形数据 (用于 Qt 调参面板) ========
@@ -1917,8 +2114,9 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Target state: L(%.3fm, %.1fdeg) R(%.3fm, %.1fdeg)\n",
                    g_leg_left_target_length, g_leg_left_target_angle,
                    g_leg_right_target_length, g_leg_right_target_angle);
+            printf("Leg length range: %.3f ~ %.3f m\n", g_leg_length_min, g_leg_length_max);
             printf("Leg speed: %.1f rpm\n", g_leg_move_speed);
-            printf("Usage: balance leg [on|off|status|set|target|speed|test]\n");
+            printf("Usage: balance leg [on|off|status|set|target|speed|range|test]\n");
         } else if (strcmp(token, "on") == 0) {
             balance_test_set_leg_control(true);
             printf("Leg motors enabled\n");
@@ -1949,7 +2147,7 @@ void balance_test_process_cmd(const char *cmd_str) {
             token = strtok(NULL, " \t\n\r");
             if (token == NULL) {
                 printf("Usage: balance leg target <length_m> <angle_deg> [left|right|both]\n");
-                printf("  length: leg length in meters (%.3f ~ %.3f)\n", LEG_LENGTH_MIN, LEG_LENGTH_MAX);
+                printf("  length: leg length in meters (%.3f ~ %.3f)\n", g_leg_length_min, g_leg_length_max);
                 printf("  angle: body angle in degrees (%.1f ~ %.1f), forward=positive\n", 
                        LEG_BODY_ANGLE_MIN, LEG_BODY_ANGLE_MAX);
                 printf("Example: balance leg target 0.15 0 both\n");
@@ -2011,6 +2209,33 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Current leg speed: %.1f rpm\n", g_leg_move_speed);
                 printf("Usage: balance leg speed <rpm>\n");
             }
+        } else if (strcmp(token, "range") == 0) {
+            // balance leg range [<min> <max>]
+            // 设置腿长范围限制
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                // 显示当前范围
+                printf("Leg length range: %.3f ~ %.3f m\n", g_leg_length_min, g_leg_length_max);
+                printf("Usage: balance leg range <min_m> <max_m>\n");
+                printf("  Default: 0.07 ~ 0.17 m\n");
+            } else {
+                float new_min = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    float new_max = atof(token);
+                    if (new_min >= new_max) {
+                        printf("Error: min (%.3f) must be less than max (%.3f)\n", new_min, new_max);
+                    } else if (new_min < 0.05f || new_max > 0.20f) {
+                        printf("Error: range out of hardware limits (0.05 ~ 0.20 m)\n");
+                    } else {
+                        g_leg_length_min = new_min;
+                        g_leg_length_max = new_max;
+                        printf("Leg length range set: %.3f ~ %.3f m\n", g_leg_length_min, g_leg_length_max);
+                    }
+                } else {
+                    printf("Usage: balance leg range <min_m> <max_m>\n");
+                }
+            }
         } else if (strcmp(token, "test") == 0) {
             // 测试运动学正逆解 (调用 algorithm 模块)
             token = strtok(NULL, " \t\n\r");
@@ -2062,12 +2287,13 @@ void balance_test_process_cmd(const char *cmd_str) {
             }
         } else {
             printf("Unknown leg command: %s\n", token);
-            printf("Usage: balance leg [on|off|status|set|target|speed|test]\n");
+            printf("Usage: balance leg [on|off|status|set|target|speed|range|test]\n");
             printf("  on/off  - Enable/disable leg motors\n");
             printf("  status  - Show detailed leg status\n");
             printf("  set <lh> <lk> <rh> <rk> - Set motor angles directly\n");
             printf("  target <length> <angle> [left|right|both] - Set using kinematics\n");
             printf("  speed <rpm> - Set leg motor speed\n");
+            printf("  range [<min> <max>] - Get/set leg length range (m)\n");
             printf("  test fk/ik ... - Test kinematics\n");
         }
     }
@@ -2086,6 +2312,37 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else {
             printf("Unknown roll command: %s\n", token);
             printf("Usage: balance roll [on|off]\n");
+        }
+    }
+    // ===== 树莓派通信开关 =====
+    else if (strcmp(token, "picomm") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Pi comm: %s\n", g_pi_comm_enabled ? "enabled" : "disabled");
+            printf("Usage: balance picomm [on|off]\n");
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+            if (!g_pi_comm_enabled) {
+                g_pi_comm_enabled = true;
+                // 如果系统已初始化，立即初始化 pi_comm
+                if (g_initialized) {
+                    esp_err_t ret = pi_comm_init();
+                    if (ret == ESP_OK) {
+                        printf("Pi comm enabled and initialized\n");
+                    } else {
+                        printf("Pi comm enabled but init failed: %s\n", esp_err_to_name(ret));
+                    }
+                } else {
+                    printf("Pi comm enabled (will init on balance init)\n");
+                }
+            } else {
+                printf("Pi comm already enabled\n");
+            }
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+            g_pi_comm_enabled = false;
+            printf("Pi comm disabled\n");
+        } else {
+            printf("Unknown picomm command: %s\n", token);
+            printf("Usage: balance picomm [on|off]\n");
         }
     }
     // ===== 电机零点设置命令 =====
@@ -2326,9 +2583,15 @@ esp_err_t leg_ctrl_get_state(bool is_left, leg_state_t *state) {
 
 /**
  * @brief 设置目标腿部状态 (腿长 + 身体夹角)
+ * @note 此函数会同时更新基础腿长，用于用户手动设置高度
+ *       Roll 控制内部不应调用此函数，以避免修改基础值
  */
 esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle) {
-    // 限幅到可达范围
+    // 使用动态可调的腿长范围做限幅
+    if (leg_length < g_leg_length_min) leg_length = g_leg_length_min;
+    if (leg_length > g_leg_length_max) leg_length = g_leg_length_max;
+    
+    // 运动学库的 clamp (包含几何限制)
     leg_kin_clamp_workspace(&leg_length, &body_angle, NULL);
     
     // 检查可达性
@@ -2346,7 +2609,12 @@ esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle) 
         return ret;
     }
     
-    // 更新目标
+    // 更新基础腿长 (用户设定的高度)
+    // 当用户手动设置时，左右腿应该设置相同的基础值
+    g_leg_base_length = leg_length;
+    g_leg_base_angle = body_angle;
+    
+    // 更新实际目标
     if (is_left) {
         g_leg_left_target_length = leg_length;
         g_leg_left_target_angle = body_angle;
@@ -2359,9 +2627,15 @@ esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle) 
         g_leg_right_knee_angle = joint.knee_angle;
     }
     
-    ESP_LOGI(TAG, "%s leg target: L=%.3fm, A=%.1fdeg -> Hip=%.1f, Knee=%.1f",
-             is_left ? "Left" : "Right", leg_length, body_angle, 
-             joint.hip_angle, joint.knee_angle);
+    // 限流日志：仅在腿长变化超过阈值时打印
+    static float s_last_log_left_len = 0, s_last_log_right_len = 0;
+    float *p_last_len = is_left ? &s_last_log_left_len : &s_last_log_right_len;
+    if (fabsf(leg_length - *p_last_len) > 0.005f) {  // 变化超过 5mm 才打印
+        ESP_LOGI(TAG, "%s leg target: L=%.3fm, A=%.1fdeg -> Hip=%.1f, Knee=%.1f",
+                 is_left ? "Left" : "Right", leg_length, body_angle, 
+                 joint.hip_angle, joint.knee_angle);
+        *p_last_len = leg_length;
+    }
     
     return ESP_OK;
 }
