@@ -2570,6 +2570,298 @@ class BalanceControlPanel(QWidget):
 
 
 # ============================================================================
+# 双环 PID 调参面板
+# ============================================================================
+class DualPIDPanel(QWidget):
+    """双环 PID 调参面板 - 直立环 + 速度环"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 标题和说明
+        title_label = QLabel("🎯 双环 PID 平衡控制")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+        layout.addWidget(title_label)
+        
+        desc_label = QLabel(
+            "控制架构: 直立环(外环) → 速度环(内环) → 扭矩输出\n"
+            "直立环: pitch → 目标速度 | 速度环: 速度误差 → 扭矩"
+        )
+        desc_label.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc_label)
+        
+        # 模式切换
+        mode_group = QGroupBox("控制模式切换")
+        mode_layout = QHBoxLayout()
+        
+        self.mode_label = QLabel("当前模式: 未知")
+        self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        mode_layout.addWidget(self.mode_label)
+        
+        mode_layout.addStretch()
+        
+        self.lqr_btn = QPushButton("🔵 LQR 模式")
+        self.lqr_btn.setToolTip("切换到 LQR 多环控制 (默认)")
+        self.lqr_btn.clicked.connect(lambda: self.set_mode("lqr"))
+        mode_layout.addWidget(self.lqr_btn)
+        
+        self.pid_btn = QPushButton("🟢 双环 PID 模式")
+        self.pid_btn.setToolTip("切换到简单双环 PID 控制")
+        self.pid_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        self.pid_btn.clicked.connect(lambda: self.set_mode("pid"))
+        mode_layout.addWidget(self.pid_btn)
+        
+        self.mode_status_btn = QPushButton("📊 状态")
+        self.mode_status_btn.clicked.connect(lambda: self.send_cmd("balance mode"))
+        mode_layout.addWidget(self.mode_status_btn)
+        
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+        
+        # 直立环 PID (外环)
+        angle_group = QGroupBox("🎯 直立环 PID (外环: Pitch → 目标速度)")
+        angle_layout = QGridLayout()
+        
+        angle_layout.addWidget(QLabel("Kp:"), 0, 0)
+        self.angle_kp = QDoubleSpinBox()
+        self.angle_kp.setRange(0, 100)
+        self.angle_kp.setSingleStep(0.5)
+        self.angle_kp.setDecimals(2)
+        self.angle_kp.setValue(15.0)
+        angle_layout.addWidget(self.angle_kp, 0, 1)
+        
+        angle_layout.addWidget(QLabel("Ki:"), 0, 2)
+        self.angle_ki = QDoubleSpinBox()
+        self.angle_ki.setRange(0, 10)
+        self.angle_ki.setSingleStep(0.01)
+        self.angle_ki.setDecimals(3)
+        self.angle_ki.setValue(0.0)
+        angle_layout.addWidget(self.angle_ki, 0, 3)
+        
+        angle_layout.addWidget(QLabel("Kd:"), 0, 4)
+        self.angle_kd = QDoubleSpinBox()
+        self.angle_kd.setRange(0, 10)
+        self.angle_kd.setSingleStep(0.1)
+        self.angle_kd.setDecimals(3)
+        self.angle_kd.setValue(0.5)
+        angle_layout.addWidget(self.angle_kd, 0, 5)
+        
+        self.angle_send_btn = QPushButton("发送")
+        self.angle_send_btn.clicked.connect(self.send_angle_pid)
+        angle_layout.addWidget(self.angle_send_btn, 0, 6)
+        
+        # 直立环说明
+        angle_note = QLabel("tip: 前倾(pitch>0)→输出正速度, P越大响应越快但易震荡")
+        angle_note.setStyleSheet("color: #666; font-size: 10px;")
+        angle_layout.addWidget(angle_note, 1, 0, 1, 7)
+        
+        angle_group.setLayout(angle_layout)
+        layout.addWidget(angle_group)
+        
+        # 速度环 PID (内环)
+        speed_group = QGroupBox("🔄 速度环 PID (内环: 速度误差 → 扭矩)")
+        speed_layout = QGridLayout()
+        
+        speed_layout.addWidget(QLabel("Kp:"), 0, 0)
+        self.speed_kp = QDoubleSpinBox()
+        self.speed_kp.setRange(0, 10)
+        self.speed_kp.setSingleStep(0.1)
+        self.speed_kp.setDecimals(3)
+        self.speed_kp.setValue(0.5)
+        speed_layout.addWidget(self.speed_kp, 0, 1)
+        
+        speed_layout.addWidget(QLabel("Ki:"), 0, 2)
+        self.speed_ki = QDoubleSpinBox()
+        self.speed_ki.setRange(0, 1)
+        self.speed_ki.setSingleStep(0.01)
+        self.speed_ki.setDecimals(3)
+        self.speed_ki.setValue(0.1)
+        speed_layout.addWidget(self.speed_ki, 0, 3)
+        
+        speed_layout.addWidget(QLabel("Kd:"), 0, 4)
+        self.speed_kd = QDoubleSpinBox()
+        self.speed_kd.setRange(0, 1)
+        self.speed_kd.setSingleStep(0.01)
+        self.speed_kd.setDecimals(3)
+        self.speed_kd.setValue(0.01)
+        speed_layout.addWidget(self.speed_kd, 0, 5)
+        
+        self.speed_send_btn = QPushButton("发送")
+        self.speed_send_btn.clicked.connect(self.send_speed_pid)
+        speed_layout.addWidget(self.speed_send_btn, 0, 6)
+        
+        # 速度环说明
+        speed_note = QLabel("tip: I项消除稳态误差, 过大会导致震荡")
+        speed_note.setStyleSheet("color: #666; font-size: 10px;")
+        speed_layout.addWidget(speed_note, 1, 0, 1, 7)
+        
+        speed_group.setLayout(speed_layout)
+        layout.addWidget(speed_group)
+        
+        # 角度零点
+        zero_group = QGroupBox("角度零点")
+        zero_layout = QHBoxLayout()
+        
+        zero_layout.addWidget(QLabel("零点 (°):"))
+        self.zero_input = QDoubleSpinBox()
+        self.zero_input.setRange(-30, 30)
+        self.zero_input.setSingleStep(0.1)
+        self.zero_input.setDecimals(2)
+        self.zero_input.setValue(0.0)
+        zero_layout.addWidget(self.zero_input)
+        
+        self.zero_send_btn = QPushButton("设置")
+        self.zero_send_btn.clicked.connect(self.send_zero)
+        zero_layout.addWidget(self.zero_send_btn)
+        
+        zero_layout.addStretch()
+        
+        self.reset_btn = QPushButton("🔄 重置 PID")
+        self.reset_btn.clicked.connect(lambda: self.send_cmd("balance dpid reset"))
+        zero_layout.addWidget(self.reset_btn)
+        
+        zero_group.setLayout(zero_layout)
+        layout.addWidget(zero_group)
+        
+        # 实时状态显示
+        status_group = QGroupBox("📊 实时状态")
+        status_layout = QGridLayout()
+        
+        status_layout.addWidget(QLabel("角度误差:"), 0, 0)
+        self.angle_err_label = QLabel("-- °")
+        self.angle_err_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff8800;")
+        status_layout.addWidget(self.angle_err_label, 0, 1)
+        
+        status_layout.addWidget(QLabel("目标速度:"), 0, 2)
+        self.target_speed_label = QLabel("-- rad/s")
+        self.target_speed_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00aaff;")
+        status_layout.addWidget(self.target_speed_label, 0, 3)
+        
+        status_layout.addWidget(QLabel("速度误差:"), 1, 0)
+        self.speed_err_label = QLabel("-- rad/s")
+        self.speed_err_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff8800;")
+        status_layout.addWidget(self.speed_err_label, 1, 1)
+        
+        status_layout.addWidget(QLabel("输出扭矩:"), 1, 2)
+        self.torque_label = QLabel("-- Nm")
+        self.torque_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00ff88;")
+        status_layout.addWidget(self.torque_label, 1, 3)
+        
+        # 刷新按钮
+        status_btn_layout = QHBoxLayout()
+        self.refresh_btn = QPushButton("🔄 刷新状态")
+        self.refresh_btn.clicked.connect(lambda: self.send_cmd("balance dpid status"))
+        status_btn_layout.addWidget(self.refresh_btn)
+        
+        self.auto_refresh_check = QCheckBox("自动刷新 (500ms)")
+        self.auto_refresh_check.stateChanged.connect(self.toggle_auto_refresh)
+        status_btn_layout.addWidget(self.auto_refresh_check)
+        
+        status_btn_layout.addStretch()
+        
+        status_v_layout = QVBoxLayout()
+        status_v_layout.addLayout(status_layout)
+        status_v_layout.addLayout(status_btn_layout)
+        status_group.setLayout(status_v_layout)
+        layout.addWidget(status_group)
+        
+        # 自动刷新定时器
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(lambda: self.send_cmd("balance dpid status"))
+        
+        # 快速调参按钮
+        quick_group = QGroupBox("⚡ 快速调参")
+        quick_layout = QHBoxLayout()
+        
+        self.preset1_btn = QPushButton("预设1: 保守")
+        self.preset1_btn.setToolTip("angle: 10,0,0.3 | speed: 0.3,0.05,0")
+        self.preset1_btn.clicked.connect(lambda: self.apply_preset(10, 0, 0.3, 0.3, 0.05, 0))
+        quick_layout.addWidget(self.preset1_btn)
+        
+        self.preset2_btn = QPushButton("预设2: 平衡")
+        self.preset2_btn.setToolTip("angle: 15,0,0.5 | speed: 0.5,0.1,0.01")
+        self.preset2_btn.clicked.connect(lambda: self.apply_preset(15, 0, 0.5, 0.5, 0.1, 0.01))
+        quick_layout.addWidget(self.preset2_btn)
+        
+        self.preset3_btn = QPushButton("预设3: 激进")
+        self.preset3_btn.setToolTip("angle: 20,0,0.8 | speed: 0.8,0.15,0.02")
+        self.preset3_btn.clicked.connect(lambda: self.apply_preset(20, 0, 0.8, 0.8, 0.15, 0.02))
+        quick_layout.addWidget(self.preset3_btn)
+        
+        quick_group.setLayout(quick_layout)
+        layout.addWidget(quick_group)
+        
+        layout.addStretch()
+    
+    def send_cmd(self, cmd):
+        if self.parent_window and self.parent_window.is_connected():
+            self.parent_window.send_command(cmd)
+    
+    def set_mode(self, mode):
+        self.send_cmd(f"balance mode {mode}")
+        if mode == "pid":
+            self.mode_label.setText("当前模式: 双环 PID")
+            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+        else:
+            self.mode_label.setText("当前模式: LQR")
+            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
+    
+    def send_angle_pid(self):
+        kp = self.angle_kp.value()
+        ki = self.angle_ki.value()
+        kd = self.angle_kd.value()
+        self.send_cmd(f"balance dpid angle {kp} {ki} {kd}")
+    
+    def send_speed_pid(self):
+        kp = self.speed_kp.value()
+        ki = self.speed_ki.value()
+        kd = self.speed_kd.value()
+        self.send_cmd(f"balance dpid speed {kp} {ki} {kd}")
+    
+    def send_zero(self):
+        zero = self.zero_input.value()
+        self.send_cmd(f"balance dpid zero {zero}")
+    
+    def apply_preset(self, a_kp, a_ki, a_kd, s_kp, s_ki, s_kd):
+        """应用预设参数"""
+        self.angle_kp.setValue(a_kp)
+        self.angle_ki.setValue(a_ki)
+        self.angle_kd.setValue(a_kd)
+        self.speed_kp.setValue(s_kp)
+        self.speed_ki.setValue(s_ki)
+        self.speed_kd.setValue(s_kd)
+        self.send_angle_pid()
+        self.send_speed_pid()
+    
+    def toggle_auto_refresh(self, state):
+        if state == Qt.Checked:
+            self.refresh_timer.start(500)
+        else:
+            self.refresh_timer.stop()
+    
+    def update_status(self, angle_err, target_speed, speed_err, torque):
+        """更新状态显示 (由主窗口解析数据后调用)"""
+        self.angle_err_label.setText(f"{angle_err:.2f} °")
+        self.target_speed_label.setText(f"{target_speed:.2f} rad/s")
+        self.speed_err_label.setText(f"{speed_err:.2f} rad/s")
+        self.torque_label.setText(f"{torque:.2f} Nm")
+    
+    def update_mode(self, mode):
+        """更新模式显示 (由主窗口解析数据后调用)"""
+        if mode == "DUAL_PID":
+            self.mode_label.setText("当前模式: 双环 PID")
+            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+        else:
+            self.mode_label.setText("当前模式: LQR")
+            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
+
+
+# ============================================================================
 # YAW 调试面板 (独立标签页)
 # ============================================================================
 class YawDebugPanel(QWidget):
@@ -3193,6 +3485,10 @@ class PIDTunerUI(QMainWindow):
         self.balance_panel = BalanceControlPanel(self)
         self.tab_widget.addTab(self.balance_panel, "🎮 平衡控制")
         
+        # 双环 PID 调参面板
+        self.dual_pid_panel = DualPIDPanel(self)
+        self.tab_widget.addTab(self.dual_pid_panel, "🎯 双环PID")
+        
         # YAW 调试面板 (独立标签页)
         self.yaw_panel = YawDebugPanel(self)
         self.tab_widget.addTab(self.yaw_panel, "🧭 YAW调试")
@@ -3603,6 +3899,32 @@ class PIDTunerUI(QMainWindow):
                     self._yaw_current_angle = float(parts[3].strip())
                 except:
                     pass
+            return  # 不在日志显示
+        
+        # ===== 双环 PID 状态解析 =====
+        # 格式: DPID_STATUS:PITCH_ERR=xxx,TGT_SPD=xxx,SPD_ERR=xxx,TORQUE=xxx
+        dpid_match = re.search(r'DPID_STATUS:PITCH_ERR=([-\d.]+),TGT_SPD=([-\d.]+),SPD_ERR=([-\d.]+),TORQUE=([-\d.]+)', line)
+        if dpid_match:
+            try:
+                pitch_err = float(dpid_match.group(1))
+                target_speed = float(dpid_match.group(2))
+                speed_err = float(dpid_match.group(3))
+                torque = float(dpid_match.group(4))
+                if hasattr(self, 'dual_pid_panel'):
+                    self.dual_pid_panel.update_status(pitch_err, target_speed, speed_err, torque)
+            except:
+                pass
+            return  # 不在日志显示
+        
+        # 格式: CTRL_MODE:LQR 或 CTRL_MODE:DUAL_PID
+        ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID)', line)
+        if ctrl_mode_match:
+            try:
+                mode = ctrl_mode_match.group(1)
+                if hasattr(self, 'dual_pid_panel'):
+                    self.dual_pid_panel.update_mode(mode)
+            except:
+                pass
             return  # 不在日志显示
     
     def log(self, msg, is_receive=False, is_error=False):

@@ -57,6 +57,13 @@ static const char *TAG = "BAL_TEST";
 #define LEG_MOTOR_DIVIDER           10      // 腿电机分频 (200Hz / 10 = 20Hz)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 
+// ===== 合并任务配置 =====
+// 将 IMU读取 + 控制算法 + 电机通信 合并到一个任务中运行
+// 默认使用分离任务架构，可通过 CLI 切换
+#define UNIFIED_TASK_PERIOD_MS      5       // 合并任务基础周期 (200Hz)
+#define UNIFIED_TASK_STACK          12288   // 合并任务栈大小 (需要更大)
+#define UNIFIED_TASK_PRIO           24      // 合并任务优先级 (最高)
+
 // 任务栈大小 - 覆盖 config.h 中的默认值
 // 注意: 1000Hz tick 下 FreeRTOS 开销增加，需要更大的栈
 #undef TASK_STACK_IMU
@@ -153,6 +160,25 @@ static TaskHandle_t g_task_imu = NULL;
 static TaskHandle_t g_task_balance = NULL;
 static TaskHandle_t g_task_motor = NULL;
 static TaskHandle_t g_task_watchdog = NULL;
+static TaskHandle_t g_task_unified = NULL;        // 合并任务句柄
+
+// 任务架构选择
+static bool g_use_unified_task = true;            // true=使用合并任务(默认), false=使用分离任务
+
+// 功能开关
+static bool g_uncontrolable_check_enabled = false; // true=启用失控检测(默认), false=禁用失控检测
+
+// 控制模式选择
+typedef enum {
+    CTRL_MODE_LQR = 0,      // LQR 多环控制 (默认)
+    CTRL_MODE_DUAL_PID,     // 双环 PID 控制 (直立环+速度环)
+} control_mode_t;
+static control_mode_t g_control_mode = CTRL_MODE_LQR;  // 默认 LQR 模式
+
+// 双环 PID 控制器
+static dual_pid_controller_t g_dual_pid_ctrl;
+static bool g_dual_pid_initialized = false;
+static dual_pid_output_t g_dual_pid_output;       // 保存输出用于调试
 
 // 状态
 static balance_test_state_t g_state = BALANCE_TEST_IDLE;
@@ -943,6 +969,7 @@ static void task_imu_read(void *arg);
 static void task_balance_ctrl(void *arg);
 static void task_motor_comm(void *arg);
 static void task_remote_watchdog(void *arg);
+static void task_unified_control(void *arg);      // 合并任务 (IMU + 控制 + 电机)
 
 static void update_remote_from_wifi(void);
 static void compute_balance_output(float dt);
@@ -1053,6 +1080,16 @@ esp_err_t balance_test_init(void) {
     // 设置角度零点 (可根据实际机器人调整)
     lqr_set_angle_zeropoint(&g_lqr_ctrl, g_angle_zeropoint);
     
+    // 初始化双环 PID 控制器 (备用控制模式)
+    ret = dual_pid_init(&g_dual_pid_ctrl, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Dual PID init failed, LQR mode only");
+    } else {
+        g_dual_pid_initialized = true;
+        dual_pid_set_angle_zeropoint(&g_dual_pid_ctrl, g_angle_zeropoint);
+        ESP_LOGI(TAG, "Dual PID controller initialized (backup mode)");
+    }
+    
     // 初始化 Commander 解析器
     // - set_callback: 收到设置命令时更新 LQR 参数
     // - query_callback: 收到查询命令时返回 LQR 实际参数
@@ -1133,22 +1170,34 @@ esp_err_t balance_test_start(void) {
     g_ctrl_count_per_sec = 0;
     g_last_stat_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     
-    // 创建任务 (Core 1 - 实时控制)
-    xTaskCreatePinnedToCore(task_imu_read, "imu_read", TASK_STACK_IMU,
-                            NULL, TASK_PRIO_IMU, &g_task_imu, 1);
-    xTaskCreatePinnedToCore(task_balance_ctrl, "balance_ctrl", TASK_STACK_BALANCE,
-                            NULL, TASK_PRIO_BALANCE, &g_task_balance, 1);
-    xTaskCreatePinnedToCore(task_motor_comm, "motor_comm", TASK_STACK_MOTOR,
-                            NULL, TASK_PRIO_MOTOR, &g_task_motor, 1);
+    // 根据架构选择创建任务
+    if (g_use_unified_task) {
+        // ===== 合并任务架构 =====
+        // IMU读取 + 控制算法 + 电机通信 在同一个任务中执行
+        ESP_LOGI(TAG, "Using UNIFIED task architecture");
+        xTaskCreatePinnedToCore(task_unified_control, "unified_ctrl", UNIFIED_TASK_STACK,
+                                NULL, UNIFIED_TASK_PRIO, &g_task_unified, 1);
+    } else {
+        // ===== 分离任务架构 (默认) =====
+        ESP_LOGI(TAG, "Using SEPARATE task architecture");
+        // 创建任务 (Core 1 - 实时控制)
+        xTaskCreatePinnedToCore(task_imu_read, "imu_read", TASK_STACK_IMU,
+                                NULL, TASK_PRIO_IMU, &g_task_imu, 1);
+        xTaskCreatePinnedToCore(task_balance_ctrl, "balance_ctrl", TASK_STACK_BALANCE,
+                                NULL, TASK_PRIO_BALANCE, &g_task_balance, 1);
+        xTaskCreatePinnedToCore(task_motor_comm, "motor_comm", TASK_STACK_MOTOR,
+                                NULL, TASK_PRIO_MOTOR, &g_task_motor, 1);
+    }
     
-    // 创建任务 (Core 0 - 非实时)
+    // 创建任务 (Core 0 - 非实时) - 两种架构都需要
     xTaskCreatePinnedToCore(task_remote_watchdog, "watchdog", TASK_STACK_WATCHDOG,
                             NULL, TASK_PRIO_WATCHDOG, &g_task_watchdog, 0);
     
     g_tasks_running = true;
     g_state = BALANCE_TEST_READY;
     
-    ESP_LOGI(TAG, "Balance test tasks started");
+    ESP_LOGI(TAG, "Balance test tasks started (%s mode)", 
+             g_use_unified_task ? "unified" : "separate");
     ESP_LOGI(TAG, "=================================");
     ESP_LOGI(TAG, "Connect to WiFi: WL-PRO (password: 12345678)");
     ESP_LOGI(TAG, "Open http://192.168.4.1 in browser");
@@ -1309,6 +1358,10 @@ void balance_test_print_status(void) {
     
     ESP_LOGI(TAG, "=== Balance Test Status ===");
     ESP_LOGI(TAG, "State: %s", state_names[g_state]);
+    ESP_LOGI(TAG, "Task mode: %s", g_use_unified_task ? "UNIFIED" : "SEPARATE");
+    ESP_LOGI(TAG, "Control mode: %s", g_control_mode == CTRL_MODE_LQR ? "LQR" : "DUAL_PID");
+    ESP_LOGI(TAG, "Safety check: %s (uncontrolable=%d)", 
+             g_uncontrolable_check_enabled ? "ENABLED" : "DISABLED", g_uncontrolable);
     ESP_LOGI(TAG, "Angle zeropoint: %.2f deg", g_angle_zeropoint);
     ESP_LOGI(TAG, "Roll control: %s", g_roll_control_enabled ? "ENABLED" : "DISABLED");
     ESP_LOGI(TAG, "Leg control: %s", g_leg_control_enabled ? "ENABLED" : "DISABLED");
@@ -1520,6 +1573,125 @@ static void task_motor_comm(void *arg) {
 }
 
 /**
+ * @brief 合并任务: IMU读取 + 控制算法 + 电机通信 (Core 1, 5ms 周期)
+ * 
+ * 将三个任务合并到一个任务中执行，减少任务切换开销和同步延迟。
+ * 执行顺序: 1.读IMU → 2.计算控制 → 3.发送电机命令
+ * 全部在同一个 5ms 周期内完成。
+ */
+static void task_unified_control(void *arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(UNIFIED_TASK_PERIOD_MS);
+    const float dt = UNIFIED_TASK_PERIOD_MS / 1000.0f;
+    static uint8_t leg_divider_count = 0;
+    imu_data_t imu_raw;
+    
+    ESP_LOGI(TAG, "[task_unified_control] Started on Core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "  Period: %d ms (%.0f Hz)", UNIFIED_TASK_PERIOD_MS, 1000.0f / UNIFIED_TASK_PERIOD_MS);
+    ESP_LOGI(TAG, "  Mode: IMU + Control + Motor in ONE task");
+    
+    while (g_tasks_running) {
+        uint64_t cycle_start = esp_timer_get_time();
+        
+        // ======== Step 1: 读取 IMU 数据 (直接读，不通过互斥锁) ========
+        if (imu_read_data(&imu_raw) == ESP_OK && imu_raw.is_valid) {
+            // 直接更新共享数据 (单任务，不需要锁)
+            g_imu_data.pitch = imu_raw.pitch;
+            g_imu_data.pitch_rate = imu_raw.gyro_y;
+            g_imu_data.roll = imu_raw.roll;
+            g_imu_data.roll_rate = imu_raw.gyro_x;
+            g_imu_data.yaw = imu_raw.yaw;
+            g_imu_data.yaw_rate = imu_raw.gyro_z;
+            g_imu_data.timestamp = imu_raw.timestamp;
+            g_imu_data.read_time_us = cycle_start;
+            g_imu_data.valid = true;
+            
+            g_stats.imu_read_count++;
+            g_imu_count_per_sec++;
+        }
+        
+        // ======== Step 2: 处理 CAN 接收 (保证缓冲区不溢出) ========
+        can_motor_process_rx();
+        
+        // ======== Step 3: 读取轮电机状态 ========
+        g_wheel_state.left_position = can_motor_read_position(g_motor_left);
+        g_wheel_state.left_speed = can_motor_read_speed(g_motor_left);
+        g_wheel_state.left_online = can_motor_is_online(g_motor_left, 100);
+        g_wheel_state.right_position = can_motor_read_position(g_motor_right);
+        g_wheel_state.right_speed = can_motor_read_speed(g_motor_right);
+        g_wheel_state.right_online = can_motor_is_online(g_motor_right, 100);
+        g_wheel_state.timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        
+        // ======== Step 4: 更新遥控数据 ========
+        update_remote_from_wifi();
+        
+        // ======== Step 5: 计算平衡控制输出 ========
+        uint64_t ctrl_start = esp_timer_get_time();
+        compute_balance_output(dt);
+        uint64_t ctrl_end = esp_timer_get_time();
+        
+        // 延迟统计 (简化版，同一任务内延迟很小)
+        g_latency_imu_to_ctrl_us = (float)(ctrl_start - cycle_start);
+        g_latency_ctrl_calc_us = (float)(ctrl_end - ctrl_start);
+        
+        g_stats.control_loop_count++;
+        g_ctrl_count_per_sec++;
+        
+        // ======== Step 6: 发送轮电机力矩命令 ========
+        apply_motor_commands();
+        g_motor_count_per_sec++;
+        
+        // ======== Step 7: 腿电机 (分频执行, 默认 20Hz) ========
+        leg_divider_count++;
+        if (leg_divider_count >= LEG_MOTOR_DIVIDER) {
+            leg_divider_count = 0;
+            apply_leg_motor_commands();
+            g_leg_count_per_sec++;
+        }
+        
+        g_stats.motor_cmd_count++;
+        
+        // 记录总延迟
+        uint64_t cycle_end = esp_timer_get_time();
+        g_latency_ctrl_to_motor_us = (float)(cycle_end - ctrl_end);
+        g_latency_total_us = (float)(cycle_end - cycle_start);
+        
+        // 更新最大/最小值
+        if (g_latency_total_us > g_latency_total_max_us) {
+            g_latency_total_max_us = g_latency_total_us;
+        }
+        if (g_latency_total_us < g_latency_total_min_us) {
+            g_latency_total_min_us = g_latency_total_us;
+        }
+        
+        // 每秒更新一次频率统计
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now - g_last_stat_time >= 1000) {
+            g_stats.imu_freq_hz = (float)g_imu_count_per_sec;
+            g_stats.control_freq_hz = (float)g_ctrl_count_per_sec;
+            g_stats.motor_freq_hz = (float)g_motor_count_per_sec;
+            g_stats.leg_freq_hz = (float)g_leg_count_per_sec;
+            g_imu_count_per_sec = 0;
+            g_ctrl_count_per_sec = 0;
+            g_motor_count_per_sec = 0;
+            g_leg_count_per_sec = 0;
+            g_last_stat_time = now;
+        }
+        
+        // 更新 pi_comm 状态 (仅在使能时)
+        if (g_pi_comm_enabled) {
+            update_pi_comm_state();
+        }
+        
+        vTaskDelayUntil(&last_wake, period);
+    }
+    
+    ESP_LOGI(TAG, "[task_unified_control] Stopped");
+    g_task_unified = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
  * @brief 遥控看门狗任务 (Core 0, 100ms 周期)
  */
 static void task_remote_watchdog(void *arg) {
@@ -1618,26 +1790,31 @@ static void compute_balance_output(float dt) {
     memcpy(&wheel, &g_wheel_state, sizeof(wheel));
     xSemaphoreGive(g_wheel_state_mutex);
     
-    // ======== 检查紧急停止 ========
-    if (fabsf(imu.pitch) > EMERGENCY_ANGLE_DEG) {
-        if (g_uncontrolable == 0) {
-            ESP_LOGW(TAG, "Pitch angle too large: %.1f deg", imu.pitch);
-        }
-        g_uncontrolable = 1;
-    }
-    
-    // 恢复检测 (参考 shibo_wheel_leg)
-    if (g_uncontrolable != 0) {
-        if (fabsf(imu.pitch) < 10.0f) {
-            g_uncontrolable++;
-        } else {
-            // 角度仍然过大，重置计数器
+    // ======== 检查紧急停止 (可通过开关禁用) ========
+    if (g_uncontrolable_check_enabled) {
+        if (fabsf(imu.pitch) > EMERGENCY_ANGLE_DEG) {
+            if (g_uncontrolable == 0) {
+                ESP_LOGW(TAG, "Pitch angle too large: %.1f deg", imu.pitch);
+            }
             g_uncontrolable = 1;
         }
-        if (g_uncontrolable > 100) {  // 约 0.5 秒延时
-            g_uncontrolable = 0;
-            ESP_LOGI(TAG, "Recovered from uncontrolable state");
+        
+        // 恢复检测 (参考 shibo_wheel_leg)
+        if (g_uncontrolable != 0) {
+            if (fabsf(imu.pitch) < 10.0f) {
+                g_uncontrolable++;
+            } else {
+                // 角度仍然过大，重置计数器
+                g_uncontrolable = 1;
+            }
+            if (g_uncontrolable > 100) {  // 约 0.5 秒延时
+                g_uncontrolable = 0;
+                ESP_LOGI(TAG, "Recovered from uncontrolable state");
+            }
         }
+    } else {
+        // 失控检测禁用时，始终保持可控状态
+        g_uncontrolable = 0;
     }
     
     // ======== 计算 LQR 状态量 ========
@@ -1771,37 +1948,84 @@ static void compute_balance_output(float dt) {
         lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);  // 同步到 LQR 控制器
     }
     
-    // ======== 计算 LQR 输出 ========
+    // ======== 根据控制模式选择算法 ========
     lqr_output_t output = {0};
     
-    // 自动模式下根据状态切换 simple/full 模式
-    // 手动模式下保持用户设置的环路使能状态
-    if (!g_loop_manual_mode) {
-        if (!remote.go || g_uncontrolable != 0) {
-            // 未使能或失控，切换到简单平衡模式 (仅角度+角速度环)
-            lqr_set_simple_balance_mode(&g_lqr_ctrl);
+    if (g_control_mode == CTRL_MODE_DUAL_PID && g_dual_pid_initialized) {
+        // ======== 双环 PID 控制模式 ========
+        // 直立环 (外环): pitch → target_speed
+        // 速度环 (内环): target_speed - actual_speed → torque
+        
+        float wheel_speed_avg = (left_vel_rad + right_vel_rad) / 2.0f;  // 平均轮速 (rad/s)
+        
+        esp_err_t ret = dual_pid_balance_loop(&g_dual_pid_ctrl, 
+                                               pitch_for_control, imu.pitch_rate,
+                                               wheel_speed_avg, dt,
+                                               &g_dual_pid_output);
+        
+        if (ret != ESP_OK || g_dual_pid_output.emergency) {
+            // 失败或紧急停止
+            output.left_wheel_torque = 0;
+            output.right_wheel_torque = 0;
+            g_last_lqr_u = 0;
         } else {
-            // 正常控制，使用完整平衡模式
-            lqr_set_full_balance_mode(&g_lqr_ctrl);
+            // 双环 PID 输出 (左右轮相同)
+            float torque = g_dual_pid_output.torque;
+            output.lqr_u = torque;  // 用于波形显示兼容
+            
+            // YAW 控制 (可选，仅在 go=true 时)
+            if (remote.go && g_yaw_control_enabled) {
+                lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
+                g_yaw_output = output.yaw_control;
+                output.left_wheel_torque = torque + g_yaw_output;
+                output.right_wheel_torque = torque - g_yaw_output;
+            } else {
+                output.left_wheel_torque = torque;
+                output.right_wheel_torque = torque;
+                g_yaw_output = 0.0f;
+            }
+            g_last_lqr_u = torque;
         }
-    }
-    // 手动模式: 环路使能状态由 g_loop_enable_mask 控制，已在 balance_test_set_loop_gain() 中设置
-    
-    // 统一调用 LQR 平衡循环
-    esp_err_t ret = lqr_balance_loop(&g_lqr_ctrl, &input, &output);
-    if (ret != ESP_OK) {
-        // 限流打印：每秒最多打印一次
-        static uint32_t last_fail_log = 0;
-        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (now - last_fail_log > 1000) {
-            ESP_LOGW(TAG, "LQR balance loop failed");
-            last_fail_log = now;
-        }
-        output.left_wheel_torque = 0;
-        output.right_wheel_torque = 0;
-        g_last_lqr_u = 0;
+        
+        // 填充兼容字段用于波形显示
+        output.angle_control = g_dual_pid_output.angle_p_out;
+        output.gyro_control = g_dual_pid_output.angle_d_out;
+        output.speed_control = g_dual_pid_output.speed_p_out;
+        output.filtered_target_speed = g_dual_pid_output.target_speed;
+        
     } else {
-        // ======== YAW 轴转向控制 (仅在正常模式下且 YAW 环使能) ========
+        // ======== LQR 多环控制模式 (默认) ========
+        
+        // 自动模式下根据状态切换 simple/full 模式
+        // 手动模式下保持用户设置的环路使能状态
+        // 修改: go 只影响 YAW 环路，其他环路始终按 full 模式运行 (除非失控)
+        if (!g_loop_manual_mode) {
+            if (g_uncontrolable != 0) {
+                // 失控时，切换到简单平衡模式 (仅角度+角速度环)
+                lqr_set_simple_balance_mode(&g_lqr_ctrl);
+            } else {
+                // 正常控制，使用完整平衡模式 (go 不再影响此逻辑)
+                lqr_set_full_balance_mode(&g_lqr_ctrl);
+            }
+        }
+        // 手动模式: 环路使能状态由 g_loop_enable_mask 控制，已在 balance_test_set_loop_gain() 中设置
+        
+        // 统一调用 LQR 平衡循环
+        esp_err_t ret = lqr_balance_loop(&g_lqr_ctrl, &input, &output);
+        if (ret != ESP_OK) {
+            // 限流打印：每秒最多打印一次
+            static uint32_t last_fail_log = 0;
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last_fail_log > 1000) {
+                ESP_LOGW(TAG, "LQR balance loop failed");
+                last_fail_log = now;
+            }
+            output.left_wheel_torque = 0;
+            output.right_wheel_torque = 0;
+            g_last_lqr_u = 0;
+        } else {
+        // ======== YAW 轴转向控制 (仅在 go=true 且 YAW 环使能时生效) ========
+        // 修改: go 只控制 YAW 环路是否加入
         if (remote.go && g_uncontrolable == 0 && g_yaw_control_enabled) {
             // 使用 lqr_yaw_loop 计算 YAW 控制量
             // input.target_yaw_rate 已经在前面设置为 remote.joy_x * 0.02f
@@ -1888,6 +2112,32 @@ static void compute_balance_output(float dt) {
             g_roll_left_delta = 0.0f;
             g_roll_right_delta = 0.0f;
             g_roll_filtered = 0.0f;
+        }
+        }  // end of LQR balance_loop success
+    }  // end of LQR mode
+    
+    // ======== Roll 控制 (两种模式通用，在 LQR 模式之外也可用) ========
+    // 注: 双环PID模式下也可以使用 Roll 控制，只需保持腿部控制启用
+    if (g_control_mode == CTRL_MODE_DUAL_PID && g_leg_control_enabled && g_roll_control_enabled) {
+        lqr_roll_output_t roll_output;
+        esp_err_t roll_ret = lqr_roll_loop(&g_lqr_ctrl, &input, &roll_output);
+        
+        if (roll_ret == ESP_OK) {
+            g_roll_output = roll_output.roll_control;
+            g_roll_left_delta = roll_output.left_leg_delta;
+            g_roll_right_delta = roll_output.right_leg_delta;
+            g_roll_filtered = roll_output.filtered_roll;
+            
+            float new_left_length = g_leg_base_length + roll_output.left_leg_delta;
+            float new_right_length = g_leg_base_length + roll_output.right_leg_delta;
+            
+            if (new_left_length < g_leg_length_min) new_left_length = g_leg_length_min;
+            if (new_left_length > g_leg_length_max) new_left_length = g_leg_length_max;
+            if (new_right_length < g_leg_length_min) new_right_length = g_leg_length_min;
+            if (new_right_length > g_leg_length_max) new_right_length = g_leg_length_max;
+            
+            g_leg_left_target_length = new_left_length;
+            g_leg_right_target_length = new_right_length;
         }
     }
     
@@ -2457,9 +2707,174 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("       balance loop <A|B|C|D|H|Y> [on|off|<0.0-1.0>]\n");
         }
     }
+    // ===== 任务架构切换命令 =====
+    else if (strcmp(token, "task") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Task architecture: %s\n", g_use_unified_task ? "UNIFIED" : "SEPARATE");
+            printf("  UNIFIED:  IMU + Ctrl + Motor in ONE task (lower latency)\n");
+            printf("  SEPARATE: IMU, Ctrl, Motor in separate tasks (default)\n");
+            printf("Usage: balance task [unified|separate]\n");
+            printf("Note: Must 'balance stop' first, then change, then 'balance start'\n");
+        } else if (strcmp(token, "unified") == 0 || strcmp(token, "1") == 0) {
+            if (g_tasks_running) {
+                printf("Error: Stop tasks first with 'balance stop'\n");
+            } else {
+                g_use_unified_task = true;
+                printf("Task architecture set to UNIFIED\n");
+                printf("  Run 'balance start' to apply\n");
+            }
+        } else if (strcmp(token, "separate") == 0 || strcmp(token, "0") == 0) {
+            if (g_tasks_running) {
+                printf("Error: Stop tasks first with 'balance stop'\n");
+            } else {
+                g_use_unified_task = false;
+                printf("Task architecture set to SEPARATE (default)\n");
+                printf("  Run 'balance start' to apply\n");
+            }
+        } else {
+            printf("Unknown task command: %s\n", token);
+            printf("Usage: balance task [unified|separate]\n");
+        }
+    }
+    // ===== 失控检测开关命令 =====
+    else if (strcmp(token, "safety") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Safety (uncontrolable check): %s\n", g_uncontrolable_check_enabled ? "ENABLED" : "DISABLED");
+            printf("  ENABLED:  Pitch > 45° triggers emergency mode (simple balance)\n");
+            printf("  DISABLED: No pitch limit check, always full balance mode\n");
+            printf("Usage: balance safety [on|off]\n");
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0 || strcmp(token, "enable") == 0) {
+            g_uncontrolable_check_enabled = true;
+            g_uncontrolable = 0;  // 清除失控状态
+            printf("Safety check ENABLED\n");
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0 || strcmp(token, "disable") == 0) {
+            g_uncontrolable_check_enabled = false;
+            g_uncontrolable = 0;  // 清除失控状态
+            printf("Safety check DISABLED - use with caution!\n");
+        } else {
+            printf("Unknown safety command: %s\n", token);
+            printf("Usage: balance safety [on|off]\n");
+        }
+    }
+    // ===== 控制模式切换命令 =====
+    else if (strcmp(token, "mode") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Control mode: %s\n", g_control_mode == CTRL_MODE_LQR ? "LQR" : "DUAL_PID");
+            printf("CTRL_MODE:%s\n", g_control_mode == CTRL_MODE_LQR ? "LQR" : "DUAL_PID");
+            printf("  LQR:      Multi-loop LQR control (angle+gyro+dist+speed)\n");
+            printf("  DUAL_PID: Simple dual-loop PID (angle->speed->torque)\n");
+            printf("Usage: balance mode [lqr|pid]\n");
+        } else if (strcmp(token, "lqr") == 0 || strcmp(token, "0") == 0) {
+            g_control_mode = CTRL_MODE_LQR;
+            printf("Control mode set to LQR\n");
+            printf("CTRL_MODE:LQR\n");
+        } else if (strcmp(token, "pid") == 0 || strcmp(token, "dual") == 0 || strcmp(token, "1") == 0) {
+            if (!g_dual_pid_initialized) {
+                printf("Error: Dual PID controller not initialized\n");
+            } else {
+                g_control_mode = CTRL_MODE_DUAL_PID;
+                dual_pid_reset(&g_dual_pid_ctrl);  // 切换时重置
+                printf("Control mode set to DUAL_PID\n");
+                printf("CTRL_MODE:DUAL_PID\n");
+            }
+        } else {
+            printf("Unknown mode: %s\n", token);
+            printf("Usage: balance mode [lqr|pid]\n");
+        }
+    }
+    // ===== 双环 PID 调参命令 =====
+    else if (strcmp(token, "dpid") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            // 显示当前参数
+            printf("=== Dual PID Parameters ===\n");
+            printf("Angle PID (outer loop): kp=%.2f ki=%.2f kd=%.3f limit=%.1f\n",
+                   g_dual_pid_ctrl.params.angle_kp, g_dual_pid_ctrl.params.angle_ki,
+                   g_dual_pid_ctrl.params.angle_kd, g_dual_pid_ctrl.params.angle_limit);
+            printf("Speed PID (inner loop): kp=%.2f ki=%.2f kd=%.3f limit=%.1f\n",
+                   g_dual_pid_ctrl.params.speed_kp, g_dual_pid_ctrl.params.speed_ki,
+                   g_dual_pid_ctrl.params.speed_kd, g_dual_pid_ctrl.params.speed_limit);
+            printf("Angle zeropoint: %.2f deg\n", g_dual_pid_ctrl.params.angle_zeropoint);
+            printf("Max torque: %.1f Nm\n", g_dual_pid_ctrl.params.max_torque);
+            printf("\nUsage: balance dpid angle <kp> <ki> <kd>\n");
+            printf("       balance dpid speed <kp> <ki> <kd>\n");
+            printf("       balance dpid zero <degrees>\n");
+            printf("       balance dpid reset\n");
+            printf("       balance dpid status\n");
+        } else if (strcmp(token, "angle") == 0) {
+            // 设置直立环 PID
+            float kp = g_dual_pid_ctrl.params.angle_kp;
+            float ki = g_dual_pid_ctrl.params.angle_ki;
+            float kd = g_dual_pid_ctrl.params.angle_kd;
+            
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            
+            dual_pid_set_angle_gains(&g_dual_pid_ctrl, kp, ki, kd);
+            printf("Angle PID set: kp=%.2f ki=%.2f kd=%.3f\n", kp, ki, kd);
+            // 输出 Qt 可解析格式
+            printf("DPID:ANGLE,%.4f,%.4f,%.4f\n", kp, ki, kd);
+        } else if (strcmp(token, "speed") == 0) {
+            // 设置速度环 PID
+            float kp = g_dual_pid_ctrl.params.speed_kp;
+            float ki = g_dual_pid_ctrl.params.speed_ki;
+            float kd = g_dual_pid_ctrl.params.speed_kd;
+            
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            
+            dual_pid_set_speed_gains(&g_dual_pid_ctrl, kp, ki, kd);
+            printf("Speed PID set: kp=%.2f ki=%.2f kd=%.3f\n", kp, ki, kd);
+            // 输出 Qt 可解析格式
+            printf("DPID:SPEED,%.4f,%.4f,%.4f\n", kp, ki, kd);
+        } else if (strcmp(token, "zero") == 0) {
+            // 设置角度零点
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float zero = atof(token);
+                dual_pid_set_angle_zeropoint(&g_dual_pid_ctrl, zero);
+                printf("Dual PID angle zeropoint set to %.2f\n", zero);
+            } else {
+                printf("Current angle zeropoint: %.2f\n", g_dual_pid_ctrl.params.angle_zeropoint);
+            }
+        } else if (strcmp(token, "reset") == 0) {
+            dual_pid_reset(&g_dual_pid_ctrl);
+            printf("Dual PID controller reset\n");
+        } else if (strcmp(token, "status") == 0) {
+            // 显示实时状态
+            printf("=== Dual PID Status ===\n");
+            printf("Control mode: %s\n", g_control_mode == CTRL_MODE_DUAL_PID ? "ACTIVE" : "INACTIVE");
+            printf("Angle error: %.2f deg\n", g_dual_pid_output.angle_error);
+            printf("Target speed: %.2f rad/s\n", g_dual_pid_output.target_speed);
+            printf("Speed error: %.2f rad/s\n", g_dual_pid_output.speed_error);
+            printf("Output torque: %.2f Nm\n", g_dual_pid_output.torque);
+            printf("Angle PID: P=%.2f I=%.2f D=%.3f\n",
+                   g_dual_pid_output.angle_p_out, g_dual_pid_output.angle_i_out, g_dual_pid_output.angle_d_out);
+            printf("Speed PID: P=%.2f I=%.2f D=%.3f\n",
+                   g_dual_pid_output.speed_p_out, g_dual_pid_output.speed_i_out, g_dual_pid_output.speed_d_out);
+            // 输出 Qt 可解析格式
+            printf("DPID_STATUS:PITCH_ERR=%.2f,TGT_SPD=%.2f,SPD_ERR=%.2f,TORQUE=%.2f\n",
+                   g_dual_pid_output.angle_error, g_dual_pid_output.target_speed,
+                   g_dual_pid_output.speed_error, g_dual_pid_output.torque);
+        } else {
+            printf("Unknown dpid command: %s\n", token);
+            printf("Usage: balance dpid [angle|speed|zero|reset|status]\n");
+        }
+    }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|leg|roll|mzero|loop]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|leg|roll|mzero|loop|task|safety|mode|dpid]\n");
     }
 }
 

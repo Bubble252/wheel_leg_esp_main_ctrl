@@ -442,6 +442,154 @@ float lqr_get_distance_zeropoint(lqr_controller_t *ctrl);
  */
 float lqr_yaw_angle_addup(float current_yaw, float last_yaw, float *yaw_total);
 
+// ============================================================================
+// 双环 PID 控制器 (直立环 + 速度环)
+// ============================================================================
+
+/**
+ * @brief 双环PID参数结构体
+ * 
+ * 控制架构:
+ *   目标角度(0°) → [直立环PID] → 目标速度 → [速度环PID] → 输出扭矩
+ *       ↑                              ↑
+ *   实际Pitch                      实际速度
+ */
+typedef struct {
+    // 直立环 PID (外环): pitch → target_speed
+    float angle_kp;         // 角度P (默认 15.0)
+    float angle_ki;         // 角度I (默认 0.0)
+    float angle_kd;         // 角度D (默认 0.5)
+    float angle_limit;      // 输出限幅 - 最大目标速度 (默认 10.0 rad/s)
+    
+    // 速度环 PID (内环): speed_error → torque
+    float speed_kp;         // 速度P (默认 0.5)
+    float speed_ki;         // 速度I (默认 0.1)
+    float speed_kd;         // 速度D (默认 0.01)
+    float speed_limit;      // 输出限幅 - 最大扭矩 (默认 8.0 Nm)
+    
+    // 角度零点
+    float angle_zeropoint;  // 机械零点偏移 (默认 0.0)
+    
+    // 安全阈值
+    float emergency_angle;  // 紧急停止角度 (默认 45.0)
+    
+    // 输出限幅
+    float max_torque;       // 最大输出扭矩 (默认 8.0)
+} dual_pid_params_t;
+
+/**
+ * @brief 双环PID控制器输出结构体
+ */
+typedef struct {
+    float angle_error;      // 角度误差 (目标-实际)
+    float target_speed;     // 直立环输出的目标速度
+    float speed_error;      // 速度误差 (目标-实际)
+    float torque;           // 最终输出扭矩
+    
+    // 用于调试的中间量
+    float angle_p_out;      // 角度环P输出
+    float angle_i_out;      // 角度环I输出
+    float angle_d_out;      // 角度环D输出
+    float speed_p_out;      // 速度环P输出
+    float speed_i_out;      // 速度环I输出
+    float speed_d_out;      // 速度环D输出
+    
+    bool emergency;         // 是否紧急停止
+} dual_pid_output_t;
+
+/**
+ * @brief 双环PID控制器结构体
+ */
+typedef struct {
+    pid_controller_t pid_angle;     // 直立环 (外环)
+    pid_controller_t pid_speed;     // 速度环 (内环)
+    
+    dual_pid_params_t params;
+    
+    bool initialized;
+} dual_pid_controller_t;
+
+/**
+ * @brief 获取双环PID默认参数
+ * @param params 参数结构体指针
+ */
+void dual_pid_get_default_params(dual_pid_params_t *params);
+
+/**
+ * @brief 初始化双环PID控制器
+ * @param ctrl 控制器实例
+ * @param params 参数 (NULL 使用默认参数)
+ * @return ESP_OK 成功
+ */
+esp_err_t dual_pid_init(dual_pid_controller_t *ctrl, const dual_pid_params_t *params);
+
+/**
+ * @brief 重置双环PID控制器
+ * @param ctrl 控制器实例
+ */
+void dual_pid_reset(dual_pid_controller_t *ctrl);
+
+/**
+ * @brief 设置双环PID参数
+ * @param ctrl 控制器实例
+ * @param params 新参数
+ */
+void dual_pid_set_params(dual_pid_controller_t *ctrl, const dual_pid_params_t *params);
+
+/**
+ * @brief 设置直立环PID增益
+ * @param ctrl 控制器实例
+ * @param kp P增益
+ * @param ki I增益
+ * @param kd D增益
+ */
+void dual_pid_set_angle_gains(dual_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/**
+ * @brief 设置速度环PID增益
+ * @param ctrl 控制器实例
+ * @param kp P增益
+ * @param ki I增益
+ * @param kd D增益
+ */
+void dual_pid_set_speed_gains(dual_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/**
+ * @brief 设置角度零点
+ * @param ctrl 控制器实例
+ * @param zeropoint 角度零点 (度)
+ */
+void dual_pid_set_angle_zeropoint(dual_pid_controller_t *ctrl, float zeropoint);
+
+/**
+ * @brief 双环PID平衡控制循环
+ * @param ctrl 控制器实例
+ * @param pitch 当前俯仰角 (度)
+ * @param pitch_rate 当前俯仰角速度 (度/秒) - 可用于D项
+ * @param wheel_speed 当前轮子速度 (rad/s)
+ * @param dt 时间步长 (秒)
+ * @param output 控制输出
+ * @return ESP_OK 成功
+ * 
+ * @note 控制流程:
+ *   1. 直立环: angle_error = 0 - (pitch - zeropoint)
+ *              target_speed = PID_angle(angle_error)
+ *   2. 速度环: speed_error = target_speed - wheel_speed
+ *              torque = PID_speed(speed_error)
+ */
+esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl, 
+                                 float pitch, float pitch_rate,
+                                 float wheel_speed, float dt,
+                                 dual_pid_output_t *output);
+
+/**
+ * @brief 检查是否触发紧急停止
+ * @param ctrl 控制器实例
+ * @param pitch 当前俯仰角 (度)
+ * @return true 需要紧急停止
+ */
+bool dual_pid_check_emergency(dual_pid_controller_t *ctrl, float pitch);
+
 #ifdef __cplusplus
 }
 #endif
