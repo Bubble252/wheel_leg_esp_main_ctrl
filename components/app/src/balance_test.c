@@ -42,6 +42,13 @@
 
 static const char *TAG = "BAL_TEST";
 
+// 角度-弧度转换
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+#define DEG2RAD(d) ((d) * M_PI / 180.0f)
+#define RAD2DEG(r) ((r) * 180.0f / M_PI)
+
 // ============================================================================
 // 任务配置
 // ============================================================================
@@ -116,9 +123,10 @@ typedef struct {
 
 // 轮电机命令 (由 task_balance_ctrl 写入, task_motor_comm 读取)
 typedef struct {
-    float left_torque;      // 左轮力矩
-    float right_torque;     // 右轮力矩
+    float left_torque;      // 左轮力矩 (扭矩模式) / 左轮速度 (速度模式)
+    float right_torque;     // 右轮力矩 (扭矩模式) / 右轮速度 (速度模式)
     bool enabled;           // 使能标志
+    bool use_speed_mode;    // true=速度模式, false=扭矩模式
 } shared_wheel_cmd_t;
 
 // 轮电机状态 (由 task_motor_comm 写入, task_balance_ctrl 读取)
@@ -171,7 +179,8 @@ static bool g_uncontrolable_check_enabled = false; // true=启用失控检测(�
 // 控制模式选择
 typedef enum {
     CTRL_MODE_LQR = 0,      // LQR 多环控制 (默认)
-    CTRL_MODE_DUAL_PID,     // 双环 PID 控制 (直立环+速度环)
+    CTRL_MODE_DUAL_PID,     // 双环 PID 控制 (直立环+速度环) - 扭矩模式
+    CTRL_MODE_SINGLE_PID,   // 单环 PID 控制 (直立环→速度) - 速度模式
 } control_mode_t;
 static control_mode_t g_control_mode = CTRL_MODE_LQR;  // 默认 LQR 模式
 
@@ -179,6 +188,11 @@ static control_mode_t g_control_mode = CTRL_MODE_LQR;  // 默认 LQR 模式
 static dual_pid_controller_t g_dual_pid_ctrl;
 static bool g_dual_pid_initialized = false;
 static dual_pid_output_t g_dual_pid_output;       // 保存输出用于调试
+
+// 单环 PID 控制器 (输出速度，适合电机速度模式)
+static single_pid_controller_t g_single_pid_ctrl;
+static bool g_single_pid_initialized = false;
+static single_pid_output_t g_single_pid_output;   // 保存输出用于调试
 
 // 状态
 static balance_test_state_t g_state = BALANCE_TEST_IDLE;
@@ -251,6 +265,11 @@ static uint8_t g_plot_divider = 10;         // 输出分频 (每N次控制循环
 static uint8_t g_plot_counter = 0;          // 分频计数器
 static float g_last_lqr_u = 0.0f;           // 保存 LQR 输出用于波形显示
 
+// PID 调试输出 (用于实时 debug)
+static bool g_pid_debug_enabled = false;    // PID 调试输出使能
+static uint8_t g_pid_debug_divider = 50;    // 输出分频 (每N次控制循环输出一次，默认约4Hz@200Hz)
+static uint8_t g_pid_debug_counter = 0;     // 分频计数器
+
 // 环路使能控制 (用于单环调试)
 static uint8_t g_loop_enable_mask = LOOP_FULL;  // 默认全部启用
 static bool g_yaw_control_enabled = true;       // YAW 控制独立开关
@@ -289,6 +308,22 @@ static float g_leg_right_target_angle = -90.0f;  // 右腿实际目标身体夹�
 
 // Roll 闭环控制开关 (与腿长相关，纯轮测试时禁用)
 static bool g_roll_control_enabled = false;  // 默认禁用
+
+// Pitch 腿部角度补偿开关
+static bool g_pitch_leg_comp_enabled = false; // 默认禁用腿部角度补偿
+
+// ============================================================================
+// VMC (Virtual Model Control) 力控模式
+// ============================================================================
+static bool g_vmc_enabled = false;           // VMC 力控使能 (与位置控制互斥)
+static vmc_params_t g_vmc_params;            // VMC 参数
+static float g_vmc_target_vx = 0.0f;         // 目标水平速度 (m/s), 由平衡控制给出
+static float g_vmc_target_y = 0.14f;         // 目标机身高度 (m), 默认 0.14m
+
+// VMC 调试输出
+static vmc_dual_output_t g_vmc_dual_output = {0};  // 双腿 VMC 输出 (包含协调控制)
+static bool g_vmc_input_valid = false;             // VMC 输入是否有效
+static bool g_vmc_stream_enable = false;           // VMC 数据流输出使能 (用于 UI 调试)
 
 // 树莓派通信开关 (调试时可禁用以减少串口占用)
 static bool g_pi_comm_enabled = false;  // 默认禁用
@@ -685,6 +720,62 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
            input->yaw_rate);
 }
 
+/**
+ * @brief 输出 PID 调试信息 (实时打印)
+ */
+static void output_pid_debug(const lqr_input_t *input) {
+    if (!g_pid_debug_enabled) return;
+    
+    g_pid_debug_counter++;
+    if (g_pid_debug_counter < g_pid_debug_divider) return;
+    g_pid_debug_counter = 0;
+    
+    float pitch = input->pitch;
+    float pitch_rate = input->pitch_rate;
+    float wheel_speed = input->lqr_speed;
+    
+    if (g_control_mode == CTRL_MODE_DUAL_PID) {
+        // 双环 PID 调试输出
+        printf("[DPID] pitch=%.2f° err=%.2f° rate=%.1f°/s | "
+               "Angle: P=%.2f I=%.3f D=%.3f → tgt_spd=%.2f | "
+               "Speed: err=%.2f P=%.2f I=%.3f D=%.3f → torque=%.3f\n",
+               pitch,
+               g_dual_pid_output.angle_error,
+               pitch_rate,
+               g_dual_pid_output.angle_p_out,
+               g_dual_pid_output.angle_i_out,
+               g_dual_pid_output.angle_d_out,
+               g_dual_pid_output.target_speed,
+               g_dual_pid_output.speed_error,
+               g_dual_pid_output.speed_p_out,
+               g_dual_pid_output.speed_i_out,
+               g_dual_pid_output.speed_d_out,
+               g_dual_pid_output.torque);
+               
+    } else if (g_control_mode == CTRL_MODE_SINGLE_PID) {
+        // 单环 PID 调试输出
+        float speed_rpm = g_single_pid_output.target_speed * 9.5493f;
+        printf("[SPID] pitch=%.2f° err=%.2f° rate=%.1f°/s | "
+               "Angle: P=%.2f I=%.3f D=%.3f → speed=%.2f rad/s (%.0f rpm)\n",
+               pitch,
+               g_single_pid_output.angle_error,
+               pitch_rate,
+               g_single_pid_output.angle_p_out,
+               g_single_pid_output.angle_i_out,
+               g_single_pid_output.angle_d_out,
+               g_single_pid_output.target_speed,
+               speed_rpm);
+               
+    } else {
+        // LQR 模式调试输出
+        printf("[LQR] pitch=%.2f° rate=%.1f°/s dist=%.3f spd=%.2f | "
+               "u=%.3f yaw=%.3f\n",
+               pitch, pitch_rate,
+               g_lqr_distance, wheel_speed,
+               g_last_lqr_u, g_yaw_output);
+    }
+}
+
 // ============================================================================
 // 环路使能控制 (用于单环调试)
 // ============================================================================
@@ -920,25 +1011,133 @@ void balance_test_set_leg_speed(float speed) {
 }
 
 /**
- * @brief 发送腿部电机位置命令 (在 motor_comm 任务中调用)
+ * @brief 计算 VMC 输入状态和输出扭矩 (在平衡控制循环中调用)
+ * @note 此函数负责:
+ *       1. 收集传感器数据 (电机角度/速度、IMU、轮速)
+ *       2. 设置目标值 (腿长由 Roll 控制、身体角度默认垂直)
+ *       3. 调用 vmc_ctrl_compute() 完成所有计算
+ *       4. 保存输出用于电机控制
+ * 
+ * 所有 FK、雅可比、VMC 计算都封装在 leg_kinematics.c 中
+ */
+static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
+    if (!g_vmc_enabled || !g_leg_control_enabled) {
+        g_vmc_input_valid = false;
+        return;
+    }
+    
+    // ===== 1. 获取公共数据 =====
+    // IMU 数据
+    float pitch_deg = 0.0f, pitch_rate_deg = 0.0f;
+    if (lqr_input != NULL) {
+        pitch_deg = lqr_input->raw_pitch;
+        pitch_rate_deg = lqr_input->pitch_rate;
+    }
+    
+    // 轮子速度 → 机器人水平速度
+    const float rpm_to_rad_s = 3.14159f / 30.0f;
+    xSemaphoreTake(g_wheel_state_mutex, portMAX_DELAY);
+    float avg_wheel_rpm = (g_wheel_state.left_speed + g_wheel_state.right_speed) / 2.0f;
+    xSemaphoreGive(g_wheel_state_mutex);
+    float robot_vx = -avg_wheel_rpm * rpm_to_rad_s * WHEEL_RADIUS_M;  // 向后为正
+    
+    // ===== 2. 使用 vmc_dual_compute 计算双腿 (包含协调控制) =====
+    bool left_valid = (g_motor_left_hip && g_motor_left_knee);
+    bool right_valid = (g_motor_right_hip && g_motor_right_knee);
+    
+    if (left_valid || right_valid) {
+        vmc_dual_input_t dual_input = {
+            .pitch_deg = pitch_deg,
+            .pitch_rate_deg = pitch_rate_deg,
+            .robot_vx = robot_vx,
+            .target_vx = g_vmc_target_vx,
+            .left = {
+                .target_leg_length = g_leg_left_target_length,
+                .target_body_angle_deg = -90.0f,  // 垂直向下
+                .sensor = {
+                    .hip_angle = left_valid ? can_motor_read_position(g_motor_left_hip) : 0,
+                    .knee_angle = left_valid ? can_motor_read_position(g_motor_left_knee) : 0,
+                    .hip_velocity = left_valid ? can_motor_read_speed(g_motor_left_hip) * 6.0f : 0,
+                    .knee_velocity = left_valid ? can_motor_read_speed(g_motor_left_knee) * 6.0f : 0
+                }
+            },
+            .right = {
+                .target_leg_length = g_leg_right_target_length,
+                .target_body_angle_deg = -90.0f,
+                .sensor = {
+                    .hip_angle = right_valid ? can_motor_read_position(g_motor_right_hip) : 0,
+                    .knee_angle = right_valid ? can_motor_read_position(g_motor_right_knee) : 0,
+                    .hip_velocity = right_valid ? can_motor_read_speed(g_motor_right_hip) * 6.0f : 0,
+                    .knee_velocity = right_valid ? can_motor_read_speed(g_motor_right_knee) * 6.0f : 0
+                }
+            }
+        };
+        
+        if (vmc_dual_compute(&g_vmc_params, &dual_input, &g_vmc_dual_output) == ESP_OK) {
+            g_vmc_input_valid = true;
+            
+            // VMC 数据流输出 (用于 UI 调试)
+            // 格式: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync
+            if (g_vmc_stream_enable) {
+                printf("#VMC,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f\n",
+                       g_vmc_dual_output.left.current_leg_length,
+                       g_vmc_dual_output.left.current_body_angle,
+                       g_vmc_dual_output.left.debug.F_L,
+                       g_vmc_dual_output.left.debug.F_alpha,
+                       g_vmc_dual_output.left.hip_torque,
+                       g_vmc_dual_output.left.knee_torque,
+                       g_vmc_dual_output.right.current_leg_length,
+                       g_vmc_dual_output.right.current_body_angle,
+                       g_vmc_dual_output.right.debug.F_L,
+                       g_vmc_dual_output.right.debug.F_alpha,
+                       g_vmc_dual_output.right.hip_torque,
+                       g_vmc_dual_output.right.knee_torque,
+                       g_vmc_dual_output.angle_diff_deg,
+                       g_vmc_dual_output.F_sync);
+            }
+        }
+    }
+}
+
+/**
+ * @brief 发送腿部电机命令 (在 motor_comm 任务中调用)
+ * @note 支持两种模式:
+ *       - 位置控制模式 (!g_vmc_enabled): 发送位置命令
+ *       - VMC 力控模式 (g_vmc_enabled): 发送已计算好的扭矩命令
  */
 static void apply_leg_motor_commands(void) {
     if (!g_leg_control_enabled) return;
     
-    if (g_motor_left_hip) {
-        can_motor_set_position(g_motor_left_hip, g_leg_left_hip_angle, g_leg_move_speed);
-    }
-    if (g_motor_left_knee) {
-        can_motor_set_position(g_motor_left_knee, g_leg_left_knee_angle, g_leg_move_speed);
-    }
-    if (g_motor_right_hip) {
-        can_motor_set_position(g_motor_right_hip, g_leg_right_hip_angle, g_leg_move_speed);
-    }
-    if (g_motor_right_knee) {
-        can_motor_set_position(g_motor_right_knee, g_leg_right_knee_angle, g_leg_move_speed);
+    if (g_vmc_enabled && g_vmc_input_valid) {
+        // ===== VMC 力控模式: 发送已计算好的扭矩 =====
+        if (g_motor_left_hip) {
+            can_motor_set_torque(g_motor_left_hip, g_vmc_dual_output.left.hip_torque);
+        }
+        if (g_motor_left_knee) {
+            can_motor_set_torque(g_motor_left_knee, g_vmc_dual_output.left.knee_torque);
+        }
+        if (g_motor_right_hip) {
+            can_motor_set_torque(g_motor_right_hip, g_vmc_dual_output.right.hip_torque);
+        }
+        if (g_motor_right_knee) {
+            can_motor_set_torque(g_motor_right_knee, g_vmc_dual_output.right.knee_torque);
+        }
+    } else if (!g_vmc_enabled) {
+        // ===== 位置控制模式 =====
+        if (g_motor_left_hip) {
+            can_motor_set_position(g_motor_left_hip, g_leg_left_hip_angle, g_leg_move_speed);
+        }
+        if (g_motor_left_knee) {
+            can_motor_set_position(g_motor_left_knee, g_leg_left_knee_angle, g_leg_move_speed);
+        }
+        if (g_motor_right_hip) {
+            can_motor_set_position(g_motor_right_hip, g_leg_right_hip_angle, g_leg_move_speed);
+        }
+        if (g_motor_right_knee) {
+            can_motor_set_position(g_motor_right_knee, g_leg_right_knee_angle, g_leg_move_speed);
+        }
     }
 }
-
 // ============================================================================
 // Roll 闭环控制开关
 // ============================================================================
@@ -959,6 +1158,28 @@ void balance_test_set_roll_control(bool enable) {
  */
 bool balance_test_get_roll_control(void) {
     return g_roll_control_enabled;
+}
+
+// ============================================================================
+// Pitch 腿部角度补偿开关
+// ============================================================================
+
+/**
+ * @brief 使能/禁用 Pitch 腿部角度补偿
+ * @param enable true=使能, false=禁用
+ * @note 禁用后直接使用 IMU 原始 pitch，不考虑腿部角度
+ */
+void balance_test_set_pitch_comp(bool enable) {
+    g_pitch_leg_comp_enabled = enable;
+    ESP_LOGI(TAG, "Pitch leg compensation %s", enable ? "ENABLED" : "DISABLED");
+}
+
+/**
+ * @brief 获取 Pitch 腿部角度补偿状态
+ * @return true=已使能, false=已禁用
+ */
+bool balance_test_get_pitch_comp(void) {
+    return g_pitch_leg_comp_enabled;
 }
 
 // ============================================================================
@@ -1090,6 +1311,16 @@ esp_err_t balance_test_init(void) {
         ESP_LOGI(TAG, "Dual PID controller initialized (backup mode)");
     }
     
+    // 初始化单环 PID 控制器 (输出速度，适合电机速度模式)
+    ret = single_pid_init(&g_single_pid_ctrl, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Single PID init failed");
+    } else {
+        g_single_pid_initialized = true;
+        single_pid_set_angle_zeropoint(&g_single_pid_ctrl, g_angle_zeropoint);
+        ESP_LOGI(TAG, "Single PID controller initialized (speed output mode)");
+    }
+    
     // 初始化 Commander 解析器
     // - set_callback: 收到设置命令时更新 LQR 参数
     // - query_callback: 收到查询命令时返回 LQR 实际参数
@@ -1104,6 +1335,12 @@ esp_err_t balance_test_init(void) {
     
     // 初始化腿部控制 (计算初始电机角度)
     leg_ctrl_init();
+    
+    // 初始化 VMC 参数
+    vmc_get_default_params(&g_vmc_params);
+    ESP_LOGI(TAG, "VMC params: K_vx=%.1f, K_y=%.1f, D_y=%.1f, gc=%.2f, mass=%.1fkg",
+             g_vmc_params.K_vx, g_vmc_params.K_y, g_vmc_params.D_y,
+             g_vmc_params.gravity_comp, g_vmc_params.robot_mass);
     
     // 初始化树莓派串口通信 (Core 0, 仅通信，不影响控制)
     if (g_pi_comm_enabled) {
@@ -1269,9 +1506,18 @@ void balance_test_enable(void) {
     g_yaw_first_run = true;  // 让下一帧重新初始化 yaw_angle_last
     g_uncontrolable = 0;
     
-    // 电机进入闭环
-    can_motor_set_mode(g_motor_left, MODE_TORQUE);
-    can_motor_set_mode(g_motor_right, MODE_TORQUE);
+    // 电机进入闭环 (根据控制模式选择电机模式)
+    if (g_control_mode == CTRL_MODE_SINGLE_PID) {
+        // 单环 PID 使用速度模式
+        can_motor_set_mode(g_motor_left, MODE_SPEED);
+        can_motor_set_mode(g_motor_right, MODE_SPEED);
+        ESP_LOGI(TAG, "Motor mode: SPEED (single PID)");
+    } else {
+        // LQR / 双环 PID 使用扭矩模式
+        can_motor_set_mode(g_motor_left, MODE_TORQUE);
+        can_motor_set_mode(g_motor_right, MODE_TORQUE);
+        ESP_LOGI(TAG, "Motor mode: TORQUE (LQR/dual PID)");
+    }
     can_motor_enter_closed_loop(g_motor_left);
     can_motor_enter_closed_loop(g_motor_right);
     
@@ -1355,15 +1601,19 @@ float balance_test_get_angle_zeropoint(void) {
 
 void balance_test_print_status(void) {
     const char *state_names[] = {"IDLE", "READY", "RUNNING", "EMERGENCY", "ERROR"};
+    const char *mode_names[] = {"LQR", "DUAL_PID", "SINGLE_PID"};
     
     ESP_LOGI(TAG, "=== Balance Test Status ===");
     ESP_LOGI(TAG, "State: %s", state_names[g_state]);
     ESP_LOGI(TAG, "Task mode: %s", g_use_unified_task ? "UNIFIED" : "SEPARATE");
-    ESP_LOGI(TAG, "Control mode: %s", g_control_mode == CTRL_MODE_LQR ? "LQR" : "DUAL_PID");
+    ESP_LOGI(TAG, "Control mode: %s (%s)", 
+             mode_names[g_control_mode],
+             g_control_mode == CTRL_MODE_SINGLE_PID ? "speed output" : "torque output");
     ESP_LOGI(TAG, "Safety check: %s (uncontrolable=%d)", 
              g_uncontrolable_check_enabled ? "ENABLED" : "DISABLED", g_uncontrolable);
     ESP_LOGI(TAG, "Angle zeropoint: %.2f deg", g_angle_zeropoint);
     ESP_LOGI(TAG, "Roll control: %s", g_roll_control_enabled ? "ENABLED" : "DISABLED");
+    ESP_LOGI(TAG, "Pitch leg comp: %s", g_pitch_leg_comp_enabled ? "ENABLED" : "DISABLED");
     ESP_LOGI(TAG, "Leg control: %s", g_leg_control_enabled ? "ENABLED" : "DISABLED");
     if (g_leg_control_enabled) {
         ESP_LOGI(TAG, "  Leg targets: L=%.3fm/%.1fdeg, R=%.3fm/%.1fdeg",
@@ -1855,13 +2105,13 @@ static void compute_balance_output(float dt) {
     g_yaw_angle_last = imu.yaw;
     
     // ======== 准备 LQR 输入 ========
-    // 计算真实倾斜角 theta3: 当腿部使能时，考虑腿部角度补偿
+    // 计算真实倾斜角 theta3: 当腿部使能且补偿开启时，考虑腿部角度补偿
     // theta3 = pitch(IMU) + body_angle(腿相对机身) + 90
     // body_angle 定义：腿与机身垂直向下方向的夹角，-90°=垂直向下
     // 当 body_angle = -90° 时，theta3 = pitch + 0 = pitch (无补偿)
     // 当腿向前倾斜 body_angle > -90° 时，theta3 > pitch
     float pitch_for_control = imu.pitch;
-    if (g_leg_control_enabled) {
+    if (g_leg_control_enabled && g_pitch_leg_comp_enabled) {
         // 使用 FK 从电机编码器获取实际的 body_angle
         leg_state_t left_leg_state, right_leg_state;
         float avg_body_angle = -90.0f;  // 默认垂直
@@ -1956,7 +2206,9 @@ static void compute_balance_output(float dt) {
         // 直立环 (外环): pitch → target_speed
         // 速度环 (内环): target_speed - actual_speed → torque
         
-        float wheel_speed_avg = (left_vel_rad + right_vel_rad) / 2.0f;  // 平均轮速 (rad/s)
+        // 注意: 电机安装方向导致正转时机器人向后移动，需要取负号
+        // 与 LQR 模式的 g_lqr_speed 计算保持一致
+        float wheel_speed_avg = -(left_vel_rad + right_vel_rad) / 2.0f;  // 平均轮速 (rad/s)
         
         esp_err_t ret = dual_pid_balance_loop(&g_dual_pid_ctrl, 
                                                pitch_for_control, imu.pitch_rate,
@@ -1992,6 +2244,48 @@ static void compute_balance_output(float dt) {
         output.gyro_control = g_dual_pid_output.angle_d_out;
         output.speed_control = g_dual_pid_output.speed_p_out;
         output.filtered_target_speed = g_dual_pid_output.target_speed;
+        
+    } else if (g_control_mode == CTRL_MODE_SINGLE_PID && g_single_pid_initialized) {
+        // ======== 单环 PID 控制模式 (输出速度，适合电机速度模式) ========
+        // 直立环: pitch → target_speed (直接输出给电机速度模式)
+        
+        esp_err_t ret = single_pid_balance_loop(&g_single_pid_ctrl, 
+                                                 pitch_for_control, imu.pitch_rate,
+                                                 dt,
+                                                 &g_single_pid_output);
+        
+        if (ret != ESP_OK || g_single_pid_output.emergency) {
+            // 失败或紧急停止
+            output.left_wheel_torque = 0;
+            output.right_wheel_torque = 0;
+            g_last_lqr_u = 0;
+        } else {
+            // 单环 PID 输出是目标速度 (rad/s)
+            float target_speed = g_single_pid_output.target_speed;
+            
+            // 存入 output 结构 (注意这里是速度不是扭矩，需要后续特殊处理)
+            output.lqr_u = target_speed;  // 用于波形显示兼容
+            
+            // YAW 控制 (可选，仅在 go=true 时)
+            // 单环模式下 YAW 也是速度差速
+            if (remote.go && g_yaw_control_enabled) {
+                lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
+                g_yaw_output = output.yaw_control;
+                output.left_wheel_torque = target_speed + g_yaw_output;
+                output.right_wheel_torque = target_speed - g_yaw_output;
+            } else {
+                output.left_wheel_torque = target_speed;
+                output.right_wheel_torque = target_speed;
+                g_yaw_output = 0.0f;
+            }
+            g_last_lqr_u = target_speed;
+        }
+        
+        // 填充兼容字段用于波形显示
+        output.angle_control = g_single_pid_output.angle_p_out;
+        output.gyro_control = g_single_pid_output.angle_d_out;
+        output.speed_control = 0;  // 单环无速度环
+        output.filtered_target_speed = g_single_pid_output.target_speed;
         
     } else {
         // ======== LQR 多环控制模式 (默认) ========
@@ -2141,13 +2435,30 @@ static void compute_balance_output(float dt) {
         }
     }
     
+    // ======== VMC 力控计算 (在 Roll 控制之后) ========
+    // VMC 模式下：
+    //   1. 获取 Roll 控制的腿长输出 (如果启用)
+    //   2. 计算当前状态和 VMC 扭矩
+    // 注: VMC 的 target_y 使用 Roll 调节后的腿长
+    if (g_vmc_enabled && g_leg_control_enabled) {
+        // 从 Roll 控制获取左右腿目标高度 (腿长近似等于高度)
+        // Roll 控制已将 g_leg_left_target_length 和 g_leg_right_target_length 更新
+        // 这些值在 VMC 中用作 target_y
+        vmc_compute_leg_state(&input);
+    }
+    
     // ======== 输出波形数据 (用于 Qt 调参面板) ========
     output_plot_data(&input, &output);
+    
+    // ======== 输出 PID 调试信息 ========
+    output_pid_debug(&input);
     
     // ======== 更新轮命令 ========
     xSemaphoreTake(g_wheel_cmd_mutex, portMAX_DELAY);
     g_wheel_cmd.left_torque = output.left_wheel_torque;
     g_wheel_cmd.right_torque = output.right_wheel_torque;
+    // 单环 PID 模式使用速度模式，其他模式使用扭矩模式
+    g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID);
     // enabled 状态由 balance_test_enable/disable 控制
     xSemaphoreGive(g_wheel_cmd_mutex);
 }
@@ -2163,9 +2474,20 @@ static void apply_motor_commands(void) {
     xSemaphoreGive(g_wheel_cmd_mutex);
     
     if (cmd.enabled && g_state == BALANCE_TEST_RUNNING) {
-        can_motor_set_torque(g_motor_left, cmd.left_torque);
-        can_motor_set_torque(g_motor_right, cmd.right_torque);
+        if (cmd.use_speed_mode) {
+            // 速度模式 (单环 PID 输出): left_torque/right_torque 实际存储的是速度 (rad/s)
+            // 转换: rad/s → rpm (rpm = rad/s * 60 / 2π ≈ rad/s * 9.5493)
+            float left_speed_rpm = cmd.left_torque * 9.5493f;
+            float right_speed_rpm = cmd.right_torque * 9.5493f;
+            can_motor_set_speed(g_motor_left, left_speed_rpm);
+            can_motor_set_speed(g_motor_right, right_speed_rpm);
+        } else {
+            // 扭矩模式 (LQR / 双环 PID 输出)
+            can_motor_set_torque(g_motor_left, cmd.left_torque);
+            can_motor_set_torque(g_motor_right, cmd.right_torque);
+        }
     } else {
+        // 停止时使用扭矩模式发送 0
         can_motor_set_torque(g_motor_left, 0);
         can_motor_set_torque(g_motor_right, 0);
     }
@@ -2351,6 +2673,43 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else {
             printf("Unknown plot command: %s\n", token);
             printf("Usage: balance plot [on|off|div <N>]\n");
+        }
+    }
+    // ===== PID 调试输出命令 =====
+    else if (strcmp(token, "debug") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("PID debug output: %s\n", g_pid_debug_enabled ? "enabled" : "disabled");
+            printf("Debug divider: %d (%.1f Hz @ 200Hz ctrl)\n", g_pid_debug_divider, 200.0f / g_pid_debug_divider);
+            printf("Control mode: %s\n", 
+                   g_control_mode == CTRL_MODE_LQR ? "LQR" :
+                   g_control_mode == CTRL_MODE_DUAL_PID ? "DUAL_PID" : "SINGLE_PID");
+            printf("Usage: balance debug [on|off|div <N>]\n");
+        } else if (strcmp(token, "on") == 0) {
+            g_pid_debug_enabled = true;
+            g_pid_debug_counter = 0;
+            printf("PID debug output enabled (div=%d, %.1f Hz)\n", 
+                   g_pid_debug_divider, 200.0f / g_pid_debug_divider);
+        } else if (strcmp(token, "off") == 0) {
+            g_pid_debug_enabled = false;
+            printf("PID debug output disabled\n");
+        } else if (strcmp(token, "div") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                int div = atoi(token);
+                if (div >= 1 && div <= 255) {
+                    g_pid_debug_divider = (uint8_t)div;
+                    printf("Debug divider set to %d (%.1f Hz @ 200Hz ctrl)\n", div, 200.0f / div);
+                } else {
+                    printf("Divider must be 1-255\n");
+                }
+            } else {
+                printf("Current divider: %d (%.1f Hz)\n", g_pid_debug_divider, 200.0f / g_pid_debug_divider);
+                printf("Usage: balance debug div <1-255>\n");
+            }
+        } else {
+            printf("Unknown debug command: %s\n", token);
+            printf("Usage: balance debug [on|off|div <N>]\n");
         }
     }
     // ===== 腿部电机控制命令 =====
@@ -2564,6 +2923,385 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance roll [on|off]\n");
         }
     }
+    // ===== Pitch 腿部角度补偿开关 =====
+    else if (strcmp(token, "pitchcomp") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Pitch leg compensation: %s\n", g_pitch_leg_comp_enabled ? "enabled" : "disabled");
+            printf("  When enabled: pitch_for_control = imu.pitch + body_angle + 90\n");
+            printf("  When disabled: pitch_for_control = imu.pitch (raw IMU)\n");
+            printf("Usage: balance pitchcomp [on|off]\n");
+        } else if (strcmp(token, "on") == 0) {
+            balance_test_set_pitch_comp(true);
+            printf("Pitch leg compensation enabled\n");
+        } else if (strcmp(token, "off") == 0) {
+            balance_test_set_pitch_comp(false);
+            printf("Pitch leg compensation disabled (using raw IMU pitch)\n");
+        } else {
+            printf("Unknown pitchcomp command: %s\n", token);
+            printf("Usage: balance pitchcomp [on|off]\n");
+        }
+    }
+    // ===== VMC 力控模式 =====
+    else if (strcmp(token, "vmc") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            // 显示 VMC 状态
+            printf("=== VMC Status ===\n");
+            printf("VMC mode: %s\n", g_vmc_enabled ? "ENABLED (force control)" : "DISABLED (position control)");
+            printf("Coord type: %s\n", g_vmc_params.coord_type == VMC_COORD_BODY ? "BODY" : "WORLD");
+            printf("Target height: %.3f m\n", g_vmc_target_y);
+            printf("Target vx: %.3f m/s\n", g_vmc_target_vx);
+            printf("Params: K_vx=%.1f, K_y=%.1f, D_y=%.1f, gc=%.2f, mass=%.1fkg\n",
+                   g_vmc_params.K_vx, g_vmc_params.K_y, g_vmc_params.D_y,
+                   g_vmc_params.gravity_comp, g_vmc_params.robot_mass);
+            printf("Torque limits: hip=%.1fNm, knee=%.1fNm\n",
+                   g_vmc_params.max_hip_torque, g_vmc_params.max_knee_torque);
+            printf("Leg Sync: %s (Kp=%.3f, Kd=%.3f)\n", 
+                   g_vmc_params.sync_enable ? "ON" : "OFF", g_vmc_params.K_sync, g_vmc_params.D_sync);
+            if (g_vmc_enabled) {
+                printf("Left:  F_x=%.2fN, F_y=%.2fN, tau_hip=%.2fNm, tau_knee=%.2fNm\n",
+                       g_vmc_dual_output.left.debug.F_x, g_vmc_dual_output.left.debug.F_y,
+                       g_vmc_dual_output.left.hip_torque, g_vmc_dual_output.left.knee_torque);
+                printf("Right: F_x=%.2fN, F_y=%.2fN, tau_hip=%.2fNm, tau_knee=%.2fNm\n",
+                       g_vmc_dual_output.right.debug.F_x, g_vmc_dual_output.right.debug.F_y,
+                       g_vmc_dual_output.right.hip_torque, g_vmc_dual_output.right.knee_torque);
+                if (g_vmc_params.sync_enable) {
+                    printf("Sync: diff=%.2fdeg, rate=%.1fdeg/s, out=%.3fNm\n",
+                           g_vmc_dual_output.angle_diff_deg, g_vmc_dual_output.angle_diff_rate_deg, 
+                           g_vmc_dual_output.F_sync);
+                }
+            }
+            printf("Usage: balance vmc [on|off|kvx|ky|dy|gc|mass|height|status|sync]\n");
+        } else if (strcmp(token, "on") == 0) {
+            if (!g_leg_control_enabled) {
+                printf("Error: Enable leg control first (balance leg on)\n");
+            } else {
+                // 切换腿部电机到力矩模式
+                if (g_motor_left_hip) can_motor_set_mode(g_motor_left_hip, MODE_TORQUE);
+                if (g_motor_left_knee) can_motor_set_mode(g_motor_left_knee, MODE_TORQUE);
+                if (g_motor_right_hip) can_motor_set_mode(g_motor_right_hip, MODE_TORQUE);
+                if (g_motor_right_knee) can_motor_set_mode(g_motor_right_knee, MODE_TORQUE);
+                
+                g_vmc_enabled = true;
+                printf("VMC force control ENABLED\n");
+                printf("Note: Leg motors now in torque mode!\n");
+            }
+        } else if (strcmp(token, "off") == 0) {
+            g_vmc_enabled = false;
+            
+            // 切换腿部电机回位置模式
+            if (g_motor_left_hip) can_motor_set_mode(g_motor_left_hip, MODE_POS_FILTER);
+            if (g_motor_left_knee) can_motor_set_mode(g_motor_left_knee, MODE_POS_FILTER);
+            if (g_motor_right_hip) can_motor_set_mode(g_motor_right_hip, MODE_POS_FILTER);
+            if (g_motor_right_knee) can_motor_set_mode(g_motor_right_knee, MODE_POS_FILTER);
+            
+            printf("VMC force control DISABLED (back to position control)\n");
+        } else if (strcmp(token, "kvx") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.K_vx = atof(token);
+                printf("VMC K_vx = %.1f Ns/m\n", g_vmc_params.K_vx);
+            } else {
+                printf("VMC K_vx = %.1f Ns/m\n", g_vmc_params.K_vx);
+                printf("Usage: balance vmc kvx <value>\n");
+            }
+        } else if (strcmp(token, "ky") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.K_y = atof(token);
+                printf("VMC K_y = %.1f N/m\n", g_vmc_params.K_y);
+            } else {
+                printf("VMC K_y = %.1f N/m\n", g_vmc_params.K_y);
+                printf("Usage: balance vmc ky <value>\n");
+            }
+        } else if (strcmp(token, "dy") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.D_y = atof(token);
+                printf("VMC D_y = %.1f Ns/m\n", g_vmc_params.D_y);
+            } else {
+                printf("VMC D_y = %.1f Ns/m\n", g_vmc_params.D_y);
+                printf("Usage: balance vmc dy <value>\n");
+            }
+        } else if (strcmp(token, "gc") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.gravity_comp = atof(token);
+                if (g_vmc_params.gravity_comp < 0) g_vmc_params.gravity_comp = 0;
+                if (g_vmc_params.gravity_comp > 1.5f) g_vmc_params.gravity_comp = 1.5f;
+                printf("VMC gravity_comp = %.2f\n", g_vmc_params.gravity_comp);
+            } else {
+                printf("VMC gravity_comp = %.2f\n", g_vmc_params.gravity_comp);
+                printf("Usage: balance vmc gc <0~1.5>\n");
+            }
+        } else if (strcmp(token, "mass") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.robot_mass = atof(token);
+                printf("VMC robot_mass = %.1f kg\n", g_vmc_params.robot_mass);
+            } else {
+                printf("VMC robot_mass = %.1f kg\n", g_vmc_params.robot_mass);
+                printf("Usage: balance vmc mass <kg>\n");
+            }
+        } else if (strcmp(token, "height") == 0 || strcmp(token, "y") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_target_y = atof(token);
+                // 限制在合理范围
+                if (g_vmc_target_y < 0.07f) g_vmc_target_y = 0.07f;
+                if (g_vmc_target_y > 0.19f) g_vmc_target_y = 0.19f;
+                printf("VMC target height = %.3f m\n", g_vmc_target_y);
+            } else {
+                printf("VMC target height = %.3f m\n", g_vmc_target_y);
+                printf("Usage: balance vmc height <meters>\n");
+            }
+        } else if (strcmp(token, "vx") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_target_vx = atof(token);
+                printf("VMC target vx = %.3f m/s\n", g_vmc_target_vx);
+            } else {
+                printf("VMC target vx = %.3f m/s\n", g_vmc_target_vx);
+                printf("Usage: balance vmc vx <m/s>\n");
+            }
+        } else if (strcmp(token, "status") == 0) {
+            // 详细状态
+            printf("=== VMC Detailed Status ===\n");
+            printf("Mode: %s\n", g_vmc_enabled ? "FORCE CONTROL" : "POSITION CONTROL");
+            printf("Coordinate: %s\n", g_vmc_params.coord_type == VMC_COORD_WORLD ? "WORLD (x-y)" : "BODY (L-α)");
+            printf("Target: height=%.3fm, vx=%.3fm/s\n", g_vmc_target_y, g_vmc_target_vx);
+            printf("Params (World Coord):\n");
+            printf("  K_vx = %.1f Ns/m (horizontal velocity gain)\n", g_vmc_params.K_vx);
+            printf("  K_y  = %.1f N/m (vertical stiffness)\n", g_vmc_params.K_y);
+            printf("  D_y  = %.1f Ns/m (vertical damping)\n", g_vmc_params.D_y);
+            printf("Params (Body Coord):\n");
+            printf("  K_L  = %.1f N/m (leg stiffness)\n", g_vmc_params.K_L);
+            printf("  D_L  = %.1f Ns/m (leg damping)\n", g_vmc_params.D_L);
+            printf("  K_α  = %.2f Nm/rad (angle stiffness)\n", g_vmc_params.K_alpha);
+            printf("  D_α  = %.2f Nm·s/rad (angle damping)\n", g_vmc_params.D_alpha);
+            printf("Common:\n");
+            printf("  gravity_comp = %.2f (0~1)\n", g_vmc_params.gravity_comp);
+            printf("  robot_mass = %.1f kg\n", g_vmc_params.robot_mass);
+            printf("  max_hip_torque = %.1f Nm\n", g_vmc_params.max_hip_torque);
+            printf("  max_knee_torque = %.1f Nm\n", g_vmc_params.max_knee_torque);
+            printf("Pitch Control: %s\n", g_vmc_params.pitch_ctrl_enable ? "ENABLED" : "DISABLED");
+            printf("  K_pitch = %.2f Nm/rad\n", g_vmc_params.K_pitch);
+            printf("  D_pitch = %.2f Nm·s/rad\n", g_vmc_params.D_pitch);
+            printf("  target_pitch = %.2f deg\n", RAD2DEG(g_vmc_params.target_pitch));
+            if (g_vmc_enabled && g_motor_left_hip && g_motor_left_knee) {
+                // 计算当前状态
+                leg_joint_state_t joint = {
+                    .hip_angle = can_motor_read_position(g_motor_left_hip),
+                    .knee_angle = can_motor_read_position(g_motor_left_knee)
+                };
+                leg_workspace_state_t ws;
+                leg_kin_forward(&joint, true, NULL, &ws);
+                float x, y;
+                leg_kin_forward_cartesian(&joint, true, NULL, 0.0f, &x, &y);
+                printf("Left leg state:\n");
+                printf("  Body coord: L=%.3fm, α=%.1f°\n", ws.leg_length, ws.body_angle);
+                printf("  World coord: y=%.3fm, x=%.3fm (pitch=0)\n", y, x);
+                if (g_vmc_params.coord_type == VMC_COORD_BODY) {
+                    printf("  Output: F_L=%.2fN, F_α=%.3fNm (gravity=%.2fN)\n",
+                           g_vmc_dual_output.left.debug.F_L, g_vmc_dual_output.left.debug.F_alpha, g_vmc_dual_output.left.debug.F_gravity);
+                } else {
+                    printf("  Output: F_x=%.2fN, F_y=%.2fN (gravity=%.2fN)\n",
+                           g_vmc_dual_output.left.debug.F_x, g_vmc_dual_output.left.debug.F_y, g_vmc_dual_output.left.debug.F_gravity);
+                }
+                printf("  Torque: hip=%.2fNm (vmc=%.2f, pitch=%.2f), knee=%.2fNm\n",
+                       g_vmc_dual_output.left.hip_torque, g_vmc_dual_output.left.debug.tau_hip_vmc, 
+                       g_vmc_dual_output.left.debug.tau_hip_pitch, g_vmc_dual_output.left.knee_torque);
+            }
+        } else if (strcmp(token, "coord") == 0) {
+            // 坐标系切换
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("VMC Coordinate: %s\n", g_vmc_params.coord_type == VMC_COORD_WORLD ? "WORLD (x-y)" : "BODY (L-α)");
+                printf("Usage: balance vmc coord [world|body]\n");
+            } else if (strcmp(token, "world") == 0) {
+                g_vmc_params.coord_type = VMC_COORD_WORLD;
+                printf("VMC coordinate set to WORLD (x-y)\n");
+                printf("  Controls: horizontal velocity (vx), vertical height (y)\n");
+            } else if (strcmp(token, "body") == 0) {
+                g_vmc_params.coord_type = VMC_COORD_BODY;
+                printf("VMC coordinate set to BODY (L-α)\n");
+                printf("  Controls: leg length (L), body angle (α)\n");
+            } else {
+                printf("Unknown coordinate type: %s\n", token);
+                printf("Usage: balance vmc coord [world|body]\n");
+            }
+        } else if (strcmp(token, "kl") == 0) {
+            // 腿长刚度 (机身坐标系)
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.K_L = atof(token);
+                printf("VMC K_L = %.1f N/m\n", g_vmc_params.K_L);
+            } else {
+                printf("VMC K_L = %.1f N/m\n", g_vmc_params.K_L);
+                printf("Usage: balance vmc kl <N/m>\n");
+            }
+        } else if (strcmp(token, "dl") == 0) {
+            // 腿长阻尼 (机身坐标系)
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.D_L = atof(token);
+                printf("VMC D_L = %.1f Ns/m\n", g_vmc_params.D_L);
+            } else {
+                printf("VMC D_L = %.1f Ns/m\n", g_vmc_params.D_L);
+                printf("Usage: balance vmc dl <Ns/m>\n");
+            }
+        } else if (strcmp(token, "ka") == 0) {
+            // 身体角度刚度 (机身坐标系)
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.K_alpha = atof(token);
+                printf("VMC K_alpha = %.2f Nm/rad\n", g_vmc_params.K_alpha);
+            } else {
+                printf("VMC K_alpha = %.2f Nm/rad\n", g_vmc_params.K_alpha);
+                printf("Usage: balance vmc ka <Nm/rad>\n");
+            }
+        } else if (strcmp(token, "da") == 0) {
+            // 身体角度阻尼 (机身坐标系)
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_vmc_params.D_alpha = atof(token);
+                printf("VMC D_alpha = %.2f Nm·s/rad\n", g_vmc_params.D_alpha);
+            } else {
+                printf("VMC D_alpha = %.2f Nm·s/rad\n", g_vmc_params.D_alpha);
+                printf("Usage: balance vmc da <Nm·s/rad>\n");
+            }
+        } else if (strcmp(token, "soft") == 0) {
+            // 柔软预设
+            g_vmc_params.K_y = 500.0f;
+            g_vmc_params.D_y = 80.0f;
+            printf("VMC preset: SOFT (K_y=500, D_y=80)\n");
+        } else if (strcmp(token, "stiff") == 0) {
+            // 刚硬预设
+            g_vmc_params.K_y = 1500.0f;
+            g_vmc_params.D_y = 30.0f;
+            printf("VMC preset: STIFF (K_y=1500, D_y=30)\n");
+        } else if (strcmp(token, "pitch") == 0) {
+            // Pitch 控制子命令
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("VMC Pitch Control: %s\n", g_vmc_params.pitch_ctrl_enable ? "ENABLED" : "DISABLED");
+                printf("  K_pitch = %.2f Nm/rad\n", g_vmc_params.K_pitch);
+                printf("  D_pitch = %.2f Nm·s/rad\n", g_vmc_params.D_pitch);
+                printf("  target_pitch = %.2f deg\n", RAD2DEG(g_vmc_params.target_pitch));
+                if (g_vmc_enabled && g_vmc_input_valid) {
+                    printf("  tau_hip_pitch (L) = %.3f Nm\n", g_vmc_dual_output.left.debug.tau_hip_pitch);
+                    printf("  tau_hip_pitch (R) = %.3f Nm\n", g_vmc_dual_output.right.debug.tau_hip_pitch);
+                }
+                printf("Usage: balance vmc pitch [on|off|kp|kd|target]\n");
+            } else if (strcmp(token, "on") == 0) {
+                g_vmc_params.pitch_ctrl_enable = true;
+                printf("VMC pitch control ENABLED\n");
+            } else if (strcmp(token, "off") == 0) {
+                g_vmc_params.pitch_ctrl_enable = false;
+                printf("VMC pitch control DISABLED\n");
+            } else if (strcmp(token, "kp") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    g_vmc_params.K_pitch = atof(token);
+                    printf("VMC K_pitch = %.2f Nm/rad\n", g_vmc_params.K_pitch);
+                } else {
+                    printf("VMC K_pitch = %.2f Nm/rad\n", g_vmc_params.K_pitch);
+                    printf("Usage: balance vmc pitch kp <value>\n");
+                }
+            } else if (strcmp(token, "kd") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    g_vmc_params.D_pitch = atof(token);
+                    printf("VMC D_pitch = %.2f Nm·s/rad\n", g_vmc_params.D_pitch);
+                } else {
+                    printf("VMC D_pitch = %.2f Nm·s/rad\n", g_vmc_params.D_pitch);
+                    printf("Usage: balance vmc pitch kd <value>\n");
+                }
+            } else if (strcmp(token, "target") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    g_vmc_params.target_pitch = DEG2RAD(atof(token));
+                    printf("VMC target_pitch = %.2f deg\n", RAD2DEG(g_vmc_params.target_pitch));
+                } else {
+                    printf("VMC target_pitch = %.2f deg\n", RAD2DEG(g_vmc_params.target_pitch));
+                    printf("Usage: balance vmc pitch target <deg>\n");
+                }
+            } else {
+                printf("Unknown vmc pitch command: %s\n", token);
+                printf("Usage: balance vmc pitch [on|off|kp|kd|target]\n");
+            }
+        } else if (strcmp(token, "sync") == 0) {
+            // 双腿协调控制 (Leg Sync) 子命令
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("=== Leg Sync Control ===\n");
+                printf("Status: %s\n", g_vmc_params.sync_enable ? "ENABLED" : "DISABLED");
+                printf("  Kp = %.3f Nm/rad\n", g_vmc_params.K_sync);
+                printf("  Kd = %.3f Nm·s/rad\n", g_vmc_params.D_sync);
+                if (g_vmc_enabled && g_vmc_params.sync_enable) {
+                    printf("  Left angle  = %.2f deg\n", g_vmc_dual_output.left.current_body_angle);
+                    printf("  Right angle = %.2f deg\n", g_vmc_dual_output.right.current_body_angle);
+                    printf("  Angle diff  = %.2f deg\n", g_vmc_dual_output.angle_diff_deg);
+                    printf("  Diff rate   = %.2f deg/s\n", g_vmc_dual_output.angle_diff_rate_deg);
+                    printf("  Sync output = %.3f Nm\n", g_vmc_dual_output.F_sync);
+                }
+                printf("Usage: balance vmc sync [on|off|kp|kd]\n");
+            } else if (strcmp(token, "on") == 0) {
+                g_vmc_params.sync_enable = true;
+                printf("Leg sync control ENABLED\n");
+            } else if (strcmp(token, "off") == 0) {
+                g_vmc_params.sync_enable = false;
+                printf("Leg sync control DISABLED\n");
+            } else if (strcmp(token, "kp") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    g_vmc_params.K_sync = atof(token);
+                    printf("Leg sync Kp = %.3f Nm/rad\n", g_vmc_params.K_sync);
+                } else {
+                    printf("Leg sync Kp = %.3f Nm/rad\n", g_vmc_params.K_sync);
+                    printf("Usage: balance vmc sync kp <value>\n");
+                }
+            } else if (strcmp(token, "kd") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    g_vmc_params.D_sync = atof(token);
+                    printf("Leg sync Kd = %.3f Nm·s/rad\n", g_vmc_params.D_sync);
+                } else {
+                    printf("Leg sync Kd = %.3f Nm·s/rad\n", g_vmc_params.D_sync);
+                    printf("Usage: balance vmc sync kd <value>\n");
+                }
+            } else {
+                printf("Unknown vmc sync command: %s\n", token);
+                printf("Usage: balance vmc sync [on|off|kp|kd]\n");
+            }
+        } else if (strcmp(token, "stream") == 0) {
+            // VMC 数据流输出控制
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("VMC stream: %s\n", g_vmc_stream_enable ? "ENABLED" : "DISABLED");
+                printf("Format: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync\n");
+                printf("Usage: balance vmc stream [on|off]\n");
+            } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+                g_vmc_stream_enable = true;
+                printf("VMC stream ENABLED\n");
+            } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+                g_vmc_stream_enable = false;
+                printf("VMC stream DISABLED\n");
+            } else {
+                printf("Unknown vmc stream command: %s\n", token);
+                printf("Usage: balance vmc stream [on|off]\n");
+            }
+        } else {
+            printf("Unknown vmc command: %s\n", token);
+            printf("Usage: balance vmc [on|off|status|coord|soft|stiff|pitch|sync|stream]\n");
+            printf("  World coord: kvx|ky|dy\n");
+            printf("  Body coord:  kl|dl|ka|da\n");
+            printf("  Common:      gc|mass|height|vx\n");
+            printf("  Leg sync:    sync [on|off|kp|kd]\n");
+            printf("  Stream:      stream [on|off]  (for UI debug)\n");
+        }
+    }
     // ===== 树莓派通信开关 =====
     else if (strcmp(token, "picomm") == 0) {
         token = strtok(NULL, " \t\n\r");
@@ -2762,14 +3500,22 @@ void balance_test_process_cmd(const char *cmd_str) {
     else if (strcmp(token, "mode") == 0) {
         token = strtok(NULL, " \t\n\r");
         if (token == NULL) {
-            printf("Control mode: %s\n", g_control_mode == CTRL_MODE_LQR ? "LQR" : "DUAL_PID");
-            printf("CTRL_MODE:%s\n", g_control_mode == CTRL_MODE_LQR ? "LQR" : "DUAL_PID");
-            printf("  LQR:      Multi-loop LQR control (angle+gyro+dist+speed)\n");
-            printf("  DUAL_PID: Simple dual-loop PID (angle->speed->torque)\n");
-            printf("Usage: balance mode [lqr|pid]\n");
+            const char *mode_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
+                                   (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : "SINGLE_PID";
+            printf("Control mode: %s\n", mode_str);
+            printf("CTRL_MODE:%s\n", mode_str);
+            printf("  LQR:        Multi-loop LQR control (angle+gyro+dist+speed) → torque\n");
+            printf("  DUAL_PID:   Dual-loop PID (angle→speed→torque) → torque mode\n");
+            printf("  SINGLE_PID: Single-loop PID (angle→speed) → speed mode\n");
+            printf("Usage: balance mode [lqr|pid|spid]\n");
         } else if (strcmp(token, "lqr") == 0 || strcmp(token, "0") == 0) {
             g_control_mode = CTRL_MODE_LQR;
-            printf("Control mode set to LQR\n");
+            // 如果正在运行，切换电机到扭矩模式
+            if (g_state == BALANCE_TEST_RUNNING) {
+                can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                can_motor_set_mode(g_motor_right, MODE_TORQUE);
+            }
+            printf("Control mode set to LQR (torque mode)\n");
             printf("CTRL_MODE:LQR\n");
         } else if (strcmp(token, "pid") == 0 || strcmp(token, "dual") == 0 || strcmp(token, "1") == 0) {
             if (!g_dual_pid_initialized) {
@@ -2777,12 +3523,31 @@ void balance_test_process_cmd(const char *cmd_str) {
             } else {
                 g_control_mode = CTRL_MODE_DUAL_PID;
                 dual_pid_reset(&g_dual_pid_ctrl);  // 切换时重置
-                printf("Control mode set to DUAL_PID\n");
+                // 如果正在运行，切换电机到扭矩模式
+                if (g_state == BALANCE_TEST_RUNNING) {
+                    can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                    can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                }
+                printf("Control mode set to DUAL_PID (torque mode)\n");
                 printf("CTRL_MODE:DUAL_PID\n");
+            }
+        } else if (strcmp(token, "spid") == 0 || strcmp(token, "single") == 0 || strcmp(token, "2") == 0) {
+            if (!g_single_pid_initialized) {
+                printf("Error: Single PID controller not initialized\n");
+            } else {
+                g_control_mode = CTRL_MODE_SINGLE_PID;
+                single_pid_reset(&g_single_pid_ctrl);  // 切换时重置
+                // 如果正在运行，切换电机到速度模式
+                if (g_state == BALANCE_TEST_RUNNING) {
+                    can_motor_set_mode(g_motor_left, MODE_SPEED);
+                    can_motor_set_mode(g_motor_right, MODE_SPEED);
+                }
+                printf("Control mode set to SINGLE_PID (speed mode)\n");
+                printf("CTRL_MODE:SINGLE_PID\n");
             }
         } else {
             printf("Unknown mode: %s\n", token);
-            printf("Usage: balance mode [lqr|pid]\n");
+            printf("Usage: balance mode [lqr|pid|spid]\n");
         }
     }
     // ===== 双环 PID 调参命令 =====
@@ -2872,9 +3637,86 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance dpid [angle|speed|zero|reset|status]\n");
         }
     }
+    // ===== 单环 PID 调参命令 =====
+    else if (strcmp(token, "spid") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            // 显示当前参数
+            printf("=== Single PID Parameters (Speed Output Mode) ===\n");
+            printf("Angle PID: kp=%.2f ki=%.2f kd=%.3f limit=%.1f rad/s\n",
+                   g_single_pid_ctrl.params.angle_kp, g_single_pid_ctrl.params.angle_ki,
+                   g_single_pid_ctrl.params.angle_kd, g_single_pid_ctrl.params.angle_limit);
+            printf("Angle zeropoint: %.2f deg\n", g_single_pid_ctrl.params.angle_zeropoint);
+            printf("Emergency angle: %.1f deg\n", g_single_pid_ctrl.params.emergency_angle);
+            printf("\nUsage: balance spid angle <kp> <ki> <kd>\n");
+            printf("       balance spid limit <max_speed_rad_s>\n");
+            printf("       balance spid zero <degrees>\n");
+            printf("       balance spid reset\n");
+            printf("       balance spid status\n");
+        } else if (strcmp(token, "angle") == 0) {
+            // 设置直立环 PID
+            float kp = g_single_pid_ctrl.params.angle_kp;
+            float ki = g_single_pid_ctrl.params.angle_ki;
+            float kd = g_single_pid_ctrl.params.angle_kd;
+            
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            
+            single_pid_set_angle_gains(&g_single_pid_ctrl, kp, ki, kd);
+            printf("Single PID Angle set: kp=%.2f ki=%.2f kd=%.3f\n", kp, ki, kd);
+            // 输出 Qt 可解析格式
+            printf("SPID:ANGLE,%.4f,%.4f,%.4f\n", kp, ki, kd);
+        } else if (strcmp(token, "limit") == 0) {
+            // 设置输出限幅 (最大速度)
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float limit = atof(token);
+                g_single_pid_ctrl.params.angle_limit = limit;
+                pid_set_output_limits(&g_single_pid_ctrl.pid_angle, -limit, limit);
+                printf("Single PID output limit set to %.1f rad/s (%.1f rpm)\n", limit, limit * 9.5493f);
+            } else {
+                printf("Current output limit: %.1f rad/s (%.1f rpm)\n", 
+                       g_single_pid_ctrl.params.angle_limit,
+                       g_single_pid_ctrl.params.angle_limit * 9.5493f);
+            }
+        } else if (strcmp(token, "zero") == 0) {
+            // 设置角度零点
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float zero = atof(token);
+                single_pid_set_angle_zeropoint(&g_single_pid_ctrl, zero);
+                printf("Single PID angle zeropoint set to %.2f\n", zero);
+            } else {
+                printf("Current angle zeropoint: %.2f\n", g_single_pid_ctrl.params.angle_zeropoint);
+            }
+        } else if (strcmp(token, "reset") == 0) {
+            single_pid_reset(&g_single_pid_ctrl);
+            printf("Single PID controller reset\n");
+        } else if (strcmp(token, "status") == 0) {
+            // 显示实时状态
+            printf("=== Single PID Status ===\n");
+            printf("Control mode: %s\n", g_control_mode == CTRL_MODE_SINGLE_PID ? "ACTIVE" : "INACTIVE");
+            printf("Angle error: %.2f deg\n", g_single_pid_output.angle_error);
+            printf("Output speed: %.2f rad/s (%.1f rpm)\n", 
+                   g_single_pid_output.target_speed,
+                   g_single_pid_output.target_speed * 9.5493f);
+            printf("Angle PID: P=%.2f I=%.2f D=%.3f\n",
+                   g_single_pid_output.angle_p_out, g_single_pid_output.angle_i_out, g_single_pid_output.angle_d_out);
+            // 输出 Qt 可解析格式
+            printf("SPID_STATUS:PITCH_ERR=%.2f,TGT_SPD=%.2f\n",
+                   g_single_pid_output.angle_error, g_single_pid_output.target_speed);
+        } else {
+            printf("Unknown spid command: %s\n", token);
+            printf("Usage: balance spid [angle|limit|zero|reset|status]\n");
+        }
+    }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|leg|roll|mzero|loop|task|safety|mode|dpid]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|mode|dpid|spid]\n");
     }
 }
 

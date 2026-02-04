@@ -590,6 +590,129 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
  */
 bool dual_pid_check_emergency(dual_pid_controller_t *ctrl, float pitch);
 
+// ============================================================================
+// 单环 PID 控制器 (直立环 → 目标速度，配合轮电机速度模式)
+// ============================================================================
+
+/**
+ * @brief 单环PID参数结构体
+ * 
+ * 控制架构:
+ *   目标角度(0°) → [直立环PID] → 目标速度 (送给轮电机速度模式)
+ *       ↑
+ *   实际Pitch
+ * 
+ * @note 与双环 PID 区别:
+ *   - 双环: 直立环→速度环→扭矩 (适合扭矩模式)
+ *   - 单环: 直立环→速度 (适合速度模式，由电机内部速度环闭环)
+ */
+typedef struct {
+    // 直立环 PID: pitch → target_speed
+    float angle_kp;         // 角度P (默认 15.0)
+    float angle_ki;         // 角度I (默认 0.0)
+    float angle_kd;         // 角度D (默认 0.5)
+    float angle_limit;      // 输出限幅 - 最大目标速度 (默认 100.0 rad/s)
+    
+    // 角度零点
+    float angle_zeropoint;  // 机械零点偏移 (默认 0.0 度)
+    
+    // 安全阈值
+    float emergency_angle;  // 紧急停止角度 (默认 45.0 度)
+} single_pid_params_t;
+
+/**
+ * @brief 单环PID控制器输出结构体
+ */
+typedef struct {
+    float angle_error;      // 角度误差 (目标-实际)
+    float target_speed;     // 输出目标速度 (rad/s)
+    
+    // 用于调试的中间量
+    float angle_p_out;      // 角度环P输出
+    float angle_i_out;      // 角度环I输出
+    float angle_d_out;      // 角度环D输出
+    
+    bool emergency;         // 是否紧急停止
+} single_pid_output_t;
+
+/**
+ * @brief 单环PID控制器结构体
+ */
+typedef struct {
+    pid_controller_t pid_angle;     // 直立环
+    
+    single_pid_params_t params;
+    
+    bool initialized;
+} single_pid_controller_t;
+
+/**
+ * @brief 获取单环PID默认参数
+ * @param params 参数结构体指针
+ */
+void single_pid_get_default_params(single_pid_params_t *params);
+
+/**
+ * @brief 初始化单环PID控制器
+ * @param ctrl 控制器实例
+ * @param params 参数 (NULL 使用默认)
+ * @return ESP_OK 成功
+ */
+esp_err_t single_pid_init(single_pid_controller_t *ctrl, const single_pid_params_t *params);
+
+/**
+ * @brief 重置单环PID控制器
+ * @param ctrl 控制器实例
+ */
+void single_pid_reset(single_pid_controller_t *ctrl);
+
+/**
+ * @brief 设置单环PID参数
+ * @param ctrl 控制器实例
+ * @param params 新参数
+ */
+void single_pid_set_params(single_pid_controller_t *ctrl, const single_pid_params_t *params);
+
+/**
+ * @brief 设置直立环PID增益
+ * @param ctrl 控制器实例
+ * @param kp P增益
+ * @param ki I增益
+ * @param kd D增益
+ */
+void single_pid_set_angle_gains(single_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/**
+ * @brief 设置角度零点
+ * @param ctrl 控制器实例
+ * @param zeropoint 角度零点 (度)
+ */
+void single_pid_set_angle_zeropoint(single_pid_controller_t *ctrl, float zeropoint);
+
+/**
+ * @brief 单环PID平衡控制循环 (输出速度，适合电机速度模式)
+ * @param ctrl 控制器实例
+ * @param pitch 当前俯仰角 (度)
+ * @param pitch_rate 当前俯仰角速度 (度/秒) - 可用于D项优化
+ * @param dt 时间步长 (秒)
+ * @param output 控制输出
+ * @return ESP_OK 成功
+ * 
+ * @note 输出 target_speed 直接送给轮电机的速度模式
+ */
+esp_err_t single_pid_balance_loop(single_pid_controller_t *ctrl, 
+                                   float pitch, float pitch_rate,
+                                   float dt,
+                                   single_pid_output_t *output);
+
+/**
+ * @brief 检查是否触发紧急停止
+ * @param ctrl 控制器实例
+ * @param pitch 当前俯仰角 (度)
+ * @return true 需要紧急停止
+ */
+bool single_pid_check_emergency(single_pid_controller_t *ctrl, float pitch);
+
 #ifdef __cplusplus
 }
 #endif

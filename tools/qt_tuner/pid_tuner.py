@@ -2573,7 +2573,7 @@ class BalanceControlPanel(QWidget):
 # 双环 PID 调参面板
 # ============================================================================
 class DualPIDPanel(QWidget):
-    """双环 PID 调参面板 - 直立环 + 速度环"""
+    """双环 PID 调参面板 - 直立环 + 速度环 (扭矩输出)"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2584,7 +2584,7 @@ class DualPIDPanel(QWidget):
         layout = QVBoxLayout(self)
         
         # 标题和说明
-        title_label = QLabel("🎯 双环 PID 平衡控制")
+        title_label = QLabel("🎯 双环 PID 平衡控制 (扭矩输出)")
         title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
         layout.addWidget(title_label)
         
@@ -2605,16 +2605,22 @@ class DualPIDPanel(QWidget):
         
         mode_layout.addStretch()
         
-        self.lqr_btn = QPushButton("🔵 LQR 模式")
+        self.lqr_btn = QPushButton("🔵 LQR")
         self.lqr_btn.setToolTip("切换到 LQR 多环控制 (默认)")
         self.lqr_btn.clicked.connect(lambda: self.set_mode("lqr"))
         mode_layout.addWidget(self.lqr_btn)
         
-        self.pid_btn = QPushButton("🟢 双环 PID 模式")
-        self.pid_btn.setToolTip("切换到简单双环 PID 控制")
+        self.pid_btn = QPushButton("🟢 双环PID")
+        self.pid_btn.setToolTip("双环 PID 控制 (扭矩模式)")
         self.pid_btn.setStyleSheet("background-color: #4CAF50; color: white;")
         self.pid_btn.clicked.connect(lambda: self.set_mode("pid"))
         mode_layout.addWidget(self.pid_btn)
+        
+        self.spid_btn = QPushButton("🟡 单环PID")
+        self.spid_btn.setToolTip("单环 PID 控制 (速度模式)")
+        self.spid_btn.setStyleSheet("background-color: #FF9800; color: white;")
+        self.spid_btn.clicked.connect(lambda: self.set_mode("spid"))
+        mode_layout.addWidget(self.spid_btn)
         
         self.mode_status_btn = QPushButton("📊 状态")
         self.mode_status_btn.clicked.connect(lambda: self.send_cmd("balance mode"))
@@ -2728,29 +2734,133 @@ class DualPIDPanel(QWidget):
         zero_group.setLayout(zero_layout)
         layout.addWidget(zero_group)
         
-        # 实时状态显示
-        status_group = QGroupBox("📊 实时状态")
-        status_layout = QGridLayout()
+        # 实时状态显示 (扩展版)
+        status_group = QGroupBox("📊 实时 PID 调试数据")
+        status_main_layout = QVBoxLayout()
         
-        status_layout.addWidget(QLabel("角度误差:"), 0, 0)
-        self.angle_err_label = QLabel("-- °")
-        self.angle_err_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff8800;")
-        status_layout.addWidget(self.angle_err_label, 0, 1)
+        # === 双环 PID 状态 ===
+        dpid_frame = QFrame()
+        dpid_frame.setStyleSheet("QFrame { background-color: #1a2a1a; border-radius: 5px; padding: 5px; }")
+        dpid_layout = QGridLayout(dpid_frame)
+        dpid_layout.setSpacing(8)
         
-        status_layout.addWidget(QLabel("目标速度:"), 0, 2)
+        dpid_title = QLabel("🟢 双环 PID")
+        dpid_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #4CAF50;")
+        dpid_layout.addWidget(dpid_title, 0, 0, 1, 8)
+        
+        # 第一行: 输入信息
+        dpid_layout.addWidget(QLabel("Pitch:"), 1, 0)
+        self.dpid_pitch_label = QLabel("--°")
+        self.dpid_pitch_label.setStyleSheet("font-weight: bold; color: #ffcc00;")
+        dpid_layout.addWidget(self.dpid_pitch_label, 1, 1)
+        
+        dpid_layout.addWidget(QLabel("误差:"), 1, 2)
+        self.angle_err_label = QLabel("--°")
+        self.angle_err_label.setStyleSheet("font-weight: bold; color: #ff8800;")
+        dpid_layout.addWidget(self.angle_err_label, 1, 3)
+        
+        dpid_layout.addWidget(QLabel("角速度:"), 1, 4)
+        self.dpid_rate_label = QLabel("--°/s")
+        self.dpid_rate_label.setStyleSheet("font-weight: bold; color: #88ccff;")
+        dpid_layout.addWidget(self.dpid_rate_label, 1, 5)
+        
+        # 第二行: 直立环 PID 分量
+        dpid_layout.addWidget(QLabel("直立环:"), 2, 0)
+        dpid_layout.addWidget(QLabel("P="), 2, 1)
+        self.dpid_angle_p = QLabel("--")
+        self.dpid_angle_p.setStyleSheet("color: #ff6666;")
+        dpid_layout.addWidget(self.dpid_angle_p, 2, 2)
+        dpid_layout.addWidget(QLabel("I="), 2, 3)
+        self.dpid_angle_i = QLabel("--")
+        self.dpid_angle_i.setStyleSheet("color: #66ff66;")
+        dpid_layout.addWidget(self.dpid_angle_i, 2, 4)
+        dpid_layout.addWidget(QLabel("D="), 2, 5)
+        self.dpid_angle_d = QLabel("--")
+        self.dpid_angle_d.setStyleSheet("color: #6666ff;")
+        dpid_layout.addWidget(self.dpid_angle_d, 2, 6)
+        dpid_layout.addWidget(QLabel("→"), 2, 7)
         self.target_speed_label = QLabel("-- rad/s")
-        self.target_speed_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00aaff;")
-        status_layout.addWidget(self.target_speed_label, 0, 3)
+        self.target_speed_label.setStyleSheet("font-weight: bold; color: #00aaff;")
+        dpid_layout.addWidget(self.target_speed_label, 2, 8)
         
-        status_layout.addWidget(QLabel("速度误差:"), 1, 0)
-        self.speed_err_label = QLabel("-- rad/s")
-        self.speed_err_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff8800;")
-        status_layout.addWidget(self.speed_err_label, 1, 1)
+        # 第三行: 速度环 PID 分量
+        dpid_layout.addWidget(QLabel("速度环:"), 3, 0)
+        dpid_layout.addWidget(QLabel("err="), 3, 1)
+        self.speed_err_label = QLabel("--")
+        self.speed_err_label.setStyleSheet("color: #ff8800;")
+        dpid_layout.addWidget(self.speed_err_label, 3, 2)
+        dpid_layout.addWidget(QLabel("P="), 3, 3)
+        self.dpid_speed_p = QLabel("--")
+        self.dpid_speed_p.setStyleSheet("color: #ff6666;")
+        dpid_layout.addWidget(self.dpid_speed_p, 3, 4)
+        dpid_layout.addWidget(QLabel("I="), 3, 5)
+        self.dpid_speed_i = QLabel("--")
+        self.dpid_speed_i.setStyleSheet("color: #66ff66;")
+        dpid_layout.addWidget(self.dpid_speed_i, 3, 6)
+        dpid_layout.addWidget(QLabel("D="), 3, 7)
+        self.dpid_speed_d = QLabel("--")
+        self.dpid_speed_d.setStyleSheet("color: #6666ff;")
+        dpid_layout.addWidget(self.dpid_speed_d, 3, 8)
         
-        status_layout.addWidget(QLabel("输出扭矩:"), 1, 2)
+        # 第四行: 输出扭矩
+        dpid_layout.addWidget(QLabel("输出扭矩:"), 4, 0, 1, 2)
         self.torque_label = QLabel("-- Nm")
-        self.torque_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00ff88;")
-        status_layout.addWidget(self.torque_label, 1, 3)
+        self.torque_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #00ff88;")
+        dpid_layout.addWidget(self.torque_label, 4, 2, 1, 3)
+        
+        status_main_layout.addWidget(dpid_frame)
+        
+        # === 单环 PID 状态 ===
+        spid_frame = QFrame()
+        spid_frame.setStyleSheet("QFrame { background-color: #2a2a1a; border-radius: 5px; padding: 5px; }")
+        spid_layout = QGridLayout(spid_frame)
+        spid_layout.setSpacing(8)
+        
+        spid_title = QLabel("🟡 单环 PID")
+        spid_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #FF9800;")
+        spid_layout.addWidget(spid_title, 0, 0, 1, 8)
+        
+        # 第一行: 输入信息
+        spid_layout.addWidget(QLabel("Pitch:"), 1, 0)
+        self.spid_pitch_label = QLabel("--°")
+        self.spid_pitch_label.setStyleSheet("font-weight: bold; color: #ffcc00;")
+        spid_layout.addWidget(self.spid_pitch_label, 1, 1)
+        
+        spid_layout.addWidget(QLabel("误差:"), 1, 2)
+        self.spid_err_label = QLabel("--°")
+        self.spid_err_label.setStyleSheet("font-weight: bold; color: #ff8800;")
+        spid_layout.addWidget(self.spid_err_label, 1, 3)
+        
+        spid_layout.addWidget(QLabel("角速度:"), 1, 4)
+        self.spid_rate_label = QLabel("--°/s")
+        self.spid_rate_label.setStyleSheet("font-weight: bold; color: #88ccff;")
+        spid_layout.addWidget(self.spid_rate_label, 1, 5)
+        
+        # 第二行: PID 分量
+        spid_layout.addWidget(QLabel("直立环:"), 2, 0)
+        spid_layout.addWidget(QLabel("P="), 2, 1)
+        self.spid_p = QLabel("--")
+        self.spid_p.setStyleSheet("color: #ff6666;")
+        spid_layout.addWidget(self.spid_p, 2, 2)
+        spid_layout.addWidget(QLabel("I="), 2, 3)
+        self.spid_i = QLabel("--")
+        self.spid_i.setStyleSheet("color: #66ff66;")
+        spid_layout.addWidget(self.spid_i, 2, 4)
+        spid_layout.addWidget(QLabel("D="), 2, 5)
+        self.spid_d = QLabel("--")
+        self.spid_d.setStyleSheet("color: #6666ff;")
+        spid_layout.addWidget(self.spid_d, 2, 6)
+        
+        # 第三行: 输出速度
+        spid_layout.addWidget(QLabel("输出速度:"), 3, 0, 1, 2)
+        self.spid_speed_label = QLabel("-- rad/s")
+        self.spid_speed_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00aaff;")
+        spid_layout.addWidget(self.spid_speed_label, 3, 2, 1, 2)
+        self.spid_rpm_label = QLabel("(-- rpm)")
+        self.spid_rpm_label.setStyleSheet("color: #888;")
+        spid_layout.addWidget(self.spid_rpm_label, 3, 4, 1, 2)
+        
+        status_main_layout.addWidget(spid_frame)
         
         # 刷新按钮
         status_btn_layout = QHBoxLayout()
@@ -2764,10 +2874,13 @@ class DualPIDPanel(QWidget):
         
         status_btn_layout.addStretch()
         
-        status_v_layout = QVBoxLayout()
-        status_v_layout.addLayout(status_layout)
-        status_v_layout.addLayout(status_btn_layout)
-        status_group.setLayout(status_v_layout)
+        # 调试数据更新指示
+        self.debug_update_label = QLabel("调试数据: 等待...")
+        self.debug_update_label.setStyleSheet("color: #666; font-size: 10px;")
+        status_btn_layout.addWidget(self.debug_update_label)
+        
+        status_main_layout.addLayout(status_btn_layout)
+        status_group.setLayout(status_main_layout)
         layout.addWidget(status_group)
         
         # 自动刷新定时器
@@ -2796,6 +2909,107 @@ class DualPIDPanel(QWidget):
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
         
+        # ========== 单环 PID 参数区域 (速度输出模式) ==========
+        spid_group = QGroupBox("🟡 单环 PID 参数 (速度输出模式)")
+        spid_group.setStyleSheet("QGroupBox { color: #FF9800; }")
+        spid_layout = QGridLayout()
+        
+        spid_desc = QLabel("适合电机速度模式，输出目标速度 (rad/s) 送给电机内部速度环")
+        spid_desc.setStyleSheet("color: #888; font-size: 10px;")
+        spid_layout.addWidget(spid_desc, 0, 0, 1, 7)
+        
+        spid_layout.addWidget(QLabel("Kp:"), 1, 0)
+        self.spid_kp = QDoubleSpinBox()
+        self.spid_kp.setRange(0, 100)
+        self.spid_kp.setSingleStep(0.5)
+        self.spid_kp.setDecimals(2)
+        self.spid_kp.setValue(15.0)
+        spid_layout.addWidget(self.spid_kp, 1, 1)
+        
+        spid_layout.addWidget(QLabel("Ki:"), 1, 2)
+        self.spid_ki = QDoubleSpinBox()
+        self.spid_ki.setRange(0, 10)
+        self.spid_ki.setSingleStep(0.01)
+        self.spid_ki.setDecimals(3)
+        self.spid_ki.setValue(0.0)
+        spid_layout.addWidget(self.spid_ki, 1, 3)
+        
+        spid_layout.addWidget(QLabel("Kd:"), 1, 4)
+        self.spid_kd = QDoubleSpinBox()
+        self.spid_kd.setRange(0, 10)
+        self.spid_kd.setSingleStep(0.1)
+        self.spid_kd.setDecimals(3)
+        self.spid_kd.setValue(0.5)
+        spid_layout.addWidget(self.spid_kd, 1, 5)
+        
+        self.spid_send_btn = QPushButton("发送")
+        self.spid_send_btn.clicked.connect(self.send_spid_params)
+        spid_layout.addWidget(self.spid_send_btn, 1, 6)
+        
+        # 输出限幅
+        spid_layout.addWidget(QLabel("输出限幅:"), 2, 0)
+        self.spid_limit = QDoubleSpinBox()
+        self.spid_limit.setRange(1, 200)
+        self.spid_limit.setSingleStep(5)
+        self.spid_limit.setDecimals(1)
+        self.spid_limit.setValue(100.0)
+        self.spid_limit.setSuffix(" rad/s")
+        spid_layout.addWidget(self.spid_limit, 2, 1)
+        
+        self.spid_limit_btn = QPushButton("设置限幅")
+        self.spid_limit_btn.clicked.connect(self.send_spid_limit)
+        spid_layout.addWidget(self.spid_limit_btn, 2, 2)
+        
+        self.spid_status_btn = QPushButton("📊 单环状态")
+        self.spid_status_btn.clicked.connect(lambda: self.send_cmd("balance spid status"))
+        spid_layout.addWidget(self.spid_status_btn, 2, 4, 1, 2)
+        
+        self.spid_reset_btn = QPushButton("🔄 重置")
+        self.spid_reset_btn.clicked.connect(lambda: self.send_cmd("balance spid reset"))
+        spid_layout.addWidget(self.spid_reset_btn, 2, 6)
+        
+        spid_group.setLayout(spid_layout)
+        layout.addWidget(spid_group)
+        
+        # ========== 调试输出控制 ==========
+        debug_group = QGroupBox("🔧 实时调试输出")
+        debug_group.setStyleSheet("QGroupBox { color: #9C27B0; }")
+        debug_layout = QHBoxLayout()
+        
+        debug_desc = QLabel("开启后实时打印 PID 内部状态 (P/I/D分量、误差、输出)")
+        debug_desc.setStyleSheet("color: #888; font-size: 10px;")
+        debug_layout.addWidget(debug_desc)
+        
+        debug_layout.addStretch()
+        
+        self.debug_on_btn = QPushButton("🟢 开启调试")
+        self.debug_on_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        self.debug_on_btn.clicked.connect(lambda: self.send_cmd("balance debug on"))
+        debug_layout.addWidget(self.debug_on_btn)
+        
+        self.debug_off_btn = QPushButton("🔴 关闭调试")
+        self.debug_off_btn.setStyleSheet("background-color: #f44336; color: white;")
+        self.debug_off_btn.clicked.connect(lambda: self.send_cmd("balance debug off"))
+        debug_layout.addWidget(self.debug_off_btn)
+        
+        debug_layout.addWidget(QLabel("频率:"))
+        self.debug_div = QSpinBox()
+        self.debug_div.setRange(1, 255)
+        self.debug_div.setValue(50)
+        self.debug_div.setToolTip("分频系数 (1~255)，输出频率 = 200Hz / 分频")
+        debug_layout.addWidget(self.debug_div)
+        
+        self.debug_div_btn = QPushButton("设置")
+        self.debug_div_btn.clicked.connect(self.send_debug_div)
+        debug_layout.addWidget(self.debug_div_btn)
+        
+        self.debug_status_btn = QPushButton("📊 状态")
+        self.debug_status_btn.clicked.connect(lambda: self.send_cmd("balance debug"))
+        debug_layout.addWidget(self.debug_status_btn)
+        
+        debug_group.setLayout(debug_layout)
+        layout.addWidget(debug_group)
+        
         layout.addStretch()
     
     def send_cmd(self, cmd):
@@ -2805,8 +3019,11 @@ class DualPIDPanel(QWidget):
     def set_mode(self, mode):
         self.send_cmd(f"balance mode {mode}")
         if mode == "pid":
-            self.mode_label.setText("当前模式: 双环 PID")
+            self.mode_label.setText("当前模式: 双环 PID (扭矩)")
             self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+        elif mode == "spid":
+            self.mode_label.setText("当前模式: 单环 PID (速度)")
+            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #FF9800;")
         else:
             self.mode_label.setText("当前模式: LQR")
             self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
@@ -2822,6 +3039,23 @@ class DualPIDPanel(QWidget):
         ki = self.speed_ki.value()
         kd = self.speed_kd.value()
         self.send_cmd(f"balance dpid speed {kp} {ki} {kd}")
+    
+    def send_spid_params(self):
+        """发送单环 PID 参数"""
+        kp = self.spid_kp.value()
+        ki = self.spid_ki.value()
+        kd = self.spid_kd.value()
+        self.send_cmd(f"balance spid angle {kp} {ki} {kd}")
+    
+    def send_spid_limit(self):
+        """发送单环 PID 输出限幅"""
+        limit = self.spid_limit.value()
+        self.send_cmd(f"balance spid limit {limit}")
+    
+    def send_debug_div(self):
+        """发送调试输出分频系数"""
+        div = self.debug_div.value()
+        self.send_cmd(f"balance debug div {div}")
     
     def send_zero(self):
         zero = self.zero_input.value()
@@ -2846,16 +3080,50 @@ class DualPIDPanel(QWidget):
     
     def update_status(self, angle_err, target_speed, speed_err, torque):
         """更新状态显示 (由主窗口解析数据后调用)"""
-        self.angle_err_label.setText(f"{angle_err:.2f} °")
+        self.angle_err_label.setText(f"{angle_err:.2f}°")
         self.target_speed_label.setText(f"{target_speed:.2f} rad/s")
-        self.speed_err_label.setText(f"{speed_err:.2f} rad/s")
+        self.speed_err_label.setText(f"{speed_err:.2f}")
         self.torque_label.setText(f"{torque:.2f} Nm")
+    
+    def update_dpid_debug(self, pitch, err, rate, angle_p, angle_i, angle_d, tgt_spd, 
+                          spd_err, speed_p, speed_i, speed_d, torque):
+        """更新双环 PID 调试数据 (解析 [DPID] 输出)"""
+        self.dpid_pitch_label.setText(f"{pitch:.2f}°")
+        self.angle_err_label.setText(f"{err:.2f}°")
+        self.dpid_rate_label.setText(f"{rate:.1f}°/s")
+        self.dpid_angle_p.setText(f"{angle_p:.2f}")
+        self.dpid_angle_i.setText(f"{angle_i:.3f}")
+        self.dpid_angle_d.setText(f"{angle_d:.3f}")
+        self.target_speed_label.setText(f"{tgt_spd:.2f} rad/s")
+        self.speed_err_label.setText(f"{spd_err:.2f}")
+        self.dpid_speed_p.setText(f"{speed_p:.2f}")
+        self.dpid_speed_i.setText(f"{speed_i:.3f}")
+        self.dpid_speed_d.setText(f"{speed_d:.3f}")
+        self.torque_label.setText(f"{torque:.3f} Nm")
+        self.debug_update_label.setText(f"调试数据: 双环 PID ✓")
+        self.debug_update_label.setStyleSheet("color: #4CAF50; font-size: 10px;")
+    
+    def update_spid_debug(self, pitch, err, rate, p, i, d, speed, rpm):
+        """更新单环 PID 调试数据 (解析 [SPID] 输出)"""
+        self.spid_pitch_label.setText(f"{pitch:.2f}°")
+        self.spid_err_label.setText(f"{err:.2f}°")
+        self.spid_rate_label.setText(f"{rate:.1f}°/s")
+        self.spid_p.setText(f"{p:.2f}")
+        self.spid_i.setText(f"{i:.3f}")
+        self.spid_d.setText(f"{d:.3f}")
+        self.spid_speed_label.setText(f"{speed:.2f} rad/s")
+        self.spid_rpm_label.setText(f"({rpm:.0f} rpm)")
+        self.debug_update_label.setText(f"调试数据: 单环 PID ✓")
+        self.debug_update_label.setStyleSheet("color: #FF9800; font-size: 10px;")
     
     def update_mode(self, mode):
         """更新模式显示 (由主窗口解析数据后调用)"""
         if mode == "DUAL_PID":
-            self.mode_label.setText("当前模式: 双环 PID")
+            self.mode_label.setText("当前模式: 双环 PID (扭矩)")
             self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+        elif mode == "SINGLE_PID":
+            self.mode_label.setText("当前模式: 单环 PID (速度)")
+            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #FF9800;")
         else:
             self.mode_label.setText("当前模式: LQR")
             self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
@@ -3185,6 +3453,522 @@ class YawDebugPanel(QWidget):
 
 
 # ============================================================================
+# VMC 调试面板
+# ============================================================================
+class VMCDebugPanel(QWidget):
+    """VMC (虚拟模型控制) 调试面板 - 腿部力控制调参"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # ========== VMC 开关控制 ==========
+        ctrl_group = QGroupBox("🦿 VMC 控制")
+        ctrl_layout = QHBoxLayout()
+        
+        self.vmc_on_btn = QPushButton("✅ 开启 VMC")
+        self.vmc_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px 20px; font-size: 14px;")
+        self.vmc_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc on"))
+        ctrl_layout.addWidget(self.vmc_on_btn)
+        
+        self.vmc_off_btn = QPushButton("❌ 关闭 VMC")
+        self.vmc_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 10px 20px; font-size: 14px;")
+        self.vmc_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc off"))
+        ctrl_layout.addWidget(self.vmc_off_btn)
+        
+        self.vmc_status_btn = QPushButton("📊 查看状态")
+        self.vmc_status_btn.setStyleSheet("padding: 10px 20px; font-size: 14px;")
+        self.vmc_status_btn.clicked.connect(lambda: self.send_cmd("balance vmc status"))
+        ctrl_layout.addWidget(self.vmc_status_btn)
+        
+        self.stream_on_btn = QPushButton("📈 开启数据流")
+        self.stream_on_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px 15px;")
+        self.stream_on_btn.setToolTip("开启 VMC 实时数据流，用于 UI 监控")
+        self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc stream on"))
+        ctrl_layout.addWidget(self.stream_on_btn)
+        
+        self.stream_off_btn = QPushButton("⏹️ 关闭数据流")
+        self.stream_off_btn.setStyleSheet("padding: 10px 15px;")
+        self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc stream off"))
+        ctrl_layout.addWidget(self.stream_off_btn)
+        
+        ctrl_layout.addStretch()
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+        
+        # ========== 坐标系选择 ==========
+        coord_group = QGroupBox("📐 坐标系选择")
+        coord_layout = QHBoxLayout()
+        
+        coord_layout.addWidget(QLabel("VMC 坐标系:"))
+        
+        self.coord_world_btn = QPushButton("🌍 世界坐标系 (World)")
+        self.coord_world_btn.setToolTip("世界坐标系: 控制 F_x (水平力) 和 F_y (垂直力)")
+        self.coord_world_btn.clicked.connect(lambda: self.send_cmd("balance vmc coord world"))
+        coord_layout.addWidget(self.coord_world_btn)
+        
+        self.coord_body_btn = QPushButton("🤖 机身坐标系 (Body)")
+        self.coord_body_btn.setToolTip("机身坐标系: 控制 F_L (腿长方向力) 和 F_α (摆角方向力矩)")
+        self.coord_body_btn.clicked.connect(lambda: self.send_cmd("balance vmc coord body"))
+        coord_layout.addWidget(self.coord_body_btn)
+        
+        self.coord_status = QLabel("当前: --")
+        self.coord_status.setStyleSheet("font-weight: bold; color: #00ccff;")
+        coord_layout.addWidget(self.coord_status)
+        
+        coord_layout.addStretch()
+        coord_group.setLayout(coord_layout)
+        layout.addWidget(coord_group)
+        
+        # ========== 世界坐标系参数 (K_vx, K_y, D_y) ==========
+        world_group = QGroupBox("🌍 世界坐标系参数 (World Coord)")
+        world_layout = QGridLayout()
+        
+        # K_vx - 速度反馈增益
+        world_layout.addWidget(QLabel("K_vx (速度反馈):"), 0, 0)
+        self.kvx_input = QDoubleSpinBox()
+        self.kvx_input.setRange(-100, 100)
+        self.kvx_input.setDecimals(3)
+        self.kvx_input.setSingleStep(0.1)
+        self.kvx_input.setValue(0.0)
+        world_layout.addWidget(self.kvx_input, 0, 1)
+        self.kvx_set_btn = QPushButton("设置")
+        self.kvx_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc kvx {self.kvx_input.value()}"))
+        world_layout.addWidget(self.kvx_set_btn, 0, 2)
+        
+        # K_y - 高度刚度
+        world_layout.addWidget(QLabel("K_y (高度刚度 N/m):"), 1, 0)
+        self.ky_input = QDoubleSpinBox()
+        self.ky_input.setRange(0, 5000)
+        self.ky_input.setDecimals(1)
+        self.ky_input.setSingleStep(50)
+        self.ky_input.setValue(0.0)  # 默认 0
+        world_layout.addWidget(self.ky_input, 1, 1)
+        self.ky_set_btn = QPushButton("设置")
+        self.ky_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc ky {self.ky_input.value()}"))
+        world_layout.addWidget(self.ky_set_btn, 1, 2)
+        
+        # D_y - 高度阻尼
+        world_layout.addWidget(QLabel("D_y (高度阻尼 Ns/m):"), 2, 0)
+        self.dy_input = QDoubleSpinBox()
+        self.dy_input.setRange(0, 500)
+        self.dy_input.setDecimals(1)
+        self.dy_input.setSingleStep(5)
+        self.dy_input.setValue(0.0)  # 默认 0
+        world_layout.addWidget(self.dy_input, 2, 1)
+        self.dy_set_btn = QPushButton("设置")
+        self.dy_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc dy {self.dy_input.value()}"))
+        world_layout.addWidget(self.dy_set_btn, 2, 2)
+        
+        world_group.setLayout(world_layout)
+        layout.addWidget(world_group)
+        
+        # ========== 机身坐标系参数 (K_L, D_L, K_α, D_α) ==========
+        body_group = QGroupBox("🤖 机身坐标系参数 (Body Coord)")
+        body_layout = QGridLayout()
+        
+        # K_L - 腿长刚度
+        body_layout.addWidget(QLabel("K_L (腿长刚度 N/m):"), 0, 0)
+        self.kl_input = QDoubleSpinBox()
+        self.kl_input.setRange(0, 5000)
+        self.kl_input.setDecimals(1)
+        self.kl_input.setSingleStep(50)
+        self.kl_input.setValue(0.0)  # 默认 0
+        body_layout.addWidget(self.kl_input, 0, 1)
+        self.kl_set_btn = QPushButton("设置")
+        self.kl_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc kl {self.kl_input.value()}"))
+        body_layout.addWidget(self.kl_set_btn, 0, 2)
+        
+        # D_L - 腿长阻尼
+        body_layout.addWidget(QLabel("D_L (腿长阻尼 Ns/m):"), 1, 0)
+        self.dl_input = QDoubleSpinBox()
+        self.dl_input.setRange(0, 500)
+        self.dl_input.setDecimals(1)
+        self.dl_input.setSingleStep(5)
+        self.dl_input.setValue(0.0)  # 默认 0
+        body_layout.addWidget(self.dl_input, 1, 1)
+        self.dl_set_btn = QPushButton("设置")
+        self.dl_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc dl {self.dl_input.value()}"))
+        body_layout.addWidget(self.dl_set_btn, 1, 2)
+        
+        # K_alpha - 摆角刚度
+        body_layout.addWidget(QLabel("K_α (摆角刚度 Nm/rad):"), 2, 0)
+        self.ka_input = QDoubleSpinBox()
+        self.ka_input.setRange(0, 500)
+        self.ka_input.setDecimals(2)
+        self.ka_input.setSingleStep(1)
+        self.ka_input.setValue(0.0)  # 默认 0
+        body_layout.addWidget(self.ka_input, 2, 1)
+        self.ka_set_btn = QPushButton("设置")
+        self.ka_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc ka {self.ka_input.value()}"))
+        body_layout.addWidget(self.ka_set_btn, 2, 2)
+        
+        # D_alpha - 摆角阻尼
+        body_layout.addWidget(QLabel("D_α (摆角阻尼 Nm·s/rad):"), 3, 0)
+        self.da_input = QDoubleSpinBox()
+        self.da_input.setRange(0, 50)
+        self.da_input.setDecimals(2)
+        self.da_input.setSingleStep(0.5)
+        self.da_input.setValue(0.0)  # 默认 0
+        body_layout.addWidget(self.da_input, 3, 1)
+        self.da_set_btn = QPushButton("设置")
+        self.da_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc da {self.da_input.value()}"))
+        body_layout.addWidget(self.da_set_btn, 3, 2)
+        
+        body_group.setLayout(body_layout)
+        layout.addWidget(body_group)
+        
+        # ========== 通用参数 ==========
+        common_group = QGroupBox("⚙️ 通用参数")
+        common_layout = QGridLayout()
+        
+        # 重力补偿系数
+        common_layout.addWidget(QLabel("重力补偿系数 (0~1.5):"), 0, 0)
+        self.gc_input = QDoubleSpinBox()
+        self.gc_input.setRange(0, 1.5)
+        self.gc_input.setDecimals(2)
+        self.gc_input.setSingleStep(0.05)
+        self.gc_input.setValue(0.0)  # 默认 0
+        common_layout.addWidget(self.gc_input, 0, 1)
+        self.gc_set_btn = QPushButton("设置")
+        self.gc_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc gc {self.gc_input.value()}"))
+        common_layout.addWidget(self.gc_set_btn, 0, 2)
+        
+        # 机器人质量
+        common_layout.addWidget(QLabel("机器人质量 (kg):"), 1, 0)
+        self.mass_input = QDoubleSpinBox()
+        self.mass_input.setRange(0.1, 50)
+        self.mass_input.setDecimals(2)
+        self.mass_input.setSingleStep(0.1)
+        self.mass_input.setValue(1.0)  # 默认 1.0 kg
+        common_layout.addWidget(self.mass_input, 1, 1)
+        self.mass_set_btn = QPushButton("设置")
+        self.mass_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc mass {self.mass_input.value()}"))
+        common_layout.addWidget(self.mass_set_btn, 1, 2)
+        
+        # 目标腿高
+        common_layout.addWidget(QLabel("目标腿高 (m):"), 2, 0)
+        self.height_input = QDoubleSpinBox()
+        self.height_input.setRange(0.05, 0.3)
+        self.height_input.setDecimals(3)
+        self.height_input.setSingleStep(0.005)
+        self.height_input.setValue(0.14)  # 默认 0.14m (与 g_vmc_target_y 一致)
+        common_layout.addWidget(self.height_input, 2, 1)
+        self.height_set_btn = QPushButton("设置")
+        self.height_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc height {self.height_input.value()}"))
+        common_layout.addWidget(self.height_set_btn, 2, 2)
+        
+        # 目标速度
+        common_layout.addWidget(QLabel("目标速度 (m/s):"), 3, 0)
+        self.vx_input = QDoubleSpinBox()
+        self.vx_input.setRange(-2, 2)
+        self.vx_input.setDecimals(2)
+        self.vx_input.setSingleStep(0.1)
+        self.vx_input.setValue(0.0)
+        common_layout.addWidget(self.vx_input, 3, 1)
+        self.vx_set_btn = QPushButton("设置")
+        self.vx_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc vx {self.vx_input.value()}"))
+        common_layout.addWidget(self.vx_set_btn, 3, 2)
+        
+        common_group.setLayout(common_layout)
+        layout.addWidget(common_group)
+        
+        # ========== Pitch 控制参数 ==========
+        pitch_group = QGroupBox("📐 Pitch 俯仰控制 (补偿)")
+        pitch_layout = QVBoxLayout()
+        
+        # Pitch 开关
+        pitch_ctrl_layout = QHBoxLayout()
+        
+        self.pitch_on_btn = QPushButton("✅ 开启 Pitch 补偿")
+        self.pitch_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 15px;")
+        self.pitch_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc pitch on"))
+        pitch_ctrl_layout.addWidget(self.pitch_on_btn)
+        
+        self.pitch_off_btn = QPushButton("❌ 关闭 Pitch 补偿")
+        self.pitch_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 15px;")
+        self.pitch_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc pitch off"))
+        pitch_ctrl_layout.addWidget(self.pitch_off_btn)
+        
+        pitch_ctrl_layout.addStretch()
+        pitch_layout.addLayout(pitch_ctrl_layout)
+        
+        # Pitch 参数
+        pitch_param_layout = QGridLayout()
+        
+        # Kp
+        pitch_param_layout.addWidget(QLabel("Pitch Kp:"), 0, 0)
+        self.pitch_kp_input = QDoubleSpinBox()
+        self.pitch_kp_input.setRange(0, 100)
+        self.pitch_kp_input.setDecimals(2)
+        self.pitch_kp_input.setSingleStep(0.5)
+        self.pitch_kp_input.setValue(0.0)  # 默认 0
+        pitch_param_layout.addWidget(self.pitch_kp_input, 0, 1)
+        self.pitch_kp_set_btn = QPushButton("设置")
+        self.pitch_kp_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc pitch kp {self.pitch_kp_input.value()}"))
+        pitch_param_layout.addWidget(self.pitch_kp_set_btn, 0, 2)
+        
+        # Kd
+        pitch_param_layout.addWidget(QLabel("Pitch Kd:"), 1, 0)
+        self.pitch_kd_input = QDoubleSpinBox()
+        self.pitch_kd_input.setRange(0, 50)
+        self.pitch_kd_input.setDecimals(2)
+        self.pitch_kd_input.setSingleStep(0.1)
+        self.pitch_kd_input.setValue(0.0)  # 默认 0
+        pitch_param_layout.addWidget(self.pitch_kd_input, 1, 1)
+        self.pitch_kd_set_btn = QPushButton("设置")
+        self.pitch_kd_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc pitch kd {self.pitch_kd_input.value()}"))
+        pitch_param_layout.addWidget(self.pitch_kd_set_btn, 1, 2)
+        
+        # Target
+        pitch_param_layout.addWidget(QLabel("目标角度 (°):"), 2, 0)
+        self.pitch_target_input = QDoubleSpinBox()
+        self.pitch_target_input.setRange(-30, 30)
+        self.pitch_target_input.setDecimals(1)
+        self.pitch_target_input.setSingleStep(0.5)
+        self.pitch_target_input.setValue(0.0)
+        pitch_param_layout.addWidget(self.pitch_target_input, 2, 1)
+        self.pitch_target_set_btn = QPushButton("设置")
+        self.pitch_target_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc pitch target {self.pitch_target_input.value()}"))
+        pitch_param_layout.addWidget(self.pitch_target_set_btn, 2, 2)
+        
+        pitch_layout.addLayout(pitch_param_layout)
+        pitch_group.setLayout(pitch_layout)
+        layout.addWidget(pitch_group)
+        
+        # ========== 双腿协调控制 (Leg Sync) ==========
+        sync_group = QGroupBox("🔗 双腿协调控制 (Leg Sync)")
+        sync_layout = QVBoxLayout()
+        
+        # 协调控制开关
+        sync_ctrl_layout = QHBoxLayout()
+        
+        self.sync_on_btn = QPushButton("✅ 开启协调控制")
+        self.sync_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 15px;")
+        self.sync_on_btn.setToolTip("消除左右腿 body_angle 差异，保持机体姿态一致")
+        self.sync_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc sync on"))
+        sync_ctrl_layout.addWidget(self.sync_on_btn)
+        
+        self.sync_off_btn = QPushButton("❌ 关闭协调控制")
+        self.sync_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 15px;")
+        self.sync_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc sync off"))
+        sync_ctrl_layout.addWidget(self.sync_off_btn)
+        
+        self.sync_status_btn = QPushButton("📊 查看状态")
+        self.sync_status_btn.clicked.connect(lambda: self.send_cmd("balance vmc sync"))
+        sync_ctrl_layout.addWidget(self.sync_status_btn)
+        
+        sync_ctrl_layout.addStretch()
+        sync_layout.addLayout(sync_ctrl_layout)
+        
+        # 协调控制参数
+        sync_param_layout = QGridLayout()
+        
+        # K_sync - 协调 P 增益
+        sync_param_layout.addWidget(QLabel("K_sync (P增益 Nm/rad):"), 0, 0)
+        self.sync_kp_input = QDoubleSpinBox()
+        self.sync_kp_input.setRange(0, 50)
+        self.sync_kp_input.setDecimals(3)
+        self.sync_kp_input.setSingleStep(0.1)
+        self.sync_kp_input.setValue(0.0)  # 默认 0
+        self.sync_kp_input.setToolTip("角度差比例增益：越大响应越快，但可能震荡")
+        sync_param_layout.addWidget(self.sync_kp_input, 0, 1)
+        self.sync_kp_set_btn = QPushButton("设置")
+        self.sync_kp_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc sync kp {self.sync_kp_input.value()}"))
+        sync_param_layout.addWidget(self.sync_kp_set_btn, 0, 2)
+        
+        # D_sync - 协调 D 增益
+        sync_param_layout.addWidget(QLabel("D_sync (D增益 Nm·s/rad):"), 1, 0)
+        self.sync_kd_input = QDoubleSpinBox()
+        self.sync_kd_input.setRange(0, 5)
+        self.sync_kd_input.setDecimals(3)
+        self.sync_kd_input.setSingleStep(0.01)
+        self.sync_kd_input.setValue(0.0)  # 默认 0
+        self.sync_kd_input.setToolTip("角速度差阻尼增益：抑制振荡")
+        sync_param_layout.addWidget(self.sync_kd_input, 1, 1)
+        self.sync_kd_set_btn = QPushButton("设置")
+        self.sync_kd_set_btn.clicked.connect(lambda: self.send_cmd(f"balance vmc sync kd {self.sync_kd_input.value()}"))
+        sync_param_layout.addWidget(self.sync_kd_set_btn, 1, 2)
+        
+        sync_layout.addLayout(sync_param_layout)
+        
+        # 实时状态显示
+        sync_status_layout = QGridLayout()
+        sync_status_layout.addWidget(QLabel("左腿角度:"), 0, 0)
+        self.left_angle_label = QLabel("-- °")
+        self.left_angle_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        sync_status_layout.addWidget(self.left_angle_label, 0, 1)
+        
+        sync_status_layout.addWidget(QLabel("右腿角度:"), 0, 2)
+        self.right_angle_label = QLabel("-- °")
+        self.right_angle_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        sync_status_layout.addWidget(self.right_angle_label, 0, 3)
+        
+        sync_status_layout.addWidget(QLabel("角度差:"), 1, 0)
+        self.angle_diff_label = QLabel("-- °")
+        self.angle_diff_label.setStyleSheet("font-weight: bold; color: #ffaa00;")
+        sync_status_layout.addWidget(self.angle_diff_label, 1, 1)
+        
+        sync_status_layout.addWidget(QLabel("F_sync:"), 1, 2)
+        self.f_sync_label = QLabel("-- Nm")
+        self.f_sync_label.setStyleSheet("font-weight: bold; color: #ff6600;")
+        sync_status_layout.addWidget(self.f_sync_label, 1, 3)
+        
+        sync_layout.addLayout(sync_status_layout)
+        
+        sync_group.setLayout(sync_layout)
+        layout.addWidget(sync_group)
+        
+        # ========== 快捷预设 ==========
+        preset_group = QGroupBox("🎯 快捷预设")
+        preset_layout = QHBoxLayout()
+        
+        self.soft_btn = QPushButton("🧸 软腿 (Soft)")
+        self.soft_btn.setToolTip("低刚度低阻尼: 适合缓冲/柔软触地")
+        self.soft_btn.clicked.connect(lambda: self.send_cmd("balance vmc soft"))
+        preset_layout.addWidget(self.soft_btn)
+        
+        self.stiff_btn = QPushButton("💪 硬腿 (Stiff)")
+        self.stiff_btn.setToolTip("高刚度高阻尼: 适合稳定站立/负载")
+        self.stiff_btn.clicked.connect(lambda: self.send_cmd("balance vmc stiff"))
+        preset_layout.addWidget(self.stiff_btn)
+        
+        preset_layout.addStretch()
+        preset_group.setLayout(preset_layout)
+        layout.addWidget(preset_group)
+        
+        # ========== VMC 实时状态监控 ==========
+        monitor_group = QGroupBox("📈 VMC 实时状态")
+        monitor_layout = QGridLayout()
+        
+        # 左腿状态
+        monitor_layout.addWidget(QLabel("【左腿】"), 0, 0)
+        monitor_layout.addWidget(QLabel("腿长:"), 0, 1)
+        self.left_leg_length_label = QLabel("-- m")
+        self.left_leg_length_label.setStyleSheet("color: #00ff00;")
+        monitor_layout.addWidget(self.left_leg_length_label, 0, 2)
+        monitor_layout.addWidget(QLabel("F_L:"), 0, 3)
+        self.left_fl_label = QLabel("-- N")
+        self.left_fl_label.setStyleSheet("color: #00ccff;")
+        monitor_layout.addWidget(self.left_fl_label, 0, 4)
+        monitor_layout.addWidget(QLabel("F_α:"), 0, 5)
+        self.left_fa_label = QLabel("-- Nm")
+        self.left_fa_label.setStyleSheet("color: #ffaa00;")
+        monitor_layout.addWidget(self.left_fa_label, 0, 6)
+        
+        # 右腿状态
+        monitor_layout.addWidget(QLabel("【右腿】"), 1, 0)
+        monitor_layout.addWidget(QLabel("腿长:"), 1, 1)
+        self.right_leg_length_label = QLabel("-- m")
+        self.right_leg_length_label.setStyleSheet("color: #00ff00;")
+        monitor_layout.addWidget(self.right_leg_length_label, 1, 2)
+        monitor_layout.addWidget(QLabel("F_L:"), 1, 3)
+        self.right_fl_label = QLabel("-- N")
+        self.right_fl_label.setStyleSheet("color: #00ccff;")
+        monitor_layout.addWidget(self.right_fl_label, 1, 4)
+        monitor_layout.addWidget(QLabel("F_α:"), 1, 5)
+        self.right_fa_label = QLabel("-- Nm")
+        self.right_fa_label.setStyleSheet("color: #ffaa00;")
+        monitor_layout.addWidget(self.right_fa_label, 1, 6)
+        
+        # 扭矩输出
+        monitor_layout.addWidget(QLabel("【扭矩】"), 2, 0)
+        monitor_layout.addWidget(QLabel("L髋:"), 2, 1)
+        self.left_hip_torque_label = QLabel("-- Nm")
+        monitor_layout.addWidget(self.left_hip_torque_label, 2, 2)
+        monitor_layout.addWidget(QLabel("L膝:"), 2, 3)
+        self.left_knee_torque_label = QLabel("-- Nm")
+        monitor_layout.addWidget(self.left_knee_torque_label, 2, 4)
+        monitor_layout.addWidget(QLabel("R髋:"), 2, 5)
+        self.right_hip_torque_label = QLabel("-- Nm")
+        monitor_layout.addWidget(self.right_hip_torque_label, 2, 6)
+        monitor_layout.addWidget(QLabel("R膝:"), 2, 7)
+        self.right_knee_torque_label = QLabel("-- Nm")
+        monitor_layout.addWidget(self.right_knee_torque_label, 2, 8)
+        
+        monitor_group.setLayout(monitor_layout)
+        layout.addWidget(monitor_group)
+        
+        layout.addStretch()
+    
+    def send_cmd(self, cmd):
+        """发送命令到串口"""
+        if self.parent_window:
+            self.parent_window.send_command(cmd)
+    
+    def update_coord_status(self, coord_type):
+        """更新坐标系状态显示"""
+        if coord_type == "world":
+            self.coord_status.setText("当前: 世界坐标系 (World)")
+            self.coord_status.setStyleSheet("font-weight: bold; color: #00ff00;")
+        elif coord_type == "body":
+            self.coord_status.setText("当前: 机身坐标系 (Body)")
+            self.coord_status.setStyleSheet("font-weight: bold; color: #00ccff;")
+    
+    def update_sync_status(self, left_angle, right_angle, angle_diff, f_sync):
+        """更新双腿协调控制状态显示"""
+        self.left_angle_label.setText(f"{left_angle:.2f} °")
+        self.right_angle_label.setText(f"{right_angle:.2f} °")
+        self.angle_diff_label.setText(f"{angle_diff:.2f} °")
+        self.f_sync_label.setText(f"{f_sync:.3f} Nm")
+        
+        # 根据角度差大小改变颜色
+        if abs(angle_diff) < 1.0:
+            self.angle_diff_label.setStyleSheet("font-weight: bold; color: #00ff00;")  # 绿色 - 良好
+        elif abs(angle_diff) < 3.0:
+            self.angle_diff_label.setStyleSheet("font-weight: bold; color: #ffaa00;")  # 黄色 - 警告
+        else:
+            self.angle_diff_label.setStyleSheet("font-weight: bold; color: #ff4444;")  # 红色 - 需调整
+    
+    def update_vmc_monitor(self, data):
+        """更新 VMC 实时监控数据
+        
+        Args:
+            data: dict 包含以下键:
+                - left_leg_length, right_leg_length
+                - left_body_angle, right_body_angle
+                - left_F_L, right_F_L
+                - left_F_alpha, right_F_alpha
+                - left_hip_torque, left_knee_torque
+                - right_hip_torque, right_knee_torque
+                - angle_diff, f_sync
+        """
+        if 'left_leg_length' in data:
+            self.left_leg_length_label.setText(f"{data['left_leg_length']:.3f} m")
+        if 'right_leg_length' in data:
+            self.right_leg_length_label.setText(f"{data['right_leg_length']:.3f} m")
+        if 'left_F_L' in data:
+            self.left_fl_label.setText(f"{data['left_F_L']:.2f} N")
+        if 'right_F_L' in data:
+            self.right_fl_label.setText(f"{data['right_F_L']:.2f} N")
+        if 'left_F_alpha' in data:
+            self.left_fa_label.setText(f"{data['left_F_alpha']:.3f} Nm")
+        if 'right_F_alpha' in data:
+            self.right_fa_label.setText(f"{data['right_F_alpha']:.3f} Nm")
+        if 'left_hip_torque' in data:
+            self.left_hip_torque_label.setText(f"{data['left_hip_torque']:.3f} Nm")
+        if 'left_knee_torque' in data:
+            self.left_knee_torque_label.setText(f"{data['left_knee_torque']:.3f} Nm")
+        if 'right_hip_torque' in data:
+            self.right_hip_torque_label.setText(f"{data['right_hip_torque']:.3f} Nm")
+        if 'right_knee_torque' in data:
+            self.right_knee_torque_label.setText(f"{data['right_knee_torque']:.3f} Nm")
+        
+        # 更新协调控制状态
+        if 'left_body_angle' in data and 'right_body_angle' in data:
+            self.update_sync_status(
+                data.get('left_body_angle', 0),
+                data.get('right_body_angle', 0),
+                data.get('angle_diff', 0),
+                data.get('f_sync', 0)
+            )
+
+
+# ============================================================================
 # 传感器面板
 # ============================================================================
 class SensorPanel(QWidget):
@@ -3371,6 +4155,7 @@ class PIDTunerUI(QMainWindow):
         self.lpf_panels = {}
         self.speed_adaptive_panel = None
         self.debug_mode = False
+        self.show_high_freq_data = False  # 是否在日志中显示高频数据
         
         # YAW 调试数据缓存
         self._yaw_target_angle = 0.0
@@ -3493,6 +4278,10 @@ class PIDTunerUI(QMainWindow):
         self.yaw_panel = YawDebugPanel(self)
         self.tab_widget.addTab(self.yaw_panel, "🧭 YAW调试")
         
+        # VMC 调试面板
+        self.vmc_panel = VMCDebugPanel(self)
+        self.tab_widget.addTab(self.vmc_panel, "🦿 VMC调试")
+        
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
         self.tab_widget.addTab(self.motor_panel, "⚙️ 电机控制")
@@ -3536,6 +4325,12 @@ class PIDTunerUI(QMainWindow):
         debug_btn.setCheckable(True)
         debug_btn.toggled.connect(self.toggle_debug_mode)
         log_btn_layout.addWidget(debug_btn)
+        
+        high_freq_btn = QPushButton("📊 高频数据")
+        high_freq_btn.setCheckable(True)
+        high_freq_btn.setToolTip("开启后在日志中显示高频数据(IMU/腿部状态/频率等)")
+        high_freq_btn.toggled.connect(self.toggle_high_freq_data)
+        log_btn_layout.addWidget(high_freq_btn)
         
         log_btn_layout.addStretch()
         log_inner_layout.addLayout(log_btn_layout)
@@ -3597,6 +4392,8 @@ class PIDTunerUI(QMainWindow):
         if self.debug_mode:
             self.log(f"← {line}", is_receive=True)
         
+        # ===== 高频波形数据 - 只更新图表，不打印日志 =====
+        
         # 解析数据流格式: #DATA,ID,Target,Control
         if line.startswith("#DATA,"):
             parts = line.split(',')
@@ -3638,12 +4435,13 @@ class PIDTunerUI(QMainWindow):
                         panel_key = wheel_map[panel_id]
                         if panel_key in self.wheel_panels:
                             self.wheel_panels[panel_key].update_plot(target, control)
-                    return
                 except (ValueError, IndexError) as e:
-                    self.log(f"解析数据失败: {line} ({e})", is_error=True)
-                    return
+                    if self.debug_mode:
+                        self.log(f"解析数据失败: {line} ({e})", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 波形数据不打印日志(非debug模式)
         
-        # 解析Web命令格式: #WEB,go,dir,joyx,joyy,height
+        # 解析Web命令格式: #WEB,go,dir,joyx,joyy,height (高频数据)
         if line.startswith("#WEB,"):
             parts = line.split(',')
             if len(parts) == 6:
@@ -3653,11 +4451,257 @@ class PIDTunerUI(QMainWindow):
                     joyx = parts[3].strip()
                     joyy = parts[4].strip()
                     height = parts[5].strip()
-                    
                     self.web_monitor.update_web_status(go, dir_val, joyx, joyy, height)
-                    return
                 except (ValueError, IndexError):
                     pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # Web数据不打印日志(非debug模式)
+        
+        # YAW 调试数据 (高频)
+        if line.startswith("#YAW_DBG,"):
+            yaw_dbg_match = re.search(r'#YAW_DBG,out=([-\d.]+),err=([-\d.]+),hold=(\d),rate=([-\d.]+)', line)
+            if yaw_dbg_match:
+                try:
+                    yaw_output = float(yaw_dbg_match.group(1))
+                    yaw_error = float(yaw_dbg_match.group(2))
+                    yaw_holding = int(yaw_dbg_match.group(3)) == 1
+                    yaw_rate = float(yaw_dbg_match.group(4))
+                    if hasattr(self, 'yaw_panel'):
+                        self.yaw_panel.update_yaw_debug(
+                            self._yaw_target_angle, self._yaw_current_angle,
+                            yaw_error, yaw_output, yaw_holding, yaw_rate
+                        )
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 双环 PID 状态 (高频)
+        if line.startswith("DPID_STATUS:"):
+            dpid_match = re.search(r'DPID_STATUS:PITCH_ERR=([-\d.]+),TGT_SPD=([-\d.]+),SPD_ERR=([-\d.]+),TORQUE=([-\d.]+)', line)
+            if dpid_match:
+                try:
+                    pitch_err = float(dpid_match.group(1))
+                    target_speed = float(dpid_match.group(2))
+                    speed_err = float(dpid_match.group(3))
+                    torque = float(dpid_match.group(4))
+                    if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_status(pitch_err, target_speed, speed_err, torque)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 双环 PID 调试输出 (实时)
+        # 格式: [DPID] pitch=X° err=X° rate=X°/s | Angle: P=X I=X D=X → tgt_spd=X | Speed: err=X P=X I=X D=X → torque=X
+        if line.startswith("[DPID]"):
+            dpid_debug_match = re.search(
+                r'\[DPID\] pitch=([-\d.]+)° err=([-\d.]+)° rate=([-\d.]+)°/s \| '
+                r'Angle: P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → tgt_spd=([-\d.]+) \| '
+                r'Speed: err=([-\d.]+) P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → torque=([-\d.]+)', line)
+            if dpid_debug_match:
+                try:
+                    pitch = float(dpid_debug_match.group(1))
+                    err = float(dpid_debug_match.group(2))
+                    rate = float(dpid_debug_match.group(3))
+                    angle_p = float(dpid_debug_match.group(4))
+                    angle_i = float(dpid_debug_match.group(5))
+                    angle_d = float(dpid_debug_match.group(6))
+                    tgt_spd = float(dpid_debug_match.group(7))
+                    spd_err = float(dpid_debug_match.group(8))
+                    speed_p = float(dpid_debug_match.group(9))
+                    speed_i = float(dpid_debug_match.group(10))
+                    speed_d = float(dpid_debug_match.group(11))
+                    torque = float(dpid_debug_match.group(12))
+                    if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_dpid_debug(
+                            pitch, err, rate, angle_p, angle_i, angle_d, tgt_spd,
+                            spd_err, speed_p, speed_i, speed_d, torque)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 单环 PID 调试输出 (实时)
+        # 格式: [SPID] pitch=X° err=X° rate=X°/s | Angle: P=X I=X D=X → speed=X rad/s (X rpm)
+        if line.startswith("[SPID]"):
+            spid_debug_match = re.search(
+                r'\[SPID\] pitch=([-\d.]+)° err=([-\d.]+)° rate=([-\d.]+)°/s \| '
+                r'Angle: P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → speed=([-\d.]+) rad/s \(([-\d.]+) rpm\)', line)
+            if spid_debug_match:
+                try:
+                    pitch = float(spid_debug_match.group(1))
+                    err = float(spid_debug_match.group(2))
+                    rate = float(spid_debug_match.group(3))
+                    p = float(spid_debug_match.group(4))
+                    i = float(spid_debug_match.group(5))
+                    d = float(spid_debug_match.group(6))
+                    speed = float(spid_debug_match.group(7))
+                    rpm = float(spid_debug_match.group(8))
+                    if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_spid_debug(pitch, err, rate, p, i, d, speed, rpm)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 控制模式切换
+        if line.startswith("CTRL_MODE:"):
+            ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID|SINGLE_PID)', line)
+            if ctrl_mode_match:
+                try:
+                    mode = ctrl_mode_match.group(1)
+                    if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_mode(mode)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 腿部状态 (高频): LEG_STATE: L_Len=xxx ...
+        if line.startswith("LEG_STATE:"):
+            leg_state_match = re.search(
+                r'LEG_STATE:\s*L_Len=([-\d.]+)\s*L_Ang=([-\d.]+)\s*L_Hip=([-\d.]+)\s*L_Knee=([-\d.]+)\s*'
+                r'R_Len=([-\d.]+)\s*R_Ang=([-\d.]+)\s*R_Hip=([-\d.]+)\s*R_Knee=([-\d.]+)', line)
+            if leg_state_match:
+                try:
+                    left_state = {
+                        'length': float(leg_state_match.group(1)),
+                        'angle': float(leg_state_match.group(2)),
+                        'hip': float(leg_state_match.group(3)),
+                        'knee': float(leg_state_match.group(4))
+                    }
+                    right_state = {
+                        'length': float(leg_state_match.group(5)),
+                        'angle': float(leg_state_match.group(6)),
+                        'hip': float(leg_state_match.group(7)),
+                        'knee': float(leg_state_match.group(8))
+                    }
+                    if hasattr(self, 'leg_panel'):
+                        self.leg_panel.update_leg_state(left_state, right_state)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # VMC 数据流 (高频): #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync
+        if line.startswith("#VMC,"):
+            parts = line.split(',')
+            if len(parts) == 15:  # #VMC + 14 个数据
+                try:
+                    vmc_data = {
+                        'left_leg_length': float(parts[1]),
+                        'left_body_angle': float(parts[2]),
+                        'left_F_L': float(parts[3]),
+                        'left_F_alpha': float(parts[4]),
+                        'left_hip_torque': float(parts[5]),
+                        'left_knee_torque': float(parts[6]),
+                        'right_leg_length': float(parts[7]),
+                        'right_body_angle': float(parts[8]),
+                        'right_F_L': float(parts[9]),
+                        'right_F_alpha': float(parts[10]),
+                        'right_hip_torque': float(parts[11]),
+                        'right_knee_torque': float(parts[12]),
+                        'angle_diff': float(parts[13]),
+                        'f_sync': float(parts[14])
+                    }
+                    if hasattr(self, 'vmc_panel'):
+                        self.vmc_panel.update_vmc_monitor(vmc_data)
+                except (ValueError, IndexError) as e:
+                    if self.debug_mode:
+                        self.log(f"VMC data parse error: {e}", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # IMU 高频数据 (Angle: Roll= ... Pitch= ... Yaw= ...)
+        if line.startswith("Angle:") or "Roll=" in line and "Pitch=" in line:
+            imu_match = re.search(r'Roll[=:]\s*([-+]?\d+\.?\d*)\s+Pitch[=:]\s*([-+]?\d+\.?\d*)\s+Yaw[=:]\s*([-+]?\d+\.?\d*)', line, re.IGNORECASE)
+            if imu_match:
+                try:
+                    roll = float(imu_match.group(1))
+                    pitch = float(imu_match.group(2))
+                    yaw = float(imu_match.group(3))
+                    if hasattr(self, 'imu_panel') and self.imu_panel is not None:
+                        self.imu_panel.update_imu_data(roll, pitch, yaw, 0, 0, 0)
+                        self.status_label.setText(f"R:{roll:.1f}° P:{pitch:.1f}° Y:{yaw:.1f}°")
+                    if hasattr(self, 'leg_panel') and self.leg_panel is not None:
+                        if hasattr(self.leg_panel, 'update_roll_display'):
+                            self.leg_panel.update_roll_display(roll)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志 (高频,非debug模式)
+        
+        # Gyro 高频数据
+        if line.startswith("Gyro:"):
+            gyro_match = re.search(r'Gyro:\s*X[=:]\s*([-+]?\d+\.?\d*)\s+Y[=:]\s*([-+]?\d+\.?\d*)\s+Z[=:]\s*([-+]?\d+\.?\d*)', line, re.IGNORECASE)
+            if gyro_match:
+                try:
+                    gx = float(gyro_match.group(1))
+                    gy = float(gyro_match.group(2))
+                    gz = float(gyro_match.group(3))
+                    if hasattr(self, 'imu_panel') and self.imu_panel is not None:
+                        self.imu_panel.gx_label.setText(f"{gx:.2f}°/s")
+                        self.imu_panel.gy_label.setText(f"{gy:.2f}°/s")
+                        self.imu_panel.gz_label.setText(f"{gz:.2f}°/s")
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志 (高频,非debug模式)
+        
+        # 频率数据 (定期输出，但不需要刷屏)
+        if line.startswith("FREQ:"):
+            freq_match = re.search(r'FREQ:IMU=([-\d.]+),CTRL=([-\d.]+),MOTOR=([-\d.]+),LEG=([-\d.]+)', line)
+            if freq_match:
+                try:
+                    imu_hz = float(freq_match.group(1))
+                    ctrl_hz = float(freq_match.group(2))
+                    motor_hz = float(freq_match.group(3))
+                    leg_hz = float(freq_match.group(4))
+                    if hasattr(self, 'balance_panel'):
+                        self.balance_panel.update_task_freq(imu_hz, ctrl_hz, motor_hz, leg_hz)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 延迟数据 (定期输出)
+        if line.startswith("LATENCY:"):
+            latency_match = re.search(r'LATENCY:IMU_CTRL=([-\d.]+),CALC=([-\d.]+),CTRL_MOTOR=([-\d.]+),TOTAL=([-\d.]+)(?:,AVG=([-\d.]+),MIN=([-\d.]+),MAX=([-\d.]+))?', line)
+            if latency_match:
+                try:
+                    imu_ctrl_us = float(latency_match.group(1))
+                    calc_us = float(latency_match.group(2))
+                    ctrl_motor_us = float(latency_match.group(3))
+                    total_us = float(latency_match.group(4))
+                    avg_us = float(latency_match.group(5)) if latency_match.group(5) else total_us
+                    min_us = float(latency_match.group(6)) if latency_match.group(6) else total_us
+                    max_us = float(latency_match.group(7)) if latency_match.group(7) else total_us
+                    if hasattr(self, 'balance_panel'):
+                        self.balance_panel.update_latency(imu_ctrl_us, calc_us, ctrl_motor_us, total_us, avg_us, min_us, max_us)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # WiFi 延迟数据
+        if line.startswith("WIFI_LATENCY:"):
+            wifi_latency_match = re.search(r'WIFI_LATENCY:WIFI_CTRL=([-\d.]+),TOTAL=([-\d.]+),AVG=([-\d.]+),MIN=([-\d.]+),MAX=([-\d.]+)', line)
+            if wifi_latency_match:
+                try:
+                    wifi_ctrl_us = float(wifi_latency_match.group(1))
+                    wifi_total_us = float(wifi_latency_match.group(2))
+                    wifi_avg_us = float(wifi_latency_match.group(3))
+                    wifi_min_us = float(wifi_latency_match.group(4))
+                    wifi_max_us = float(wifi_latency_match.group(5))
+                    if hasattr(self, 'balance_panel'):
+                        self.balance_panel.update_wifi_latency(wifi_ctrl_us, wifi_total_us, wifi_avg_us, wifi_min_us, wifi_max_us)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # ===== 以下是低频/重要数据，会打印到日志 =====
         
         # 非调试模式只显示重要信息
         if not self.debug_mode:
@@ -3703,41 +4747,8 @@ class PIDTunerUI(QMainWindow):
                 self.balance_panel.on_init_success()
             self.log(f"✓ {line}", is_receive=True)
         
-        # 检测 IMU 数据: Roll=xxx Pitch=xxx Yaw=xxx
-        # 格式: "Angle: Roll= +0.05 Pitch= -0.63 Yaw= +67.12 (°)"
-        imu_match = re.search(r'Roll[=:]\s*([-+]?\d+\.?\d*)\s+Pitch[=:]\s*([-+]?\d+\.?\d*)\s+Yaw[=:]\s*([-+]?\d+\.?\d*)', line, re.IGNORECASE)
-        if imu_match:
-            try:
-                roll = float(imu_match.group(1))
-                pitch = float(imu_match.group(2))
-                yaw = float(imu_match.group(3))
-                if hasattr(self, 'imu_panel') and self.imu_panel is not None:
-                    self.imu_panel.update_imu_data(roll, pitch, yaw, 0, 0, 0)
-                    # 在状态栏显示 IMU 数据
-                    self.status_label.setText(f"R:{roll:.1f}° P:{pitch:.1f}° Y:{yaw:.1f}°")
-                # 同时更新腿部面板中的 Roll 显示 (如果有)
-                if hasattr(self, 'leg_panel') and self.leg_panel is not None:
-                    if hasattr(self.leg_panel, 'update_roll_display'):
-                        self.leg_panel.update_roll_display(roll)
-            except Exception as e:
-                if self.debug_mode:
-                    self.log(f"IMU 解析错误: {e}", is_error=True)
-        
-        # 检测 Gyro 数据: Gyro: X= +0.18 Y= -0.18 Z= -0.49 (°/s)
-        gyro_match = re.search(r'Gyro:\s*X[=:]\s*([-+]?\d+\.?\d*)\s+Y[=:]\s*([-+]?\d+\.?\d*)\s+Z[=:]\s*([-+]?\d+\.?\d*)', line, re.IGNORECASE)
-        if gyro_match:
-            try:
-                gx = float(gyro_match.group(1))
-                gy = float(gyro_match.group(2))
-                gz = float(gyro_match.group(3))
-                if hasattr(self, 'imu_panel') and self.imu_panel is not None:
-                    # 只更新角速度部分
-                    self.imu_panel.gx_label.setText(f"{gx:.2f}°/s")
-                    self.imu_panel.gy_label.setText(f"{gy:.2f}°/s")
-                    self.imu_panel.gz_label.setText(f"{gz:.2f}°/s")
-            except Exception as e:
-                if self.debug_mode:
-                    self.log(f"Gyro 解析错误: {e}", is_error=True)
+        # 检测 IMU 数据: Roll=xxx Pitch=xxx Yaw=xxx (已在前面处理高频数据)
+        # 这里处理一次性查询的IMU数据 (不是以 "Angle:" 开头的)
         
         # 检测电机状态: M1: pos=xxx spd=xxx cur=xxx ONLINE/OFFLINE
         motor_match = re.search(r'M(\d):\s*pos=([-\d.]+).*spd=([-\d.]+).*cur=([-\d.]+).*?(ONLINE|OFFLINE)', line, re.IGNORECASE)
@@ -3793,139 +4804,10 @@ class PIDTunerUI(QMainWindow):
                 self.leg_panel.update_test_result("❌ FK 失败")
             self.log(f"⚠ {line}", is_error=True)
         
-        # 腿部状态解析: LEG_STATE: L_Len=xxx L_Ang=xxx L_Hip=xxx L_Knee=xxx R_Len=xxx ...
-        leg_state_match = re.search(
-            r'LEG_STATE:\s*L_Len=([-\d.]+)\s*L_Ang=([-\d.]+)\s*L_Hip=([-\d.]+)\s*L_Knee=([-\d.]+)\s*'
-            r'R_Len=([-\d.]+)\s*R_Ang=([-\d.]+)\s*R_Hip=([-\d.]+)\s*R_Knee=([-\d.]+)', line)
-        if leg_state_match:
-            try:
-                left_state = {
-                    'length': float(leg_state_match.group(1)),
-                    'angle': float(leg_state_match.group(2)),
-                    'hip': float(leg_state_match.group(3)),
-                    'knee': float(leg_state_match.group(4))
-                }
-                right_state = {
-                    'length': float(leg_state_match.group(5)),
-                    'angle': float(leg_state_match.group(6)),
-                    'hip': float(leg_state_match.group(7)),
-                    'knee': float(leg_state_match.group(8))
-                }
-                if hasattr(self, 'leg_panel'):
-                    self.leg_panel.update_leg_state(left_state, right_state)
-            except:
-                pass
-        
         # 目标设置成功: Target set: Length=xxxm, Angle=xxxdeg
         target_match = re.search(r'Target set:\s*Length=([-\d.]+)m,\s*Angle=([-\d.]+)deg', line)
         if target_match:
             self.log(f"✓ {line}", is_receive=True)
-        
-        # ===== 任务频率解析 =====
-        # 格式: FREQ:IMU=xxx,CTRL=xxx,MOTOR=xxx,LEG=xxx
-        freq_match = re.search(r'FREQ:IMU=([-\d.]+),CTRL=([-\d.]+),MOTOR=([-\d.]+),LEG=([-\d.]+)', line)
-        if freq_match:
-            try:
-                imu_hz = float(freq_match.group(1))
-                ctrl_hz = float(freq_match.group(2))
-                motor_hz = float(freq_match.group(3))
-                leg_hz = float(freq_match.group(4))
-                if hasattr(self, 'balance_panel'):
-                    self.balance_panel.update_task_freq(imu_hz, ctrl_hz, motor_hz, leg_hz)
-                self.log(f"📈 频率: IMU={imu_hz:.0f}Hz, Ctrl={ctrl_hz:.0f}Hz, Motor={motor_hz:.0f}Hz, Leg={leg_hz:.0f}Hz", is_receive=True)
-            except:
-                pass
-        
-        # ===== 延迟诊断解析 =====
-        # 格式: LATENCY:IMU_CTRL=xxx,CALC=xxx,CTRL_MOTOR=xxx,TOTAL=xxx,AVG=xxx,MIN=xxx,MAX=xxx
-        latency_match = re.search(r'LATENCY:IMU_CTRL=([-\d.]+),CALC=([-\d.]+),CTRL_MOTOR=([-\d.]+),TOTAL=([-\d.]+)(?:,AVG=([-\d.]+),MIN=([-\d.]+),MAX=([-\d.]+))?', line)
-        if latency_match:
-            try:
-                imu_ctrl_us = float(latency_match.group(1))
-                calc_us = float(latency_match.group(2))
-                ctrl_motor_us = float(latency_match.group(3))
-                total_us = float(latency_match.group(4))
-                # 可选的统计字段
-                avg_us = float(latency_match.group(5)) if latency_match.group(5) else total_us
-                min_us = float(latency_match.group(6)) if latency_match.group(6) else total_us
-                max_us = float(latency_match.group(7)) if latency_match.group(7) else total_us
-                if hasattr(self, 'balance_panel'):
-                    self.balance_panel.update_latency(imu_ctrl_us, calc_us, ctrl_motor_us, total_us, avg_us, min_us, max_us)
-                self.log(f"⏱️ IMU延迟: Total={total_us:.0f}us (Avg={avg_us:.0f}, Min={min_us:.0f}, Max={max_us:.0f}us)", is_receive=True)
-            except:
-                pass
-        
-        # ===== WiFi 遥控延迟解析 =====
-        # 格式: WIFI_LATENCY:WIFI_CTRL=xxx,TOTAL=xxx,AVG=xxx,MIN=xxx,MAX=xxx
-        wifi_latency_match = re.search(r'WIFI_LATENCY:WIFI_CTRL=([-\d.]+),TOTAL=([-\d.]+),AVG=([-\d.]+),MIN=([-\d.]+),MAX=([-\d.]+)', line)
-        if wifi_latency_match:
-            try:
-                wifi_ctrl_us = float(wifi_latency_match.group(1))
-                wifi_total_us = float(wifi_latency_match.group(2))
-                wifi_avg_us = float(wifi_latency_match.group(3))
-                wifi_min_us = float(wifi_latency_match.group(4))
-                wifi_max_us = float(wifi_latency_match.group(5))
-                if hasattr(self, 'balance_panel'):
-                    self.balance_panel.update_wifi_latency(wifi_ctrl_us, wifi_total_us, wifi_avg_us, wifi_min_us, wifi_max_us)
-                self.log(f"📶 WiFi延迟: Total={wifi_total_us:.0f}us (Avg={wifi_avg_us:.0f}, Min={wifi_min_us:.0f}, Max={wifi_max_us:.0f}us)", is_receive=True)
-            except:
-                pass
-        
-        # ===== YAW 调试数据解析 =====
-        # 格式: #YAW_DBG,out=xxx,err=xxx,hold=x,rate=xxx
-        yaw_dbg_match = re.search(r'#YAW_DBG,out=([-\d.]+),err=([-\d.]+),hold=(\d),rate=([-\d.]+)', line)
-        if yaw_dbg_match:
-            try:
-                yaw_output = float(yaw_dbg_match.group(1))
-                yaw_error = float(yaw_dbg_match.group(2))
-                yaw_holding = int(yaw_dbg_match.group(3)) == 1
-                yaw_rate = float(yaw_dbg_match.group(4))
-                # 更新 YAW 调试面板
-                if hasattr(self, 'yaw_panel'):
-                    self.yaw_panel.update_yaw_debug(
-                        self._yaw_target_angle, self._yaw_current_angle,
-                        yaw_error, yaw_output, yaw_holding, yaw_rate
-                    )
-            except:
-                pass
-            return  # 不在日志显示
-        
-        # 格式: #DATA,Y,target_angle,current_angle (YAW 角度数据)
-        if line.startswith("#DATA,Y,"):
-            parts = line.split(',')
-            if len(parts) == 4:
-                try:
-                    self._yaw_target_angle = float(parts[2].strip())
-                    self._yaw_current_angle = float(parts[3].strip())
-                except:
-                    pass
-            return  # 不在日志显示
-        
-        # ===== 双环 PID 状态解析 =====
-        # 格式: DPID_STATUS:PITCH_ERR=xxx,TGT_SPD=xxx,SPD_ERR=xxx,TORQUE=xxx
-        dpid_match = re.search(r'DPID_STATUS:PITCH_ERR=([-\d.]+),TGT_SPD=([-\d.]+),SPD_ERR=([-\d.]+),TORQUE=([-\d.]+)', line)
-        if dpid_match:
-            try:
-                pitch_err = float(dpid_match.group(1))
-                target_speed = float(dpid_match.group(2))
-                speed_err = float(dpid_match.group(3))
-                torque = float(dpid_match.group(4))
-                if hasattr(self, 'dual_pid_panel'):
-                    self.dual_pid_panel.update_status(pitch_err, target_speed, speed_err, torque)
-            except:
-                pass
-            return  # 不在日志显示
-        
-        # 格式: CTRL_MODE:LQR 或 CTRL_MODE:DUAL_PID
-        ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID)', line)
-        if ctrl_mode_match:
-            try:
-                mode = ctrl_mode_match.group(1)
-                if hasattr(self, 'dual_pid_panel'):
-                    self.dual_pid_panel.update_mode(mode)
-            except:
-                pass
-            return  # 不在日志显示
     
     def log(self, msg, is_receive=False, is_error=False):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -3950,6 +4832,13 @@ class PIDTunerUI(QMainWindow):
             self.log("🐛 调试模式已开启 - 将显示所有串口数据", is_error=True)
         else:
             self.log("🐛 调试模式已关闭", is_error=True)
+    
+    def toggle_high_freq_data(self, enabled):
+        self.show_high_freq_data = enabled
+        if enabled:
+            self.log("📊 高频数据显示已开启 - IMU/腿部/频率等数据将显示在日志中", is_error=True)
+        else:
+            self.log("📊 高频数据显示已关闭", is_error=True)
     
     def show_help(self):
         help_text = """
