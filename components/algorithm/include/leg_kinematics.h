@@ -559,6 +559,102 @@ esp_err_t vmc_dual_compute(const vmc_params_t *params,
                            const vmc_dual_input_t *input,
                            vmc_dual_output_t *output);
 
+// ============================================================================
+// 简化 VMC 接口 (直接输入虚拟力)
+// ============================================================================
+
+/**
+ * @brief VMC 直接力输入 (外部计算虚拟力，VMC 只做坐标变换)
+ * 
+ * 这个接口用于将外部控制器计算的虚拟力转换为关节扭矩。
+ * 外部控制器（如 Roll 控制、腿长控制）负责计算 F_L 和 F_alpha，
+ * VMC 只负责通过雅可比矩阵将虚拟力映射到关节扭矩。
+ * 
+ * 控制公式:
+ *   [τ_hip; τ_knee] = J^T × [F_L; F_alpha]
+ *   
+ * 其中:
+ *   F_L: 腿长方向虚拟力 (N), 正=伸展
+ *   F_alpha: 身体角度虚拟力矩 (Nm), 正=向前
+ */
+typedef struct {
+    // 虚拟力输入 (由外部控制器计算)
+    float F_L;              // 腿长方向力 (N), 正=伸展腿
+    float F_alpha;          // 身体角度力矩 (Nm), 正=向前倾
+    
+    // 关节状态 (用于雅可比计算)
+    float hip_angle_deg;    // 髋关节电机角度 (度)
+    float knee_angle_deg;   // 膝关节电机角度 (度)
+} vmc_force_input_t;
+
+/**
+ * @brief VMC 直接力输出
+ */
+typedef struct {
+    float hip_torque;       // 髋关节扭矩 (Nm)
+    float knee_torque;      // 膝关节扭矩 (Nm)
+    
+    // 调试: 雅可比矩阵
+    float J[4];             // [dL/dhip, dL/dknee; dalpha/dhip, dalpha/dknee]
+} vmc_force_output_t;
+
+/**
+ * @brief 虚拟力直接转换为关节扭矩 (单腿)
+ * 
+ * 这是最简化的 VMC 接口:
+ *   - 不计算 PD 控制，直接接受虚拟力输入
+ *   - 只做雅可比变换: τ = J^T × F
+ *   - 右腿输出自动取反 (因为电机镜像安装)
+ * 
+ * 使用场景:
+ *   - 外部已经有完整的控制器计算出 F_L, F_alpha
+ *   - 需要与其他控制回路（LQR, PID）共享 Roll/腿长控制
+ * 
+ * @param input 虚拟力输入
+ * @param is_left 是否为左腿
+ * @param output 关节扭矩输出
+ * @return ESP_OK 成功
+ * 
+ * @note 右腿输出自动取反: output->hip_torque 和 output->knee_torque 已经
+ *       根据 is_left 进行了正确的符号处理
+ * 
+ * 使用示例:
+ * @code
+ *   // 外部计算虚拟力 (例如 Roll + 腿长控制)
+ *   float F_L = K_L * (target_L - current_L) + D_L * (0 - dL);
+ *   float F_alpha = roll_output + sync_output;  // Roll 控制器输出
+ *   
+ *   vmc_force_input_t input = {
+ *       .F_L = F_L,
+ *       .F_alpha = F_alpha,
+ *       .hip_angle_deg = motor_hip_pos,
+ *       .knee_angle_deg = motor_knee_pos
+ *   };
+ *   vmc_force_output_t output;
+ *   vmc_force_to_torque(&input, true, &output);
+ *   
+ *   motor_set_torque(hip, output.hip_torque);
+ *   motor_set_torque(knee, output.knee_torque);
+ * @endcode
+ */
+esp_err_t vmc_force_to_torque(const vmc_force_input_t *input,
+                               bool is_left,
+                               vmc_force_output_t *output);
+
+/**
+ * @brief 双腿虚拟力直接转换为关节扭矩
+ * 
+ * @param left_input 左腿虚拟力输入
+ * @param right_input 右腿虚拟力输入
+ * @param left_output 左腿关节扭矩输出
+ * @param right_output 右腿关节扭矩输出
+ * @return ESP_OK 成功
+ */
+esp_err_t vmc_dual_force_to_torque(const vmc_force_input_t *left_input,
+                                    const vmc_force_input_t *right_input,
+                                    vmc_force_output_t *left_output,
+                                    vmc_force_output_t *right_output);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@ idf_component_register(
         "src/lowpass_filter.c"
         "src/lqr_balance.c"
         "src/leg_kinematics.c"
+        "src/robot_state.c"
     INCLUDE_DIRS "include"
     REQUIRES freertos common
     PRIV_REQUIRES esp_timer

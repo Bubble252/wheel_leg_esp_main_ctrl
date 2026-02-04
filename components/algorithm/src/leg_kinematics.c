@@ -918,3 +918,74 @@ esp_err_t vmc_dual_compute(const vmc_params_t *params,
     
     return ESP_OK;
 }
+
+// ============================================================================
+// 简化 VMC 接口: 直接虚拟力输入
+// ============================================================================
+
+esp_err_t vmc_force_to_torque(const vmc_force_input_t *input,
+                               bool is_left,
+                               vmc_force_output_t *output) {
+    if (input == NULL || output == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 清零输出
+    output->hip_torque = 0.0f;
+    output->knee_torque = 0.0f;
+    memset(output->J, 0, sizeof(output->J));
+    
+    // 构造关节状态
+    leg_joint_state_t joint = {
+        .hip_angle = input->hip_angle_deg,
+        .knee_angle = input->knee_angle_deg
+    };
+    
+    // 计算雅可比矩阵 (机身坐标系)
+    // J = [dL/dhip,    dL/dknee;
+    //      dalpha/dhip, dalpha/dknee]
+    esp_err_t ret = leg_kin_jacobian(&joint, is_left, NULL, output->J);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to compute Jacobian");
+        return ret;
+    }
+    
+    // 雅可比转置计算关节扭矩
+    // [τ_hip]   = J^T × [F_L]     = [J[0], J[2]] × [F_L]
+    // [τ_knee]          [F_alpha]   [J[1], J[3]]   [F_alpha]
+    //
+    // τ_hip  = J[0] × F_L + J[2] × F_alpha
+    // τ_knee = J[1] × F_L + J[3] × F_alpha
+    output->hip_torque  = output->J[0] * input->F_L + output->J[2] * input->F_alpha;
+    output->knee_torque = output->J[1] * input->F_L + output->J[3] * input->F_alpha;
+    
+    // 右腿电机镜像安装，扭矩需要取反
+    // 这是统一的规则，与原有 vmc_ctrl_compute 中的处理一致
+    if (!is_left) {
+        output->hip_torque = -output->hip_torque;
+        output->knee_torque = -output->knee_torque;
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t vmc_dual_force_to_torque(const vmc_force_input_t *left_input,
+                                    const vmc_force_input_t *right_input,
+                                    vmc_force_output_t *left_output,
+                                    vmc_force_output_t *right_output) {
+    esp_err_t ret;
+    
+    // 计算左腿
+    ret = vmc_force_to_torque(left_input, true, left_output);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    // 计算右腿
+    ret = vmc_force_to_torque(right_input, false, right_output);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    return ESP_OK;
+}
