@@ -1996,6 +1996,29 @@ class BalanceControlPanel(QWidget):
         roll_group.setLayout(roll_layout)
         layout.addWidget(roll_group)
         
+        # Pitch 腿部角度补偿
+        pitch_comp_group = QGroupBox("Pitch 腿部角度补偿 (俯仰补偿)")
+        pitch_comp_layout = QHBoxLayout()
+        
+        self.pitch_comp_status = QLabel("状态: 未知")
+        self.pitch_comp_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        pitch_comp_layout.addWidget(self.pitch_comp_status)
+        
+        pitch_comp_layout.addStretch()
+        
+        self.pitch_comp_on_btn = QPushButton("✅ 开启 PitchComp")
+        self.pitch_comp_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
+        self.pitch_comp_on_btn.clicked.connect(lambda: self.send_pitch_comp_cmd("on"))
+        pitch_comp_layout.addWidget(self.pitch_comp_on_btn)
+        
+        self.pitch_comp_off_btn = QPushButton("❌ 关闭 PitchComp")
+        self.pitch_comp_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
+        self.pitch_comp_off_btn.clicked.connect(lambda: self.send_pitch_comp_cmd("off"))
+        pitch_comp_layout.addWidget(self.pitch_comp_off_btn)
+        
+        pitch_comp_group.setLayout(pitch_comp_layout)
+        layout.addWidget(pitch_comp_group)
+        
         # 角度零点设置
         zero_group = QGroupBox("角度零点设置")
         zero_layout = QHBoxLayout()
@@ -2213,7 +2236,7 @@ class BalanceControlPanel(QWidget):
         
         # 电机通信 (轮)
         freq_layout.addWidget(QLabel("轮电机通信:"), 3, 0)
-        freq_layout.addWidget(QLabel("500 Hz"), 3, 1)
+        freq_layout.addWidget(QLabel("200 Hz"), 3, 1)
         self.freq_motor_label = QLabel("-- Hz")
         self.freq_motor_label.setStyleSheet("font-weight: bold; color: #00ccff;")
         freq_layout.addWidget(self.freq_motor_label, 3, 2)
@@ -2222,7 +2245,7 @@ class BalanceControlPanel(QWidget):
         
         # 腿电机
         freq_layout.addWidget(QLabel("腿电机控制:"), 4, 0)
-        freq_layout.addWidget(QLabel("50 Hz"), 4, 1)
+        freq_layout.addWidget(QLabel("20 Hz"), 4, 1)
         self.freq_leg_label = QLabel("-- Hz")
         self.freq_leg_label.setStyleSheet("font-weight: bold; color: #00ccff;")
         freq_layout.addWidget(self.freq_leg_label, 4, 2)
@@ -2400,6 +2423,21 @@ class BalanceControlPanel(QWidget):
                 self.roll_status.setText("状态: 已关闭")
                 self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
     
+    def send_pitch_comp_cmd(self, state):
+        """发送 Pitch 腿部角度补偿命令"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        cmd = f"balance pitchcomp {state}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+            if state == "on":
+                self.pitch_comp_status.setText("状态: 已开启")
+                self.pitch_comp_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+            else:
+                self.pitch_comp_status.setText("状态: 已关闭")
+                self.pitch_comp_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
+    
     def do_balance_init(self):
         self.send_cmd("balance init")
         self.init_status.setText("初始化中...")
@@ -2485,11 +2523,11 @@ class BalanceControlPanel(QWidget):
         
         # Motor
         self.freq_motor_label.setText(f"{motor_hz:.1f} Hz")
-        self._update_freq_status(self.freq_motor_status, motor_hz, 500, 25)
+        self._update_freq_status(self.freq_motor_status, motor_hz, 200, 10)
         
         # Leg
         self.freq_leg_label.setText(f"{leg_hz:.1f} Hz")
-        self._update_freq_status(self.freq_leg_status, leg_hz, 50, 5)
+        self._update_freq_status(self.freq_leg_status, leg_hz, 20, 3)
     
     def _update_freq_status(self, label, actual, target, tolerance):
         """更新频率状态指示"""
