@@ -30,12 +30,152 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox, QGridLayout,
     QTabWidget, QDoubleSpinBox, QSpinBox, QMessageBox, QSplitter,
-    QSlider, QCheckBox, QFrame, QProgressBar, QLineEdit
+    QSlider, QCheckBox, QFrame, QProgressBar, QLineEdit, QScrollArea
 )
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QThread
 from PyQt5.QtGui import QFont, QPalette, QColor
 import pyqtgraph as pg
 import numpy as np
+
+
+# ============================================================================
+# DPI 自适应缩放
+# ============================================================================
+# 全局缩放因子, 根据屏幕分辨率自动计算
+# 基准: 1920x1080, scale=1.0
+_SCALE_FACTOR = 1.0
+
+def get_scale():
+    """获取当前缩放因子"""
+    return _SCALE_FACTOR
+
+def sp(px):
+    """缩放像素值 (Scaled Pixels): 将设计时的像素值按屏幕 DPI 缩放
+    用于 padding, margin, border-radius 等"""
+    return max(1, int(px * _SCALE_FACTOR))
+
+def sf(pt):
+    """缩放字体大小 (Scaled Font): 将设计时的字号按屏幕 DPI 缩放"""
+    return max(8, int(pt * _SCALE_FACTOR))
+
+def _compute_scale_factor(app):
+    """根据屏幕物理 DPI 和分辨率计算缩放因子"""
+    global _SCALE_FACTOR
+    try:
+        screen = app.primaryScreen()
+        if screen is None:
+            _SCALE_FACTOR = 1.0
+            return
+        dpi = screen.logicalDotsPerInch()
+        geo = screen.availableGeometry()
+        # 基准: 96 DPI, 1920x1080
+        dpi_scale = dpi / 96.0
+        # 取宽高中较小的维度来计算分辨率缩放
+        res_scale = min(geo.width() / 1920.0, geo.height() / 1080.0)
+        # 综合: DPI 权重 0.6, 分辨率权重 0.4
+        _SCALE_FACTOR = max(0.6, min(3.0, dpi_scale * 0.6 + res_scale * 0.4))
+    except Exception:
+        _SCALE_FACTOR = 1.0
+
+
+def _build_global_stylesheet():
+    """构建全局自适应 stylesheet, 基于当前 _SCALE_FACTOR"""
+    s = _SCALE_FACTOR
+    return f"""
+        /* ---- 全局字体基线 ---- */
+        QWidget {{
+            font-size: {sf(13)}px;
+        }}
+        QGroupBox {{
+            font-size: {sf(13)}px;
+            font-weight: bold;
+            padding-top: {sp(14)}px;
+            margin-top: {sp(8)}px;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: {sp(10)}px;
+            padding: 0 {sp(4)}px;
+        }}
+        QPushButton {{
+            font-size: {sf(12)}px;
+            padding: {sp(5)}px {sp(12)}px;
+            min-height: {sp(22)}px;
+        }}
+        QLabel {{
+            font-size: {sf(12)}px;
+        }}
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{
+            font-size: {sf(12)}px;
+            padding: {sp(3)}px;
+            min-height: {sp(20)}px;
+        }}
+        QTextEdit {{
+            font-size: {sf(11)}px;
+        }}
+        QTabBar::tab {{
+            font-size: {sf(11)}px;
+            padding: {sp(5)}px {sp(10)}px;
+            min-width: {sp(60)}px;
+        }}
+        QCheckBox, QRadioButton {{
+            font-size: {sf(12)}px;
+            spacing: {sp(4)}px;
+        }}
+        QSlider::groove:horizontal {{
+            height: {sp(6)}px;
+        }}
+        QSlider::handle:horizontal {{
+            width: {sp(14)}px;
+            height: {sp(14)}px;
+            margin: -{sp(4)}px 0;
+        }}
+        QProgressBar {{
+            font-size: {sf(11)}px;
+            min-height: {sp(16)}px;
+        }}
+        QScrollArea {{
+            border: none;
+            background: transparent;
+        }}
+        QScrollArea > QWidget > QWidget {{
+            background: transparent;
+        }}
+    """
+
+
+# 正则: 匹配 font-size: XXpx 并缩放
+_RE_FONT_SIZE = re.compile(r'font-size:\s*(\d+)px')
+_RE_PADDING = re.compile(r'padding:\s*(\d+)px')
+_RE_MIN_WIDTH = re.compile(r'min-width:\s*(\d+)px')
+
+def SS(style_str):
+    """Scaled StyleSheet — 自动将 inline stylesheet 中的 px 值按 DPI 缩放.
+    用法: widget.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+    """
+    if _SCALE_FACTOR == 1.0:
+        return style_str
+    def _scale_font(m):
+        return f'font-size: {sf(int(m.group(1)))}px'
+    def _scale_padding(m):
+        return f'padding: {sp(int(m.group(1)))}px'
+    def _scale_min_width(m):
+        return f'min-width: {sp(int(m.group(1)))}px'
+    result = _RE_FONT_SIZE.sub(_scale_font, style_str)
+    result = _RE_PADDING.sub(_scale_padding, result)
+    result = _RE_MIN_WIDTH.sub(_scale_min_width, result)
+    return result
+
+
+def _make_scrollable(widget):
+    """将 widget 包裹在 QScrollArea 中, 使其可滚动.
+    用于 tab 页内容过多时允许垂直滚动."""
+    scroll = QScrollArea()
+    scroll.setWidget(widget)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)  # 无边框, 视觉一致
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    return scroll
 
 
 # ============================================================================
@@ -158,7 +298,7 @@ class PIDControlPanel(QWidget):
         self.p_input.setRange(-1000, 1000)
         self.p_input.setDecimals(4)
         self.p_input.setSingleStep(0.1)
-        self.p_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.p_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.p_input, 0, 1)
         
         self.p_set_btn = QPushButton("设置 P")
@@ -171,7 +311,7 @@ class PIDControlPanel(QWidget):
         self.i_input.setRange(-1000, 1000)
         self.i_input.setDecimals(4)
         self.i_input.setSingleStep(0.1)
-        self.i_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.i_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.i_input, 1, 1)
         
         self.i_set_btn = QPushButton("设置 I")
@@ -184,7 +324,7 @@ class PIDControlPanel(QWidget):
         self.d_input.setRange(-1000, 1000)
         self.d_input.setDecimals(4)
         self.d_input.setSingleStep(0.1)
-        self.d_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.d_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.d_input, 2, 1)
         
         self.d_set_btn = QPushButton("设置 D")
@@ -197,7 +337,7 @@ class PIDControlPanel(QWidget):
         self.limit_input.setRange(0, 1000)
         self.limit_input.setDecimals(4)
         self.limit_input.setSingleStep(0.5)
-        self.limit_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.limit_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.limit_input, 3, 1)
         
         self.limit_set_btn = QPushButton("设置 Limit")
@@ -210,7 +350,7 @@ class PIDControlPanel(QWidget):
         self.ramp_input.setRange(0, 1000000)
         self.ramp_input.setDecimals(0)
         self.ramp_input.setSingleStep(1000)
-        self.ramp_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.ramp_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.ramp_input, 4, 1)
         
         self.ramp_set_btn = QPushButton("设置 Ramp")
@@ -225,17 +365,17 @@ class PIDControlPanel(QWidget):
         action_layout = QHBoxLayout()
         
         self.query_btn = QPushButton("🔍 查询当前参数")
-        self.query_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 10px;")
+        self.query_btn.setStyleSheet(SS("font-size: 14px; font-weight: bold; padding: 10px;"))
         self.query_btn.clicked.connect(self.query_params)
         action_layout.addWidget(self.query_btn)
         
         self.set_all_btn = QPushButton("📤 发送全部参数")
-        self.set_all_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 10px;")
+        self.set_all_btn.setStyleSheet(SS("font-size: 14px; font-weight: bold; padding: 10px;"))
         self.set_all_btn.clicked.connect(self.set_all_params)
         action_layout.addWidget(self.set_all_btn)
         
         self.reset_btn = QPushButton("🔄 重置为0")
-        self.reset_btn.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.reset_btn.setStyleSheet(SS("font-size: 14px; padding: 10px;"))
         self.reset_btn.clicked.connect(self.reset_params)
         action_layout.addWidget(self.reset_btn)
         
@@ -302,8 +442,8 @@ class PIDControlPanel(QWidget):
     def create_param_display(self, text):
         """创建参数显示标签"""
         label = QLabel(text)
-        label.setStyleSheet("font-size: 16px; font-weight: bold; color: #00ff00; "
-                          "background-color: #2b2b2b; padding: 8px; border-radius: 3px;")
+        label.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ff00; "
+                          "background-color: #2b2b2b; padding: 8px; border-radius: 3px;"))
         label.setAlignment(Qt.AlignCenter)
         return label
     
@@ -426,7 +566,7 @@ class LPFControlPanel(QWidget):
         self.tf_input.setDecimals(4)
         self.tf_input.setSingleStep(0.01)
         self.tf_input.setValue(0.01)
-        self.tf_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.tf_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.tf_input, 0, 1)
         
         self.tf_set_btn = QPushButton("设置 Tf")
@@ -451,8 +591,8 @@ class LPFControlPanel(QWidget):
         display_layout = QHBoxLayout()
         display_layout.addWidget(QLabel("Tf:"))
         self.tf_display = QLabel("--")
-        self.tf_display.setStyleSheet("font-size: 16px; font-weight: bold; color: #00ff00; "
-                                     "background-color: #2b2b2b; padding: 8px;")
+        self.tf_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ff00; "
+                                     "background-color: #2b2b2b; padding: 8px;"))
         display_layout.addWidget(self.tf_display)
         display_layout.addStretch()
         display_group.setLayout(display_layout)
@@ -547,31 +687,31 @@ class WebMonitorPanel(QWidget):
         # Go状态
         status_layout.addWidget(QLabel("Go (启动):"), 0, 0)
         self.go_label = QLabel("⭕ 停止")
-        self.go_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ff4444;")
+        self.go_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #ff4444;"))
         status_layout.addWidget(self.go_label, 0, 1)
         
         # Dir状态
         status_layout.addWidget(QLabel("Dir (方向):"), 0, 2)
         self.dir_label = QLabel("0")
-        self.dir_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+        self.dir_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00aaff;"))
         status_layout.addWidget(self.dir_label, 0, 3)
         
         # 摇杆X
         status_layout.addWidget(QLabel("JoyX:"), 1, 0)
         self.joyx_label = QLabel("0")
-        self.joyx_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ff00;")
+        self.joyx_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00ff00;"))
         status_layout.addWidget(self.joyx_label, 1, 1)
         
         # 摇杆Y
         status_layout.addWidget(QLabel("JoyY:"), 1, 2)
         self.joyy_label = QLabel("0")
-        self.joyy_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ff00;")
+        self.joyy_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00ff00;"))
         status_layout.addWidget(self.joyy_label, 1, 3)
         
         # 高度
         status_layout.addWidget(QLabel("Height (高度):"), 2, 0)
         self.height_label = QLabel("0")
-        self.height_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffaa00;")
+        self.height_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #ffaa00;"))
         status_layout.addWidget(self.height_label, 2, 1)
         
         status_group.setLayout(status_layout)
@@ -583,8 +723,8 @@ class WebMonitorPanel(QWidget):
         
         self.history_text = QTextEdit()
         self.history_text.setReadOnly(True)
-        self.history_text.setMaximumHeight(200)
-        self.history_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas;")
+        self.history_text.setMaximumHeight(sp(200))
+        self.history_text.setStyleSheet(SS("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas;"))
         history_layout.addWidget(self.history_text)
         
         clear_btn = QPushButton("清空历史")
@@ -600,10 +740,10 @@ class WebMonitorPanel(QWidget):
         """更新Web状态显示"""
         if go == "1":
             self.go_label.setText("🟢 运行")
-            self.go_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ff00;")
+            self.go_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00ff00;"))
         else:
             self.go_label.setText("⭕ 停止")
-            self.go_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ff4444;")
+            self.go_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #ff4444;"))
         
         self.dir_label.setText(str(dir_val))
         self.joyx_label.setText(str(joyx))
@@ -650,7 +790,7 @@ class SpeedAdaptivePanel(QWidget):
         self.kp_max_input.setDecimals(3)
         self.kp_max_input.setValue(1.0)  # 对应 default_params.speed_kp_max
         self.kp_max_input.setSingleStep(0.1)
-        self.kp_max_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.kp_max_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         range_layout.addWidget(self.kp_max_input, 0, 1)
         
         self.kp_max_btn = QPushButton("设置")
@@ -667,7 +807,7 @@ class SpeedAdaptivePanel(QWidget):
         self.kp_min_input.setDecimals(3)
         self.kp_min_input.setValue(0.3)  # 对应 default_params.speed_kp_min
         self.kp_min_input.setSingleStep(0.1)
-        self.kp_min_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.kp_min_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         range_layout.addWidget(self.kp_min_input, 1, 1)
         
         self.kp_min_btn = QPushButton("设置")
@@ -692,7 +832,7 @@ class SpeedAdaptivePanel(QWidget):
         self.height_min_input.setDecimals(3)
         self.height_min_input.setValue(0.1)  # 对应代码中的 0.1m
         self.height_min_input.setSingleStep(0.01)
-        self.height_min_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.height_min_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         height_layout.addWidget(self.height_min_input, 0, 1)
         
         # 最大高度
@@ -702,7 +842,7 @@ class SpeedAdaptivePanel(QWidget):
         self.height_max_input.setDecimals(3)
         self.height_max_input.setValue(0.3)  # 对应代码中的 0.3m
         self.height_max_input.setSingleStep(0.01)
-        self.height_max_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.height_max_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         height_layout.addWidget(self.height_max_input, 0, 3)
         
         height_group.setLayout(height_layout)
@@ -723,8 +863,8 @@ class SpeedAdaptivePanel(QWidget):
         
         preview_layout.addWidget(QLabel("计算得到的Kp:"), 0, 2)
         self.calculated_kp_display = self.create_display_label("--")
-        self.calculated_kp_display.setStyleSheet("font-size: 16px; font-weight: bold; color: #00ff00; "
-                                                  "background-color: #1a1a1a; padding: 8px; border-radius: 4px;")
+        self.calculated_kp_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ff00; "
+                                                  "background-color: #1a1a1a; padding: 8px; border-radius: 4px;"))
         preview_layout.addWidget(self.calculated_kp_display, 0, 3)
         
         preview_group.setLayout(preview_layout)
@@ -756,8 +896,8 @@ class SpeedAdaptivePanel(QWidget):
         
         principle_text = QTextEdit()
         principle_text.setReadOnly(True)
-        principle_text.setMaximumHeight(180)
-        principle_text.setStyleSheet("font-size: 12px; background-color: #2b2b2b; color: #d4d4d4; padding: 8px;")
+        principle_text.setMaximumHeight(sp(180))
+        principle_text.setStyleSheet(SS("font-size: 12px; background-color: #2b2b2b; color: #d4d4d4; padding: 8px;"))
         principle_text.setHtml("""
         <b style="color: #00ff00;">增益调度算法 (Gain Scheduling):</b><br><br>
         <code style="color: #ffaa00;">
@@ -781,10 +921,10 @@ class SpeedAdaptivePanel(QWidget):
     
     def create_display_label(self, text):
         label = QLabel(text)
-        label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00ff00; "
-                          "background-color: #2b2b2b; padding: 5px;")
+        label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #00ff00; "
+                          "background-color: #2b2b2b; padding: 5px;"))
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumWidth(80)
+        label.setMinimumWidth(sp(80))
         return label
     
     def update_kp_preview(self):
@@ -896,10 +1036,10 @@ class LegControlPanel(QWidget):
         
         # ===== 警告提示 =====
         warning_label = QLabel("⚠️ 重要: 必须先在【平衡控制】面板执行【初始化平衡系统】才能使用腿部控制!")
-        warning_label.setStyleSheet(
+        warning_label.setStyleSheet(SS(
             "background-color: #ff9800; color: black; padding: 8px; "
             "border-radius: 4px; font-weight: bold;"
-        )
+        ))
         warning_label.setWordWrap(True)
         layout.addWidget(warning_label)
         
@@ -908,18 +1048,18 @@ class LegControlPanel(QWidget):
         enable_layout = QHBoxLayout()
         
         self.leg_status = QLabel("状态: 未知")
-        self.leg_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.leg_status.setStyleSheet(SS("font-size: 14px; font-weight: bold;"))
         enable_layout.addWidget(self.leg_status)
         
         enable_layout.addStretch()
         
         self.leg_on_btn = QPushButton("✅ 使能腿部")
-        self.leg_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
+        self.leg_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 20px;"))
         self.leg_on_btn.clicked.connect(lambda: self.send_leg_cmd("on"))
         enable_layout.addWidget(self.leg_on_btn)
         
         self.leg_off_btn = QPushButton("❌ 禁用腿部")
-        self.leg_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
+        self.leg_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 20px;"))
         self.leg_off_btn.clicked.connect(lambda: self.send_leg_cmd("off"))
         enable_layout.addWidget(self.leg_off_btn)
         
@@ -942,7 +1082,7 @@ class LegControlPanel(QWidget):
         self.leg_min_input.setValue(self.leg_length_min)
         self.leg_min_input.setDecimals(3)
         self.leg_min_input.setSingleStep(0.005)
-        self.leg_min_input.setStyleSheet("font-size: 12px; padding: 3px;")
+        self.leg_min_input.setStyleSheet(SS("font-size: 12px; padding: 3px;"))
         self.leg_min_input.valueChanged.connect(self.on_leg_range_changed)
         range_layout.addWidget(self.leg_min_input, 0, 1)
         
@@ -953,13 +1093,13 @@ class LegControlPanel(QWidget):
         self.leg_max_input.setValue(self.leg_length_max)
         self.leg_max_input.setDecimals(3)
         self.leg_max_input.setSingleStep(0.005)
-        self.leg_max_input.setStyleSheet("font-size: 12px; padding: 3px;")
+        self.leg_max_input.setStyleSheet(SS("font-size: 12px; padding: 3px;"))
         self.leg_max_input.valueChanged.connect(self.on_leg_range_changed)
         range_layout.addWidget(self.leg_max_input, 0, 3)
         
         # 发送到ESP32按钮
         self.send_range_btn = QPushButton("📤 发送到ESP32")
-        self.send_range_btn.setStyleSheet("background-color: #9C27B0; color: white; padding: 5px 15px;")
+        self.send_range_btn.setStyleSheet(SS("background-color: #9C27B0; color: white; padding: 5px 15px;"))
         self.send_range_btn.clicked.connect(self.send_leg_range_to_esp)
         range_layout.addWidget(self.send_range_btn, 0, 4)
         
@@ -971,78 +1111,146 @@ class LegControlPanel(QWidget):
         
         # 说明标签
         range_hint = QLabel("💡 修改范围后会自动更新下方滑块，发送到ESP32可同步设备端限制")
-        range_hint.setStyleSheet("font-size: 10px; color: #888;")
+        range_hint.setStyleSheet(SS("font-size: 10px; color: #888;"))
         range_layout.addWidget(range_hint, 1, 0, 1, 6)
         
         range_group.setLayout(range_layout)
         layout.addWidget(range_group)
         
-        # ===== 运动学控制 (腿长 + 身体夹角) =====
-        kin_group = QGroupBox("📐 运动学控制 (腿长 + 身体夹角)")
+        # ===== 运动学控制 (腿长 + 身体夹角 / 笛卡尔) =====
+        kin_group = QGroupBox("📐 运动学控制")
         kin_layout = QGridLayout()
         kin_layout.setSpacing(10)
         
+        # 内部标志: 防止循环更新 (在创建控件前初始化)
+        self._updating_coord = False
+        
+        # 坐标系选择
+        coord_label = QLabel("坐标系:")
+        coord_label.setStyleSheet(SS("font-weight: bold;"))
+        kin_layout.addWidget(coord_label, 0, 0)
+        
+        from PyQt5.QtWidgets import QButtonGroup, QRadioButton
+        self.coord_polar_radio = QRadioButton("极坐标 (L, α)")
+        self.coord_cart_radio = QRadioButton("笛卡尔 (x, y)")
+        self.coord_polar_radio.setChecked(True)
+        self.coord_polar_radio.toggled.connect(self.on_coord_mode_changed)
+        coord_btn_group = QButtonGroup(self)
+        coord_btn_group.addButton(self.coord_polar_radio)
+        coord_btn_group.addButton(self.coord_cart_radio)
+        kin_layout.addWidget(self.coord_polar_radio, 0, 1)
+        kin_layout.addWidget(self.coord_cart_radio, 0, 2, 1, 2)
+        
+        # --- 极坐标控件 ---
         # 腿长设置
-        kin_layout.addWidget(QLabel("腿长 (m):"), 0, 0)
+        self.polar_label_L = QLabel("腿长 (m):")
+        kin_layout.addWidget(self.polar_label_L, 1, 0)
         self.leg_length_input = QDoubleSpinBox()
         self.leg_length_input.setRange(self.leg_length_min, self.leg_length_max)
         self.leg_length_input.setValue(0.15)
         self.leg_length_input.setDecimals(3)
         self.leg_length_input.setSingleStep(0.005)
-        self.leg_length_input.setStyleSheet("font-size: 14px; padding: 5px;")
-        self.leg_length_input.valueChanged.connect(self.update_ik_preview)
-        kin_layout.addWidget(self.leg_length_input, 0, 1)
+        self.leg_length_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        self.leg_length_input.valueChanged.connect(self.on_polar_changed)
+        kin_layout.addWidget(self.leg_length_input, 1, 1)
         
-        # 腿长滑块
         self.leg_length_slider = QSlider(Qt.Horizontal)
         self.leg_length_slider.setRange(int(self.leg_length_min * 1000), int(self.leg_length_max * 1000))
         self.leg_length_slider.setValue(150)
         self.leg_length_slider.valueChanged.connect(lambda v: self.leg_length_input.setValue(v / 1000.0))
         self.leg_length_input.valueChanged.connect(lambda v: self.leg_length_slider.setValue(int(v * 1000)))
-        kin_layout.addWidget(self.leg_length_slider, 0, 2, 1, 2)
+        kin_layout.addWidget(self.leg_length_slider, 1, 2, 1, 2)
         
         # 身体夹角设置
-        kin_layout.addWidget(QLabel("身体夹角 (°):"), 1, 0)
+        self.polar_label_alpha = QLabel("身体夹角 (°):")
+        kin_layout.addWidget(self.polar_label_alpha, 2, 0)
         self.body_angle_input = QDoubleSpinBox()
         self.body_angle_input.setRange(self.LEG_BODY_ANGLE_MIN, self.LEG_BODY_ANGLE_MAX)
-        self.body_angle_input.setValue(-90)  # 默认垂直向下
+        self.body_angle_input.setValue(-90)
         self.body_angle_input.setDecimals(1)
         self.body_angle_input.setSingleStep(1)
-        self.body_angle_input.setStyleSheet("font-size: 14px; padding: 5px;")
-        self.body_angle_input.valueChanged.connect(self.update_ik_preview)
-        kin_layout.addWidget(self.body_angle_input, 1, 1)
+        self.body_angle_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        self.body_angle_input.valueChanged.connect(self.on_polar_changed)
+        kin_layout.addWidget(self.body_angle_input, 2, 1)
         
-        # 身体夹角滑块
         self.body_angle_slider = QSlider(Qt.Horizontal)
         self.body_angle_slider.setRange(int(self.LEG_BODY_ANGLE_MIN), int(self.LEG_BODY_ANGLE_MAX))
-        self.body_angle_slider.setValue(-90)  # 默认垂直向下
+        self.body_angle_slider.setValue(-90)
         self.body_angle_slider.valueChanged.connect(lambda v: self.body_angle_input.setValue(v))
         self.body_angle_input.valueChanged.connect(lambda v: self.body_angle_slider.setValue(int(v)))
-        kin_layout.addWidget(self.body_angle_slider, 1, 2, 1, 2)
+        kin_layout.addWidget(self.body_angle_slider, 2, 2, 1, 2)
+        
+        # --- 笛卡尔控件 (初始隐藏) ---
+        self.cart_label_x = QLabel("x 水平 (m):")
+        kin_layout.addWidget(self.cart_label_x, 3, 0)
+        self.cart_x_input = QDoubleSpinBox()
+        self.cart_x_input.setRange(-0.17, 0.17)
+        self.cart_x_input.setValue(0.0)
+        self.cart_x_input.setDecimals(4)
+        self.cart_x_input.setSingleStep(0.005)
+        self.cart_x_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        self.cart_x_input.valueChanged.connect(self.on_cart_changed)
+        kin_layout.addWidget(self.cart_x_input, 3, 1)
+        
+        self.cart_x_slider = QSlider(Qt.Horizontal)
+        self.cart_x_slider.setRange(-170, 170)
+        self.cart_x_slider.setValue(0)
+        self.cart_x_slider.valueChanged.connect(lambda v: self.cart_x_input.setValue(v / 1000.0))
+        self.cart_x_input.valueChanged.connect(lambda v: self.cart_x_slider.setValue(int(v * 1000)))
+        kin_layout.addWidget(self.cart_x_slider, 3, 2, 1, 2)
+        
+        self.cart_label_y = QLabel("y 垂直 (m):")
+        kin_layout.addWidget(self.cart_label_y, 4, 0)
+        self.cart_y_input = QDoubleSpinBox()
+        self.cart_y_input.setRange(-0.17, 0.0)
+        self.cart_y_input.setValue(-0.15)
+        self.cart_y_input.setDecimals(4)
+        self.cart_y_input.setSingleStep(0.005)
+        self.cart_y_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        self.cart_y_input.valueChanged.connect(self.on_cart_changed)
+        kin_layout.addWidget(self.cart_y_input, 4, 1)
+        
+        self.cart_y_slider = QSlider(Qt.Horizontal)
+        self.cart_y_slider.setRange(-170, 0)
+        self.cart_y_slider.setValue(-150)
+        self.cart_y_slider.valueChanged.connect(lambda v: self.cart_y_input.setValue(v / 1000.0))
+        self.cart_y_input.valueChanged.connect(lambda v: self.cart_y_slider.setValue(int(v * 1000)))
+        kin_layout.addWidget(self.cart_y_slider, 4, 2, 1, 2)
+        
+        # 笛卡尔控件初始隐藏
+        for w in [self.cart_label_x, self.cart_x_input, self.cart_x_slider,
+                  self.cart_label_y, self.cart_y_input, self.cart_y_slider]:
+            w.setVisible(False)
         
         # 目标选择
-        kin_layout.addWidget(QLabel("目标:"), 2, 0)
+        kin_layout.addWidget(QLabel("目标:"), 5, 0)
         self.target_combo = QComboBox()
         self.target_combo.addItems(["双腿 (both)", "仅左腿 (left)", "仅右腿 (right)"])
-        kin_layout.addWidget(self.target_combo, 2, 1)
+        kin_layout.addWidget(self.target_combo, 5, 1)
         
         # 发送按钮
         self.send_kin_btn = QPushButton("📤 发送运动学目标")
-        self.send_kin_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px; font-size: 14px;")
+        self.send_kin_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 10px; font-size: 14px;"))
         self.send_kin_btn.clicked.connect(self.send_kinematics_target)
-        kin_layout.addWidget(self.send_kin_btn, 2, 2, 1, 2)
+        kin_layout.addWidget(self.send_kin_btn, 5, 2, 1, 2)
         
         # IK 预览显示 - 电机角度
-        kin_layout.addWidget(QLabel("IK预览 (电机):"), 3, 0)
+        kin_layout.addWidget(QLabel("IK预览 (电机):"), 6, 0)
         self.ik_preview_label = QLabel("Hip: --, Knee: --")
-        self.ik_preview_label.setStyleSheet("font-size: 12px; color: #888; padding: 5px;")
-        kin_layout.addWidget(self.ik_preview_label, 3, 1, 1, 3)
+        self.ik_preview_label.setStyleSheet(SS("font-size: 12px; color: #888; padding: 5px;"))
+        kin_layout.addWidget(self.ik_preview_label, 6, 1, 1, 3)
         
         # IK 预览显示 - 运动学角度 theta1/theta2
-        kin_layout.addWidget(QLabel("IK预览 (θ1,θ2):"), 4, 0)
+        kin_layout.addWidget(QLabel("IK预览 (θ1,θ2):"), 7, 0)
         self.ik_theta_label = QLabel("θ1: --, θ2: --")
-        self.ik_theta_label.setStyleSheet("font-size: 12px; color: #00ccff; padding: 5px; font-weight: bold;")
-        kin_layout.addWidget(self.ik_theta_label, 4, 1, 1, 3)
+        self.ik_theta_label.setStyleSheet(SS("font-size: 12px; color: #00ccff; padding: 5px; font-weight: bold;"))
+        kin_layout.addWidget(self.ik_theta_label, 7, 1, 1, 3)
+        
+        # 坐标换算显示
+        kin_layout.addWidget(QLabel("坐标换算:"), 8, 0)
+        self.coord_convert_label = QLabel("L=0.150m, α=-90.0° ↔ x=0.0000m, y=-0.1500m")
+        self.coord_convert_label.setStyleSheet(SS("font-size: 12px; color: #aaffaa; padding: 5px;"))
+        kin_layout.addWidget(self.coord_convert_label, 8, 1, 1, 3)
         
         kin_group.setLayout(kin_layout)
         layout.addWidget(kin_group)
@@ -1059,7 +1267,7 @@ class LegControlPanel(QWidget):
         self.left_hip_input.setValue(-105)  # 默认站立
         self.left_hip_input.setDecimals(1)
         self.left_hip_input.setSingleStep(5)
-        self.left_hip_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.left_hip_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         angle_layout.addWidget(self.left_hip_input, 0, 1)
         
         angle_layout.addWidget(QLabel("左膝 (L_Knee):"), 1, 0)
@@ -1068,7 +1276,7 @@ class LegControlPanel(QWidget):
         self.left_knee_input.setValue(60)  # 默认站立
         self.left_knee_input.setDecimals(1)
         self.left_knee_input.setSingleStep(5)
-        self.left_knee_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.left_knee_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         angle_layout.addWidget(self.left_knee_input, 1, 1)
         
         # 右腿
@@ -1078,7 +1286,7 @@ class LegControlPanel(QWidget):
         self.right_hip_input.setValue(105)  # 右腿镜像
         self.right_hip_input.setDecimals(1)
         self.right_hip_input.setSingleStep(5)
-        self.right_hip_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.right_hip_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         angle_layout.addWidget(self.right_hip_input, 0, 3)
         
         angle_layout.addWidget(QLabel("右膝 (R_Knee):"), 1, 2)
@@ -1087,7 +1295,7 @@ class LegControlPanel(QWidget):
         self.right_knee_input.setValue(-60)  # 右腿镜像
         self.right_knee_input.setDecimals(1)
         self.right_knee_input.setSingleStep(5)
-        self.right_knee_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.right_knee_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         angle_layout.addWidget(self.right_knee_input, 1, 3)
         
         # 同步选项
@@ -1103,7 +1311,7 @@ class LegControlPanel(QWidget):
         
         # 发送角度按钮
         self.send_angle_btn = QPushButton("📤 发送电机角度")
-        self.send_angle_btn.setStyleSheet("background-color: #FF9800; color: white; padding: 10px; font-size: 14px;")
+        self.send_angle_btn.setStyleSheet(SS("background-color: #FF9800; color: white; padding: 10px; font-size: 14px;"))
         self.send_angle_btn.clicked.connect(self.send_leg_angles)
         angle_layout.addWidget(self.send_angle_btn, 2, 2, 1, 2)
         
@@ -1120,7 +1328,7 @@ class LegControlPanel(QWidget):
         self.leg_speed_input.setValue(50)
         self.leg_speed_input.setDecimals(0)
         self.leg_speed_input.setSingleStep(10)
-        self.leg_speed_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.leg_speed_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         speed_layout.addWidget(self.leg_speed_input)
         
         self.set_speed_btn = QPushButton("设置速度")
@@ -1147,7 +1355,7 @@ class LegControlPanel(QWidget):
         
         for i, (name, length, angle) in enumerate(kin_presets):
             btn = QPushButton(f"{name}\n({length}m, {angle}°)")
-            btn.setStyleSheet("padding: 8px;")
+            btn.setStyleSheet(SS("padding: 8px;"))
             btn.clicked.connect(lambda checked, l=length, a=angle: self.apply_kin_preset(l, a))
             preset_layout.addWidget(btn, i // 3, i % 3)
         
@@ -1212,7 +1420,7 @@ class LegControlPanel(QWidget):
         
         # 测试结果显示
         self.test_result_label = QLabel("测试结果: --")
-        self.test_result_label.setStyleSheet("font-size: 12px; color: #00ff00; background-color: #1a1a2e; padding: 8px;")
+        self.test_result_label.setStyleSheet(SS("font-size: 12px; color: #00ff00; background-color: #1a1a2e; padding: 8px;"))
         test_layout.addWidget(self.test_result_label)
         
         test_group.setLayout(test_layout)
@@ -1263,6 +1471,18 @@ class LegControlPanel(QWidget):
         self.right_theta2_label = self.create_state_label("#ffcc00")
         state_layout.addWidget(self.right_theta2_label, 6, 2)
         
+        state_layout.addWidget(QLabel("x 水平 (m):"), 7, 0)
+        self.left_x_label = self.create_state_label("#aaffaa")
+        state_layout.addWidget(self.left_x_label, 7, 1)
+        self.right_x_label = self.create_state_label("#aaffaa")
+        state_layout.addWidget(self.right_x_label, 7, 2)
+        
+        state_layout.addWidget(QLabel("y 垂直 (m):"), 8, 0)
+        self.left_y_label = self.create_state_label("#aaffaa")
+        state_layout.addWidget(self.left_y_label, 8, 1)
+        self.right_y_label = self.create_state_label("#aaffaa")
+        state_layout.addWidget(self.right_y_label, 8, 2)
+        
         state_group.setLayout(state_layout)
         layout.addWidget(state_group)
         
@@ -1274,10 +1494,10 @@ class LegControlPanel(QWidget):
     def create_state_label(self, color="#00ccff"):
         """创建状态显示标签"""
         label = QLabel("--")
-        label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {color}; "
-                          "background-color: #1a1a2e; padding: 5px; border-radius: 3px;")
+        label.setStyleSheet(SS(f"font-size: 14px; font-weight: bold; color: {color}; "
+                          "background-color: #1a1a2e; padding: 5px; border-radius: 3px;"))
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumWidth(80)
+        label.setMinimumWidth(sp(80))
         return label
     
     def on_leg_range_changed(self):
@@ -1327,6 +1547,68 @@ class LegControlPanel(QWidget):
         else:
             self.log_message(f"❌ 无法发送命令，请先连接串口")
     
+    def on_coord_mode_changed(self, checked):
+        """坐标系模式切换"""
+        polar_mode = self.coord_polar_radio.isChecked()
+        # 切换极坐标控件显示
+        for w in [self.polar_label_L, self.leg_length_input, self.leg_length_slider,
+                  self.polar_label_alpha, self.body_angle_input, self.body_angle_slider]:
+            w.setVisible(polar_mode)
+        # 切换笛卡尔控件显示
+        for w in [self.cart_label_x, self.cart_x_input, self.cart_x_slider,
+                  self.cart_label_y, self.cart_y_input, self.cart_y_slider]:
+            w.setVisible(not polar_mode)
+        # 切换时同步一次
+        if polar_mode:
+            self.on_cart_changed()  # cart → polar 一次性同步
+        else:
+            self.on_polar_changed()  # polar → cart 一次性同步
+
+    def on_polar_changed(self):
+        """极坐标值改变 → 同步笛卡尔 + 更新预览"""
+        import math
+        if self._updating_coord:
+            return
+        self._updating_coord = True
+        try:
+            L = self.leg_length_input.value()
+            alpha_deg = self.body_angle_input.value()
+            alpha_rad = math.radians(alpha_deg)
+            x = L * math.cos(alpha_rad)
+            y = L * math.sin(alpha_rad)
+            self.cart_x_input.setValue(x)
+            self.cart_y_input.setValue(y)
+            self.coord_convert_label.setText(
+                f"L={L:.3f}m, α={alpha_deg:.1f}° → x={x:.4f}m, y={y:.4f}m")
+        finally:
+            self._updating_coord = False
+        self.update_ik_preview()
+
+    def on_cart_changed(self):
+        """笛卡尔值改变 → 同步极坐标 + 更新预览"""
+        import math
+        if self._updating_coord:
+            return
+        self._updating_coord = True
+        try:
+            x = self.cart_x_input.value()
+            y = self.cart_y_input.value()
+            L = math.sqrt(x * x + y * y)
+            if L < 1e-6:
+                L = 0.001
+            alpha_rad = math.atan2(y, x)
+            alpha_deg = math.degrees(alpha_rad)
+            # 限制到极坐标范围
+            L = max(self.leg_length_min, min(self.leg_length_max, L))
+            alpha_deg = max(self.LEG_BODY_ANGLE_MIN, min(self.LEG_BODY_ANGLE_MAX, alpha_deg))
+            self.leg_length_input.setValue(L)
+            self.body_angle_input.setValue(alpha_deg)
+            self.coord_convert_label.setText(
+                f"x={x:.4f}m, y={y:.4f}m → L={L:.3f}m, α={alpha_deg:.1f}°")
+        finally:
+            self._updating_coord = False
+        self.update_ik_preview()
+
     def update_ik_preview(self):
         """更新逆运动学预览 (本地计算) - 与 C 代码 leg_kinematics.c 保持一致"""
         import math
@@ -1342,7 +1624,7 @@ class LegControlPanel(QWidget):
         L_max = L1 + L2 - 0.001
         if length < L_min or length > L_max:
             self.ik_preview_label.setText("⚠️ 目标不可达!")
-            self.ik_preview_label.setStyleSheet("font-size: 12px; color: #ff4444; padding: 5px;")
+            self.ik_preview_label.setStyleSheet(SS("font-size: 12px; color: #ff4444; padding: 5px;"))
             self.ik_theta_label.setText("θ1: --, θ2: --")
             return
         
@@ -1378,11 +1660,11 @@ class LegControlPanel(QWidget):
             f"左腿: Hip={hip_motor:.1f}°, Knee={knee_motor:.1f}° | "
             f"右腿: Hip={right_hip_motor:.1f}°, Knee={right_knee_motor:.1f}°"
         )
-        self.ik_preview_label.setStyleSheet("font-size: 12px; color: #888; padding: 5px;")
+        self.ik_preview_label.setStyleSheet(SS("font-size: 12px; color: #888; padding: 5px;"))
         
         # 显示 theta1/theta2 (运动学角度)
         self.ik_theta_label.setText(f"θ1={theta1_deg:.1f}° (大腿), θ2={theta2_deg:.1f}° (膝关节, 0=伸直, 负=弯曲)")
-        self.ik_theta_label.setStyleSheet("font-size: 12px; color: #00ccff; padding: 5px; font-weight: bold;")
+        self.ik_theta_label.setStyleSheet(SS("font-size: 12px; color: #00ccff; padding: 5px; font-weight: bold;"))
     
     def on_sync_toggled(self, checked):
         if checked:
@@ -1422,10 +1704,10 @@ class LegControlPanel(QWidget):
             self.parent_window.log(f"发送: {cmd}")
             if state == "on":
                 self.leg_status.setText("状态: 已使能")
-                self.leg_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+                self.leg_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
             elif state == "off":
                 self.leg_status.setText("状态: 已禁用")
-                self.leg_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
+                self.leg_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #f44336;"))
     
     def send_kinematics_target(self):
         """发送运动学目标"""
@@ -1538,6 +1820,14 @@ class LegControlPanel(QWidget):
             theta2 = knee_motor - left_knee_offset
             self.left_theta1_label.setText(f"{theta1:.1f}")
             self.left_theta2_label.setText(f"{theta2:.1f}")
+            
+            # 计算笛卡尔坐标 x = L*cos(α), y = L*sin(α)
+            import math
+            L = left_state.get('length', 0)
+            alpha_deg = left_state.get('angle', 0)
+            alpha_rad = math.radians(alpha_deg)
+            self.left_x_label.setText(f"{L * math.cos(alpha_rad):.4f}")
+            self.left_y_label.setText(f"{L * math.sin(alpha_rad):.4f}")
         
         if right_state:
             self.right_length_label.setText(f"{right_state.get('length', 0):.3f}")
@@ -1553,14 +1843,22 @@ class LegControlPanel(QWidget):
             theta2 = -(knee_motor - right_knee_offset)
             self.right_theta1_label.setText(f"{theta1:.1f}")
             self.right_theta2_label.setText(f"{theta2:.1f}")
+            
+            # 计算笛卡尔坐标 x = L*cos(α), y = L*sin(α)
+            import math
+            L = right_state.get('length', 0)
+            alpha_deg = right_state.get('angle', 0)
+            alpha_rad = math.radians(alpha_deg)
+            self.right_x_label.setText(f"{L * math.cos(alpha_rad):.4f}")
+            self.right_y_label.setText(f"{L * math.sin(alpha_rad):.4f}")
     
     def update_test_result(self, result_text):
         """更新测试结果显示"""
         self.test_result_label.setText(result_text)
         if "failed" in result_text.lower() or "error" in result_text.lower():
-            self.test_result_label.setStyleSheet("font-size: 12px; color: #ff4444; background-color: #1a1a2e; padding: 8px;")
+            self.test_result_label.setStyleSheet(SS("font-size: 12px; color: #ff4444; background-color: #1a1a2e; padding: 8px;"))
         else:
-            self.test_result_label.setStyleSheet("font-size: 12px; color: #00ff00; background-color: #1a1a2e; padding: 8px;")
+            self.test_result_label.setStyleSheet(SS("font-size: 12px; color: #00ff00; background-color: #1a1a2e; padding: 8px;"))
 
 
 # ============================================================================
@@ -1591,8 +1889,8 @@ class MotorControlPanel(QWidget):
         top_layout.addWidget(self.enable_all_btn)
         
         self.stop_all_btn = QPushButton("🛑 停止全部")
-        self.stop_all_btn.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold;")
-        self.stop_all_btn.clicked.connect(lambda: self.send_cmd("stop all"))
+        self.stop_all_btn.setStyleSheet(SS("background-color: #ff4444; color: white; font-weight: bold;"))
+        self.stop_all_btn.clicked.connect(self._stop_all_motors)
         top_layout.addWidget(self.stop_all_btn)
         
         self.read_all_btn = QPushButton("📊 读取全部")
@@ -1679,7 +1977,7 @@ class MotorControlPanel(QWidget):
         
         for col, header in enumerate(["ID", "位置(°)", "速度", "电流(A)", "状态"]):
             label = QLabel(header)
-            label.setStyleSheet("font-weight: bold;")
+            label.setStyleSheet(SS("font-weight: bold;"))
             status_layout.addWidget(label, 0, col)
         
         self.status_labels = {}
@@ -1700,6 +1998,13 @@ class MotorControlPanel(QWidget):
     def send_cmd(self, cmd):
         if self.parent_window and self.parent_window.is_connected():
             self.parent_window.send_command(cmd)
+    
+    def _stop_all_motors(self):
+        """先禁用平衡控制，再停止所有电机，确保控制循环不会覆盖停止命令"""
+        self.send_cmd("balance disable")
+        # 短延时后发送停止命令，确保 disable 先被处理
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(50, lambda: self.send_cmd("stop all"))
     
     def send_motor_cmd(self, action):
         self.send_cmd(f"{action} {self.get_motor_id()}")
@@ -1727,7 +2032,7 @@ class MotorControlPanel(QWidget):
             status_text = "在线" if online else "离线"
             color = "green" if online else "red"
             self.status_labels[motor_id]['status'].setText(status_text)
-            self.status_labels[motor_id]['status'].setStyleSheet(f"color: {color}; font-weight: bold;")
+            self.status_labels[motor_id]['status'].setStyleSheet(SS(f"color: {color}; font-weight: bold;"))
 
 
 # ============================================================================
@@ -1749,7 +2054,7 @@ class IMUControlPanel(QWidget):
         init_layout = QHBoxLayout()
         
         self.init_btn = QPushButton("📡 初始化 IMU")
-        self.init_btn.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.init_btn.setStyleSheet(SS("font-size: 14px; padding: 10px;"))
         self.init_btn.clicked.connect(lambda: self.send_cmd("imu init"))
         init_layout.addWidget(self.init_btn)
         
@@ -1769,7 +2074,7 @@ class IMUControlPanel(QWidget):
         read_layout = QHBoxLayout()
         
         self.start_btn = QPushButton("▶ 开始连续读取")
-        self.start_btn.setStyleSheet("background-color: #44aa44; color: white;")
+        self.start_btn.setStyleSheet(SS("background-color: #44aa44; color: white;"))
         self.start_btn.clicked.connect(lambda: self.send_cmd("imu start"))
         read_layout.addWidget(self.start_btn)
         
@@ -1860,10 +2165,10 @@ class IMUControlPanel(QWidget):
     
     def create_data_label(self):
         label = QLabel("--")
-        label.setStyleSheet("font-size: 16px; font-weight: bold; color: #00ccff; "
-                          "background-color: #1a1a2e; padding: 8px; border-radius: 4px;")
+        label.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ccff; "
+                          "background-color: #1a1a2e; padding: 8px; border-radius: 4px;"))
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumWidth(100)
+        label.setMinimumWidth(sp(100))
         return label
     
     def send_cmd(self, cmd):
@@ -1906,18 +2211,18 @@ class BalanceControlPanel(QWidget):
         
         btn_layout = QHBoxLayout()
         self.init_btn = QPushButton("🚀 初始化平衡系统 (balance init)")
-        self.init_btn.setStyleSheet("font-size: 16px; padding: 15px; background-color: #4488ff;")
+        self.init_btn.setStyleSheet(SS("font-size: 16px; padding: 15px; background-color: #4488ff;"))
         self.init_btn.clicked.connect(self.do_balance_init)
         btn_layout.addWidget(self.init_btn)
         
         self.init_status = QLabel("未初始化")
-        self.init_status.setStyleSheet("font-size: 14px; color: gray;")
+        self.init_status.setStyleSheet(SS("font-size: 14px; color: gray;"))
         btn_layout.addWidget(self.init_status)
         
         init_layout.addLayout(btn_layout)
         
         note_label = QLabel("⚠️ 注意: 必须先初始化才能使用平衡控制和 PID 调参功能")
-        note_label.setStyleSheet("color: orange;")
+        note_label.setStyleSheet(SS("color: orange;"))
         init_layout.addWidget(note_label)
         
         init_group.setLayout(init_layout)
@@ -1928,12 +2233,12 @@ class BalanceControlPanel(QWidget):
         run_layout = QHBoxLayout()
         
         self.start_btn = QPushButton("▶ 启动 (balance start)")
-        self.start_btn.setStyleSheet("font-size: 14px; padding: 10px; background-color: #44aa44;")
+        self.start_btn.setStyleSheet(SS("font-size: 14px; padding: 10px; background-color: #44aa44;"))
         self.start_btn.clicked.connect(lambda: self.send_cmd("balance start"))
         run_layout.addWidget(self.start_btn)
         
         self.stop_btn = QPushButton("⏹ 停止 (balance stop)")
-        self.stop_btn.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.stop_btn.setStyleSheet(SS("font-size: 14px; padding: 10px;"))
         self.stop_btn.clicked.connect(lambda: self.send_cmd("balance stop"))
         run_layout.addWidget(self.stop_btn)
         
@@ -1949,7 +2254,7 @@ class BalanceControlPanel(QWidget):
         enable_layout = QHBoxLayout()
         
         self.enable_btn = QPushButton("✅ 使能平衡")
-        self.enable_btn.setStyleSheet("font-size: 14px; padding: 10px; background-color: #44aa44;")
+        self.enable_btn.setStyleSheet(SS("font-size: 14px; padding: 10px; background-color: #44aa44;"))
         self.enable_btn.clicked.connect(lambda: self.send_cmd("balance enable"))
         enable_layout.addWidget(self.enable_btn)
         
@@ -1958,7 +2263,7 @@ class BalanceControlPanel(QWidget):
         enable_layout.addWidget(self.disable_btn)
         
         self.estop_btn = QPushButton("🛑 紧急停止")
-        self.estop_btn.setStyleSheet("font-size: 14px; padding: 10px; background-color: #ff4444; color: white; font-weight: bold;")
+        self.estop_btn.setStyleSheet(SS("font-size: 14px; padding: 10px; background-color: #ff4444; color: white; font-weight: bold;"))
         self.estop_btn.clicked.connect(lambda: self.send_cmd("balance estop"))
         enable_layout.addWidget(self.estop_btn)
         
@@ -1974,18 +2279,18 @@ class BalanceControlPanel(QWidget):
         roll_layout = QHBoxLayout()
         
         self.roll_status = QLabel("状态: 未知")
-        self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.roll_status.setStyleSheet(SS("font-size: 14px; font-weight: bold;"))
         roll_layout.addWidget(self.roll_status)
         
         roll_layout.addStretch()
         
         self.roll_on_btn = QPushButton("✅ 开启 Roll")
-        self.roll_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
+        self.roll_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 20px;"))
         self.roll_on_btn.clicked.connect(lambda: self.send_roll_cmd("on"))
         roll_layout.addWidget(self.roll_on_btn)
         
         self.roll_off_btn = QPushButton("❌ 关闭 Roll")
-        self.roll_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
+        self.roll_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 20px;"))
         self.roll_off_btn.clicked.connect(lambda: self.send_roll_cmd("off"))
         roll_layout.addWidget(self.roll_off_btn)
         
@@ -2001,23 +2306,105 @@ class BalanceControlPanel(QWidget):
         pitch_comp_layout = QHBoxLayout()
         
         self.pitch_comp_status = QLabel("状态: 未知")
-        self.pitch_comp_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.pitch_comp_status.setStyleSheet(SS("font-size: 14px; font-weight: bold;"))
         pitch_comp_layout.addWidget(self.pitch_comp_status)
         
         pitch_comp_layout.addStretch()
         
         self.pitch_comp_on_btn = QPushButton("✅ 开启 PitchComp")
-        self.pitch_comp_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 20px;")
+        self.pitch_comp_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 20px;"))
         self.pitch_comp_on_btn.clicked.connect(lambda: self.send_pitch_comp_cmd("on"))
         pitch_comp_layout.addWidget(self.pitch_comp_on_btn)
         
         self.pitch_comp_off_btn = QPushButton("❌ 关闭 PitchComp")
-        self.pitch_comp_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 20px;")
+        self.pitch_comp_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 20px;"))
         self.pitch_comp_off_btn.clicked.connect(lambda: self.send_pitch_comp_cmd("off"))
         pitch_comp_layout.addWidget(self.pitch_comp_off_btn)
         
         pitch_comp_group.setLayout(pitch_comp_layout)
         layout.addWidget(pitch_comp_group)
+        
+        # X-Offset 腿部速度自适应偏移
+        xoffset_group = QGroupBox("🦶 X-Offset 腿部速度自适应偏移")
+        xoffset_layout = QVBoxLayout()
+        
+        # 第一行: 状态 + 开关
+        xoff_ctrl_layout = QHBoxLayout()
+        
+        self.xoffset_status = QLabel("状态: 未知")
+        self.xoffset_status.setStyleSheet(SS("font-size: 14px; font-weight: bold;"))
+        xoff_ctrl_layout.addWidget(self.xoffset_status)
+        
+        xoff_ctrl_layout.addStretch()
+        
+        self.xoffset_on_btn = QPushButton("✅ 开启 XOffset")
+        self.xoffset_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 20px;"))
+        self.xoffset_on_btn.clicked.connect(lambda: self.send_xoffset_cmd("on"))
+        xoff_ctrl_layout.addWidget(self.xoffset_on_btn)
+        
+        self.xoffset_off_btn = QPushButton("❌ 关闭 XOffset")
+        self.xoffset_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 20px;"))
+        self.xoffset_off_btn.clicked.connect(lambda: self.send_xoffset_cmd("off"))
+        xoff_ctrl_layout.addWidget(self.xoffset_off_btn)
+        
+        self.xoffset_query_btn = QPushButton("📊 状态")
+        self.xoffset_query_btn.clicked.connect(lambda: self.send_cmd("balance xoffset"))
+        xoff_ctrl_layout.addWidget(self.xoffset_query_btn)
+        
+        xoffset_layout.addLayout(xoff_ctrl_layout)
+        
+        # 第二行: PID 参数
+        xoff_pid_layout = QGridLayout()
+        xoff_pid_layout.setSpacing(6)
+        
+        xoff_pid_layout.addWidget(QLabel("Kp:"), 0, 0)
+        self.xoffset_kp = QDoubleSpinBox()
+        self.xoffset_kp.setRange(0, 1.0)
+        self.xoffset_kp.setSingleStep(0.001)
+        self.xoffset_kp.setDecimals(4)
+        self.xoffset_kp.setValue(0.01)
+        xoff_pid_layout.addWidget(self.xoffset_kp, 0, 1)
+        
+        xoff_pid_layout.addWidget(QLabel("Ki:"), 0, 2)
+        self.xoffset_ki = QDoubleSpinBox()
+        self.xoffset_ki.setRange(0, 1.0)
+        self.xoffset_ki.setSingleStep(0.001)
+        self.xoffset_ki.setDecimals(4)
+        self.xoffset_ki.setValue(0.0)
+        xoff_pid_layout.addWidget(self.xoffset_ki, 0, 3)
+        
+        xoff_pid_layout.addWidget(QLabel("Kd:"), 0, 4)
+        self.xoffset_kd = QDoubleSpinBox()
+        self.xoffset_kd.setRange(0, 1.0)
+        self.xoffset_kd.setSingleStep(0.001)
+        self.xoffset_kd.setDecimals(4)
+        self.xoffset_kd.setValue(0.0)
+        xoff_pid_layout.addWidget(self.xoffset_kd, 0, 5)
+        
+        xoff_pid_layout.addWidget(QLabel("Limit(m):"), 0, 6)
+        self.xoffset_limit = QDoubleSpinBox()
+        self.xoffset_limit.setRange(0.001, 0.08)
+        self.xoffset_limit.setSingleStep(0.005)
+        self.xoffset_limit.setDecimals(3)
+        self.xoffset_limit.setValue(0.03)
+        xoff_pid_layout.addWidget(self.xoffset_limit, 0, 7)
+        
+        self.xoffset_apply_btn = QPushButton("📤 应用参数")
+        self.xoffset_apply_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 6px 16px;"))
+        self.xoffset_apply_btn.clicked.connect(self.apply_xoffset_params)
+        xoff_pid_layout.addWidget(self.xoffset_apply_btn, 0, 8)
+        
+        xoffset_layout.addLayout(xoff_pid_layout)
+        
+        # 第三行: 实时值显示
+        xoff_val_layout = QHBoxLayout()
+        self.xoffset_val_label = QLabel("x_offset: --- m | speed: --- m/s")
+        self.xoffset_val_label.setStyleSheet(SS("font-size: 12px; color: #aaa; background: #1a1a2e; padding: 4px; border-radius: 3px;"))
+        xoff_val_layout.addWidget(self.xoffset_val_label)
+        xoffset_layout.addLayout(xoff_val_layout)
+        
+        xoffset_group.setLayout(xoffset_layout)
+        layout.addWidget(xoffset_group)
         
         # 角度零点设置
         zero_group = QGroupBox("角度零点设置")
@@ -2073,7 +2460,7 @@ class BalanceControlPanel(QWidget):
         
         # 说明标签
         loop_desc = QLabel("LQR控制环: A=角度环 B=角速度环 C=位移环 D=速度环 H=总输出 | Y=Yaw转向")
-        loop_desc.setStyleSheet("color: #888; font-size: 11px;")
+        loop_desc.setStyleSheet(SS("color: #888; font-size: 11px;"))
         loop_layout.addWidget(loop_desc)
         
         # 预设组合
@@ -2104,12 +2491,12 @@ class BalanceControlPanel(QWidget):
         # 分隔线
         line1 = QFrame()
         line1.setFrameShape(QFrame.HLine)
-        line1.setStyleSheet("color: #444;")
+        line1.setStyleSheet(SS("color: #444;"))
         loop_layout.addWidget(line1)
         
         # 各环路独立开关 - LQR 内环
         lqr_label = QLabel("LQR 平衡环 (Pitch):")
-        lqr_label.setStyleSheet("font-weight: bold;")
+        lqr_label.setStyleSheet(SS("font-weight: bold;"))
         loop_layout.addWidget(lqr_label)
         
         lqr_layout = QHBoxLayout()
@@ -2138,7 +2525,7 @@ class BalanceControlPanel(QWidget):
         # Yaw 转向控制 (独立于 LQR)
         yaw_layout = QHBoxLayout()
         yaw_label = QLabel("转向控制:")
-        yaw_label.setStyleSheet("font-weight: bold;")
+        yaw_label.setStyleSheet(SS("font-weight: bold;"))
         yaw_layout.addWidget(yaw_label)
         
         cb_yaw = QCheckBox("Y:Yaw转向")
@@ -2154,12 +2541,12 @@ class BalanceControlPanel(QWidget):
         # 分隔线
         line2 = QFrame()
         line2.setFrameShape(QFrame.HLine)
-        line2.setStyleSheet("color: #444;")
+        line2.setStyleSheet(SS("color: #444;"))
         loop_layout.addWidget(line2)
         
         # 增益精调 (高级)
         gain_label = QLabel("增益精调 (0.0-1.0):")
-        gain_label.setStyleSheet("font-size: 11px; color: #888;")
+        gain_label.setStyleSheet(SS("font-size: 11px; color: #888;"))
         loop_layout.addWidget(gain_label)
         
         gain_layout = QHBoxLayout()
@@ -2190,17 +2577,17 @@ class BalanceControlPanel(QWidget):
         
         status_layout.addWidget(QLabel("系统状态:"), 0, 0)
         self.sys_status_label = QLabel("未初始化")
-        self.sys_status_label.setStyleSheet("font-weight: bold; color: gray;")
+        self.sys_status_label.setStyleSheet(SS("font-weight: bold; color: gray;"))
         status_layout.addWidget(self.sys_status_label, 0, 1)
         
         status_layout.addWidget(QLabel("Pitch 角度:"), 1, 0)
         self.pitch_label = QLabel("--")
-        self.pitch_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ff00;")
+        self.pitch_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00ff00;"))
         status_layout.addWidget(self.pitch_label, 1, 1)
         
         status_layout.addWidget(QLabel("Roll 角度:"), 1, 2)
         self.roll_label = QLabel("--")
-        self.roll_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ff00;")
+        self.roll_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00ff00;"))
         status_layout.addWidget(self.roll_label, 1, 3)
         
         status_group.setLayout(status_layout)
@@ -2220,7 +2607,7 @@ class BalanceControlPanel(QWidget):
         freq_layout.addWidget(QLabel("IMU 读取:"), 1, 0)
         freq_layout.addWidget(QLabel("200 Hz"), 1, 1)
         self.freq_imu_label = QLabel("-- Hz")
-        self.freq_imu_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.freq_imu_label.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         freq_layout.addWidget(self.freq_imu_label, 1, 2)
         self.freq_imu_status = QLabel("--")
         freq_layout.addWidget(self.freq_imu_status, 1, 3)
@@ -2229,7 +2616,7 @@ class BalanceControlPanel(QWidget):
         freq_layout.addWidget(QLabel("平衡控制:"), 2, 0)
         freq_layout.addWidget(QLabel("200 Hz"), 2, 1)
         self.freq_ctrl_label = QLabel("-- Hz")
-        self.freq_ctrl_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.freq_ctrl_label.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         freq_layout.addWidget(self.freq_ctrl_label, 2, 2)
         self.freq_ctrl_status = QLabel("--")
         freq_layout.addWidget(self.freq_ctrl_status, 2, 3)
@@ -2238,7 +2625,7 @@ class BalanceControlPanel(QWidget):
         freq_layout.addWidget(QLabel("轮电机通信:"), 3, 0)
         freq_layout.addWidget(QLabel("200 Hz"), 3, 1)
         self.freq_motor_label = QLabel("-- Hz")
-        self.freq_motor_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.freq_motor_label.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         freq_layout.addWidget(self.freq_motor_label, 3, 2)
         self.freq_motor_status = QLabel("--")
         freq_layout.addWidget(self.freq_motor_status, 3, 3)
@@ -2247,7 +2634,7 @@ class BalanceControlPanel(QWidget):
         freq_layout.addWidget(QLabel("腿电机控制:"), 4, 0)
         freq_layout.addWidget(QLabel("20 Hz"), 4, 1)
         self.freq_leg_label = QLabel("-- Hz")
-        self.freq_leg_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.freq_leg_label.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         freq_layout.addWidget(self.freq_leg_label, 4, 2)
         self.freq_leg_status = QLabel("--")
         freq_layout.addWidget(self.freq_leg_status, 4, 3)
@@ -2277,13 +2664,13 @@ class BalanceControlPanel(QWidget):
         
         # ========== 延迟诊断面板 (紧凑版) ==========
         latency_group = QGroupBox("⏱️ 延迟诊断")
-        latency_group.setStyleSheet("QGroupBox { font-size: 11px; }")
+        latency_group.setStyleSheet(SS("QGroupBox { font-size: 11px; }"))
         latency_layout = QGridLayout()
         latency_layout.setSpacing(2)  # 减小间距
         
         # 小字号样式
-        small_label_style = "font-size: 10px;"
-        small_value_style = "font-size: 10px; font-weight: bold; color: #00ccff;"
+        small_label_style = SS("font-size: 10px;")
+        small_value_style = SS("font-size: 10px; font-weight: bold; color: #00ccff;")
         
         # 表头
         for col, text in enumerate(["延迟项", "us", "ms", "状态"]):
@@ -2335,16 +2722,16 @@ class BalanceControlPanel(QWidget):
         
         # 总延迟 (稍大字号)
         lbl = QLabel("📊 IMU总延迟:")
-        lbl.setStyleSheet("font-size: 11px; font-weight: bold;")
+        lbl.setStyleSheet(SS("font-size: 11px; font-weight: bold;"))
         latency_layout.addWidget(lbl, 4, 0)
         self.latency_total_us = QLabel("--")
-        self.latency_total_us.setStyleSheet("font-size: 12px; font-weight: bold; color: #ffcc00;")
+        self.latency_total_us.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #ffcc00;"))
         latency_layout.addWidget(self.latency_total_us, 4, 1)
         self.latency_total_ms = QLabel("--")
-        self.latency_total_ms.setStyleSheet("font-size: 12px; font-weight: bold; color: #ffcc00;")
+        self.latency_total_ms.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #ffcc00;"))
         latency_layout.addWidget(self.latency_total_ms, 4, 2)
         self.latency_total_status = QLabel("--")
-        self.latency_total_status.setStyleSheet("font-size: 10px; font-weight: bold;")
+        self.latency_total_status.setStyleSheet(SS("font-size: 10px; font-weight: bold;"))
         latency_layout.addWidget(self.latency_total_status, 4, 3)
         
         # 统计信息
@@ -2357,16 +2744,16 @@ class BalanceControlPanel(QWidget):
         
         # WiFi 延迟 (合并显示)
         lbl = QLabel("📶 WiFi延迟:")
-        lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #00aaff;")
+        lbl.setStyleSheet(SS("font-size: 11px; font-weight: bold; color: #00aaff;"))
         latency_layout.addWidget(lbl, 6, 0)
         self.wifi_latency_total_us = QLabel("--")
-        self.wifi_latency_total_us.setStyleSheet("font-size: 12px; font-weight: bold; color: #00ff88;")
+        self.wifi_latency_total_us.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #00ff88;"))
         latency_layout.addWidget(self.wifi_latency_total_us, 6, 1)
         self.wifi_latency_total_ms = QLabel("--")
-        self.wifi_latency_total_ms.setStyleSheet("font-size: 12px; color: #00ff88;")
+        self.wifi_latency_total_ms.setStyleSheet(SS("font-size: 12px; color: #00ff88;"))
         latency_layout.addWidget(self.wifi_latency_total_ms, 6, 2)
         self.wifi_latency_status = QLabel("--")
-        self.wifi_latency_status.setStyleSheet("font-size: 10px;")
+        self.wifi_latency_status.setStyleSheet(SS("font-size: 10px;"))
         latency_layout.addWidget(self.wifi_latency_status, 6, 3)
         
         lbl = QLabel("WiFi统计:")
@@ -2379,12 +2766,12 @@ class BalanceControlPanel(QWidget):
         # 按钮行 (紧凑)
         latency_btn_layout = QHBoxLayout()
         self.latency_refresh_btn = QPushButton("刷新")
-        self.latency_refresh_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.latency_refresh_btn.setStyleSheet(SS("font-size: 10px; padding: 2px 8px;"))
         self.latency_refresh_btn.clicked.connect(self.refresh_latency)
         latency_btn_layout.addWidget(self.latency_refresh_btn)
         
         self.latency_auto_check = QCheckBox("自动")
-        self.latency_auto_check.setStyleSheet("font-size: 10px;")
+        self.latency_auto_check.setStyleSheet(SS("font-size: 10px;"))
         self.latency_auto_check.setChecked(False)
         self.latency_auto_check.stateChanged.connect(self.toggle_auto_latency_refresh)
         latency_btn_layout.addWidget(self.latency_auto_check)
@@ -2418,10 +2805,10 @@ class BalanceControlPanel(QWidget):
             self.parent_window.log(f"发送: {cmd}")
             if state == "on":
                 self.roll_status.setText("状态: 已开启")
-                self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+                self.roll_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
             else:
                 self.roll_status.setText("状态: 已关闭")
-                self.roll_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
+                self.roll_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #f44336;"))
     
     def send_pitch_comp_cmd(self, state):
         """发送 Pitch 腿部角度补偿命令"""
@@ -2433,15 +2820,46 @@ class BalanceControlPanel(QWidget):
             self.parent_window.log(f"发送: {cmd}")
             if state == "on":
                 self.pitch_comp_status.setText("状态: 已开启")
-                self.pitch_comp_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+                self.pitch_comp_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
             else:
                 self.pitch_comp_status.setText("状态: 已关闭")
-                self.pitch_comp_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #f44336;")
+                self.pitch_comp_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #f44336;"))
+    
+    def send_xoffset_cmd(self, state):
+        """发送 X-Offset 控制命令"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        cmd = f"balance xoffset {state}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+            if state == "on":
+                self.xoffset_status.setText("状态: 已开启")
+                self.xoffset_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
+            else:
+                self.xoffset_status.setText("状态: 已关闭")
+                self.xoffset_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #f44336;"))
+    
+    def apply_xoffset_params(self):
+        """应用 X-Offset PID 参数和限幅"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        kp = self.xoffset_kp.value()
+        ki = self.xoffset_ki.value()
+        kd = self.xoffset_kd.value()
+        limit = self.xoffset_limit.value()
+        # 分别发送各参数
+        self.parent_window.send_command(f"balance xoffset kp {kp:.4f}")
+        self.parent_window.send_command(f"balance xoffset ki {ki:.4f}")
+        self.parent_window.send_command(f"balance xoffset kd {kd:.4f}")
+        self.parent_window.send_command(f"balance xoffset limit {limit:.3f}")
+        self.parent_window.log(f"X-Offset: Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f} Limit={limit:.3f}m")
     
     def do_balance_init(self):
         self.send_cmd("balance init")
         self.init_status.setText("初始化中...")
-        self.init_status.setStyleSheet("color: orange;")
+        self.init_status.setStyleSheet(SS("color: orange;"))
     
     def set_zero_point(self):
         self.send_cmd(f"balance zero {self.zero_input.value()}")
@@ -2449,9 +2867,9 @@ class BalanceControlPanel(QWidget):
     def on_init_success(self):
         self.balance_initialized = True
         self.init_status.setText("✓ 已初始化")
-        self.init_status.setStyleSheet("color: green; font-weight: bold;")
+        self.init_status.setStyleSheet(SS("color: green; font-weight: bold;"))
         self.sys_status_label.setText("就绪")
-        self.sys_status_label.setStyleSheet("font-weight: bold; color: green;")
+        self.sys_status_label.setStyleSheet(SS("font-weight: bold; color: green;"))
     
     def set_loop_preset(self, preset):
         """设置环路预设"""
@@ -2533,16 +2951,16 @@ class BalanceControlPanel(QWidget):
         """更新频率状态指示"""
         if actual == 0:
             label.setText("⚫ 停止")
-            label.setStyleSheet("color: gray;")
+            label.setStyleSheet(SS("color: gray;"))
         elif abs(actual - target) <= tolerance:
             label.setText("🟢 正常")
-            label.setStyleSheet("color: #00ff00;")
+            label.setStyleSheet(SS("color: #00ff00;"))
         elif actual < target - tolerance:
             label.setText("🟡 偏低")
-            label.setStyleSheet("color: #ffaa00;")
+            label.setStyleSheet(SS("color: #ffaa00;"))
         else:
             label.setText("🔴 偏高")
-            label.setStyleSheet("color: #ff4444;")
+            label.setStyleSheet(SS("color: #ff4444;"))
     
     def update_latency(self, imu_to_ctrl_us, ctrl_calc_us, ctrl_to_motor_us, total_us, avg_us=None, min_us=None, max_us=None):
         """更新延迟显示 (由主窗口解析串口数据后调用)"""
@@ -2571,11 +2989,11 @@ class BalanceControlPanel(QWidget):
             self.latency_stats_label.setText(f"{avg_us:.0f} / {min_us:.0f} / {max_us:.0f} us")
             # 根据最大值设置颜色
             if max_us <= 8000:
-                self.latency_stats_label.setStyleSheet("font-weight: bold; color: #00ff00;")
+                self.latency_stats_label.setStyleSheet(SS("font-weight: bold; color: #00ff00;"))
             elif max_us <= 15000:
-                self.latency_stats_label.setStyleSheet("font-weight: bold; color: #ffaa00;")
+                self.latency_stats_label.setStyleSheet(SS("font-weight: bold; color: #ffaa00;"))
             else:
-                self.latency_stats_label.setStyleSheet("font-weight: bold; color: #ff4444;")
+                self.latency_stats_label.setStyleSheet(SS("font-weight: bold; color: #ff4444;"))
     
     def update_wifi_latency(self, wifi_ctrl_us, total_us, avg_us, min_us, max_us):
         """更新 WiFi 遥控延迟显示"""
@@ -2588,23 +3006,23 @@ class BalanceControlPanel(QWidget):
         # 统计信息
         self.wifi_latency_stats_label.setText(f"{avg_us:.0f} / {min_us:.0f} / {max_us:.0f} us")
         if max_us <= 30000:
-            self.wifi_latency_stats_label.setStyleSheet("font-weight: bold; color: #00ff00;")
+            self.wifi_latency_stats_label.setStyleSheet(SS("font-weight: bold; color: #00ff00;"))
         elif max_us <= 80000:
-            self.wifi_latency_stats_label.setStyleSheet("font-weight: bold; color: #ffaa00;")
+            self.wifi_latency_stats_label.setStyleSheet(SS("font-weight: bold; color: #ffaa00;"))
         else:
-            self.wifi_latency_stats_label.setStyleSheet("font-weight: bold; color: #ff4444;")
+            self.wifi_latency_stats_label.setStyleSheet(SS("font-weight: bold; color: #ff4444;"))
     
     def _update_latency_status(self, label, us_value, good_threshold, warn_threshold):
         """更新延迟状态指示"""
         if us_value <= good_threshold:
             label.setText("🟢 优秀")
-            label.setStyleSheet("color: #00ff00; font-weight: bold;")
+            label.setStyleSheet(SS("color: #00ff00; font-weight: bold;"))
         elif us_value <= warn_threshold:
             label.setText("🟡 正常")
-            label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+            label.setStyleSheet(SS("color: #ffaa00; font-weight: bold;"))
         else:
             label.setText("🔴 需优化")
-            label.setStyleSheet("color: #ff4444; font-weight: bold;")
+            label.setStyleSheet(SS("color: #ff4444; font-weight: bold;"))
 
 
 # ============================================================================
@@ -2623,22 +3041,25 @@ class DualPIDPanel(QWidget):
         
         # 标题和说明
         title_label = QLabel("🎯 双环 PID 平衡控制 (扭矩输出)")
-        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+        title_label.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00aaff;"))
         layout.addWidget(title_label)
         
-        desc_label = QLabel(
-            "控制架构: 直立环(外环) → 速度环(内环) → 扭矩输出\n"
-            "直立环: pitch → 目标速度 | 速度环: 速度误差 → 扭矩"
+        self.desc_label = QLabel(
+            "控制架构: 角度环(外环) → 速度环(内环) → 扭矩输出\n"
+            "角度环: pitch → 目标速度 | 速度环: 速度误差 → 扭矩"
         )
-        desc_label.setStyleSheet("color: #888; font-size: 11px;")
-        layout.addWidget(desc_label)
+        self.desc_label.setStyleSheet(SS("color: #888; font-size: 11px;"))
+        layout.addWidget(self.desc_label)
+        
+        # 当前环序状态
+        self.loop_order = 0  # 0=ANGLE_FIRST, 1=SPEED_FIRST
         
         # 模式切换
         mode_group = QGroupBox("控制模式切换")
         mode_layout = QHBoxLayout()
         
         self.mode_label = QLabel("当前模式: 未知")
-        self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold;"))
         mode_layout.addWidget(self.mode_label)
         
         mode_layout.addStretch()
@@ -2650,13 +3071,13 @@ class DualPIDPanel(QWidget):
         
         self.pid_btn = QPushButton("🟢 双环PID")
         self.pid_btn.setToolTip("双环 PID 控制 (扭矩模式)")
-        self.pid_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        self.pid_btn.setStyleSheet(SS("background-color: #4CAF50; color: white;"))
         self.pid_btn.clicked.connect(lambda: self.set_mode("pid"))
         mode_layout.addWidget(self.pid_btn)
         
         self.spid_btn = QPushButton("🟡 单环PID")
         self.spid_btn.setToolTip("单环 PID 控制 (速度模式)")
-        self.spid_btn.setStyleSheet("background-color: #FF9800; color: white;")
+        self.spid_btn.setStyleSheet(SS("background-color: #FF9800; color: white;"))
         self.spid_btn.clicked.connect(lambda: self.set_mode("spid"))
         mode_layout.addWidget(self.spid_btn)
         
@@ -2667,8 +3088,36 @@ class DualPIDPanel(QWidget):
         mode_group.setLayout(mode_layout)
         layout.addWidget(mode_group)
         
-        # 直立环 PID (外环)
-        angle_group = QGroupBox("🎯 直立环 PID (外环: Pitch → 目标速度)")
+        # 环路顺序切换
+        order_group = QGroupBox("🔀 环路顺序 (双环 PID)")
+        order_layout = QHBoxLayout()
+        
+        self.order_label = QLabel("当前: 角度优先")
+        self.order_label.setStyleSheet(SS("font-size: 13px; font-weight: bold; color: #4CAF50;"))
+        order_layout.addWidget(self.order_label)
+        
+        order_layout.addStretch()
+        
+        self.order_af_btn = QPushButton("角度优先 (AF)")
+        self.order_af_btn.setToolTip("角度环(外) → 速度环(内)\npitch → target_speed → torque")
+        self.order_af_btn.setStyleSheet(SS("background-color: #4CAF50; color: white;"))
+        self.order_af_btn.clicked.connect(lambda: self.set_loop_order(0))
+        order_layout.addWidget(self.order_af_btn)
+        
+        self.order_sf_btn = QPushButton("速度优先 (SF)")
+        self.order_sf_btn.setToolTip("速度环(外) → 角度环(内)\n0 - wheel_speed → pitch_target → torque")
+        self.order_sf_btn.clicked.connect(lambda: self.set_loop_order(1))
+        order_layout.addWidget(self.order_sf_btn)
+        
+        self.order_query_btn = QPushButton("📊 查询")
+        self.order_query_btn.clicked.connect(lambda: self.send_cmd("balance dpid order"))
+        order_layout.addWidget(self.order_query_btn)
+        
+        order_group.setLayout(order_layout)
+        layout.addWidget(order_group)
+        
+        # 角度环 PID
+        self.angle_group = QGroupBox("🎯 角度环 PID (外环: Pitch → 目标速度)")
         angle_layout = QGridLayout()
         
         angle_layout.addWidget(QLabel("Kp:"), 0, 0)
@@ -2701,14 +3150,14 @@ class DualPIDPanel(QWidget):
         
         # 直立环说明
         angle_note = QLabel("tip: 前倾(pitch>0)→输出正速度, P越大响应越快但易震荡")
-        angle_note.setStyleSheet("color: #666; font-size: 10px;")
+        angle_note.setStyleSheet(SS("color: #666; font-size: 10px;"))
         angle_layout.addWidget(angle_note, 1, 0, 1, 7)
         
-        angle_group.setLayout(angle_layout)
-        layout.addWidget(angle_group)
+        self.angle_group.setLayout(angle_layout)
+        layout.addWidget(self.angle_group)
         
-        # 速度环 PID (内环)
-        speed_group = QGroupBox("🔄 速度环 PID (内环: 速度误差 → 扭矩)")
+        # 速度环 PID
+        self.speed_group = QGroupBox("🔄 速度环 PID (内环: 速度误差 → 扭矩)")
         speed_layout = QGridLayout()
         
         speed_layout.addWidget(QLabel("Kp:"), 0, 0)
@@ -2741,11 +3190,11 @@ class DualPIDPanel(QWidget):
         
         # 速度环说明
         speed_note = QLabel("tip: I项消除稳态误差, 过大会导致震荡")
-        speed_note.setStyleSheet("color: #666; font-size: 10px;")
+        speed_note.setStyleSheet(SS("color: #666; font-size: 10px;"))
         speed_layout.addWidget(speed_note, 1, 0, 1, 7)
         
-        speed_group.setLayout(speed_layout)
-        layout.addWidget(speed_group)
+        self.speed_group.setLayout(speed_layout)
+        layout.addWidget(self.speed_group)
         
         # 角度零点
         zero_group = QGroupBox("角度零点")
@@ -2778,124 +3227,124 @@ class DualPIDPanel(QWidget):
         
         # === 双环 PID 状态 ===
         dpid_frame = QFrame()
-        dpid_frame.setStyleSheet("QFrame { background-color: #1a2a1a; border-radius: 5px; padding: 5px; }")
+        dpid_frame.setStyleSheet(SS("QFrame { background-color: #1a2a1a; border-radius: 5px; padding: 5px; }"))
         dpid_layout = QGridLayout(dpid_frame)
         dpid_layout.setSpacing(8)
         
         dpid_title = QLabel("🟢 双环 PID")
-        dpid_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #4CAF50;")
+        dpid_title.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #4CAF50;"))
         dpid_layout.addWidget(dpid_title, 0, 0, 1, 8)
         
         # 第一行: 输入信息
         dpid_layout.addWidget(QLabel("Pitch:"), 1, 0)
         self.dpid_pitch_label = QLabel("--°")
-        self.dpid_pitch_label.setStyleSheet("font-weight: bold; color: #ffcc00;")
+        self.dpid_pitch_label.setStyleSheet(SS("font-weight: bold; color: #ffcc00;"))
         dpid_layout.addWidget(self.dpid_pitch_label, 1, 1)
         
         dpid_layout.addWidget(QLabel("误差:"), 1, 2)
         self.angle_err_label = QLabel("--°")
-        self.angle_err_label.setStyleSheet("font-weight: bold; color: #ff8800;")
+        self.angle_err_label.setStyleSheet(SS("font-weight: bold; color: #ff8800;"))
         dpid_layout.addWidget(self.angle_err_label, 1, 3)
         
         dpid_layout.addWidget(QLabel("角速度:"), 1, 4)
         self.dpid_rate_label = QLabel("--°/s")
-        self.dpid_rate_label.setStyleSheet("font-weight: bold; color: #88ccff;")
+        self.dpid_rate_label.setStyleSheet(SS("font-weight: bold; color: #88ccff;"))
         dpid_layout.addWidget(self.dpid_rate_label, 1, 5)
         
         # 第二行: 直立环 PID 分量
         dpid_layout.addWidget(QLabel("直立环:"), 2, 0)
         dpid_layout.addWidget(QLabel("P="), 2, 1)
         self.dpid_angle_p = QLabel("--")
-        self.dpid_angle_p.setStyleSheet("color: #ff6666;")
+        self.dpid_angle_p.setStyleSheet(SS("color: #ff6666;"))
         dpid_layout.addWidget(self.dpid_angle_p, 2, 2)
         dpid_layout.addWidget(QLabel("I="), 2, 3)
         self.dpid_angle_i = QLabel("--")
-        self.dpid_angle_i.setStyleSheet("color: #66ff66;")
+        self.dpid_angle_i.setStyleSheet(SS("color: #66ff66;"))
         dpid_layout.addWidget(self.dpid_angle_i, 2, 4)
         dpid_layout.addWidget(QLabel("D="), 2, 5)
         self.dpid_angle_d = QLabel("--")
-        self.dpid_angle_d.setStyleSheet("color: #6666ff;")
+        self.dpid_angle_d.setStyleSheet(SS("color: #6666ff;"))
         dpid_layout.addWidget(self.dpid_angle_d, 2, 6)
         dpid_layout.addWidget(QLabel("→"), 2, 7)
         self.target_speed_label = QLabel("-- rad/s")
-        self.target_speed_label.setStyleSheet("font-weight: bold; color: #00aaff;")
+        self.target_speed_label.setStyleSheet(SS("font-weight: bold; color: #00aaff;"))
         dpid_layout.addWidget(self.target_speed_label, 2, 8)
         
         # 第三行: 速度环 PID 分量
         dpid_layout.addWidget(QLabel("速度环:"), 3, 0)
         dpid_layout.addWidget(QLabel("err="), 3, 1)
         self.speed_err_label = QLabel("--")
-        self.speed_err_label.setStyleSheet("color: #ff8800;")
+        self.speed_err_label.setStyleSheet(SS("color: #ff8800;"))
         dpid_layout.addWidget(self.speed_err_label, 3, 2)
         dpid_layout.addWidget(QLabel("P="), 3, 3)
         self.dpid_speed_p = QLabel("--")
-        self.dpid_speed_p.setStyleSheet("color: #ff6666;")
+        self.dpid_speed_p.setStyleSheet(SS("color: #ff6666;"))
         dpid_layout.addWidget(self.dpid_speed_p, 3, 4)
         dpid_layout.addWidget(QLabel("I="), 3, 5)
         self.dpid_speed_i = QLabel("--")
-        self.dpid_speed_i.setStyleSheet("color: #66ff66;")
+        self.dpid_speed_i.setStyleSheet(SS("color: #66ff66;"))
         dpid_layout.addWidget(self.dpid_speed_i, 3, 6)
         dpid_layout.addWidget(QLabel("D="), 3, 7)
         self.dpid_speed_d = QLabel("--")
-        self.dpid_speed_d.setStyleSheet("color: #6666ff;")
+        self.dpid_speed_d.setStyleSheet(SS("color: #6666ff;"))
         dpid_layout.addWidget(self.dpid_speed_d, 3, 8)
         
         # 第四行: 输出扭矩
         dpid_layout.addWidget(QLabel("输出扭矩:"), 4, 0, 1, 2)
         self.torque_label = QLabel("-- Nm")
-        self.torque_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #00ff88;")
+        self.torque_label.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ff88;"))
         dpid_layout.addWidget(self.torque_label, 4, 2, 1, 3)
         
         status_main_layout.addWidget(dpid_frame)
         
         # === 单环 PID 状态 ===
         spid_frame = QFrame()
-        spid_frame.setStyleSheet("QFrame { background-color: #2a2a1a; border-radius: 5px; padding: 5px; }")
+        spid_frame.setStyleSheet(SS("QFrame { background-color: #2a2a1a; border-radius: 5px; padding: 5px; }"))
         spid_layout = QGridLayout(spid_frame)
         spid_layout.setSpacing(8)
         
         spid_title = QLabel("🟡 单环 PID")
-        spid_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #FF9800;")
+        spid_title.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #FF9800;"))
         spid_layout.addWidget(spid_title, 0, 0, 1, 8)
         
         # 第一行: 输入信息
         spid_layout.addWidget(QLabel("Pitch:"), 1, 0)
         self.spid_pitch_label = QLabel("--°")
-        self.spid_pitch_label.setStyleSheet("font-weight: bold; color: #ffcc00;")
+        self.spid_pitch_label.setStyleSheet(SS("font-weight: bold; color: #ffcc00;"))
         spid_layout.addWidget(self.spid_pitch_label, 1, 1)
         
         spid_layout.addWidget(QLabel("误差:"), 1, 2)
         self.spid_err_label = QLabel("--°")
-        self.spid_err_label.setStyleSheet("font-weight: bold; color: #ff8800;")
+        self.spid_err_label.setStyleSheet(SS("font-weight: bold; color: #ff8800;"))
         spid_layout.addWidget(self.spid_err_label, 1, 3)
         
         spid_layout.addWidget(QLabel("角速度:"), 1, 4)
         self.spid_rate_label = QLabel("--°/s")
-        self.spid_rate_label.setStyleSheet("font-weight: bold; color: #88ccff;")
+        self.spid_rate_label.setStyleSheet(SS("font-weight: bold; color: #88ccff;"))
         spid_layout.addWidget(self.spid_rate_label, 1, 5)
         
         # 第二行: PID 分量
         spid_layout.addWidget(QLabel("直立环:"), 2, 0)
         spid_layout.addWidget(QLabel("P="), 2, 1)
         self.spid_p = QLabel("--")
-        self.spid_p.setStyleSheet("color: #ff6666;")
+        self.spid_p.setStyleSheet(SS("color: #ff6666;"))
         spid_layout.addWidget(self.spid_p, 2, 2)
         spid_layout.addWidget(QLabel("I="), 2, 3)
         self.spid_i = QLabel("--")
-        self.spid_i.setStyleSheet("color: #66ff66;")
+        self.spid_i.setStyleSheet(SS("color: #66ff66;"))
         spid_layout.addWidget(self.spid_i, 2, 4)
         spid_layout.addWidget(QLabel("D="), 2, 5)
         self.spid_d = QLabel("--")
-        self.spid_d.setStyleSheet("color: #6666ff;")
+        self.spid_d.setStyleSheet(SS("color: #6666ff;"))
         spid_layout.addWidget(self.spid_d, 2, 6)
         
         # 第三行: 输出速度
         spid_layout.addWidget(QLabel("输出速度:"), 3, 0, 1, 2)
         self.spid_speed_label = QLabel("-- rad/s")
-        self.spid_speed_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00aaff;")
+        self.spid_speed_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #00aaff;"))
         spid_layout.addWidget(self.spid_speed_label, 3, 2, 1, 2)
         self.spid_rpm_label = QLabel("(-- rpm)")
-        self.spid_rpm_label.setStyleSheet("color: #888;")
+        self.spid_rpm_label.setStyleSheet(SS("color: #888;"))
         spid_layout.addWidget(self.spid_rpm_label, 3, 4, 1, 2)
         
         status_main_layout.addWidget(spid_frame)
@@ -2914,7 +3363,7 @@ class DualPIDPanel(QWidget):
         
         # 调试数据更新指示
         self.debug_update_label = QLabel("调试数据: 等待...")
-        self.debug_update_label.setStyleSheet("color: #666; font-size: 10px;")
+        self.debug_update_label.setStyleSheet(SS("color: #666; font-size: 10px;"))
         status_btn_layout.addWidget(self.debug_update_label)
         
         status_main_layout.addLayout(status_btn_layout)
@@ -2949,11 +3398,11 @@ class DualPIDPanel(QWidget):
         
         # ========== 单环 PID 参数区域 (速度输出模式) ==========
         spid_group = QGroupBox("🟡 单环 PID 参数 (速度输出模式)")
-        spid_group.setStyleSheet("QGroupBox { color: #FF9800; }")
+        spid_group.setStyleSheet(SS("QGroupBox { color: #FF9800; }"))
         spid_layout = QGridLayout()
         
         spid_desc = QLabel("适合电机速度模式，输出目标速度 (rad/s) 送给电机内部速度环")
-        spid_desc.setStyleSheet("color: #888; font-size: 10px;")
+        spid_desc.setStyleSheet(SS("color: #888; font-size: 10px;"))
         spid_layout.addWidget(spid_desc, 0, 0, 1, 7)
         
         spid_layout.addWidget(QLabel("Kp:"), 1, 0)
@@ -3011,22 +3460,22 @@ class DualPIDPanel(QWidget):
         
         # ========== 调试输出控制 ==========
         debug_group = QGroupBox("🔧 实时调试输出")
-        debug_group.setStyleSheet("QGroupBox { color: #9C27B0; }")
+        debug_group.setStyleSheet(SS("QGroupBox { color: #9C27B0; }"))
         debug_layout = QHBoxLayout()
         
         debug_desc = QLabel("开启后实时打印 PID 内部状态 (P/I/D分量、误差、输出)")
-        debug_desc.setStyleSheet("color: #888; font-size: 10px;")
+        debug_desc.setStyleSheet(SS("color: #888; font-size: 10px;"))
         debug_layout.addWidget(debug_desc)
         
         debug_layout.addStretch()
         
         self.debug_on_btn = QPushButton("🟢 开启调试")
-        self.debug_on_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        self.debug_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white;"))
         self.debug_on_btn.clicked.connect(lambda: self.send_cmd("balance debug on"))
         debug_layout.addWidget(self.debug_on_btn)
         
         self.debug_off_btn = QPushButton("🔴 关闭调试")
-        self.debug_off_btn.setStyleSheet("background-color: #f44336; color: white;")
+        self.debug_off_btn.setStyleSheet(SS("background-color: #f44336; color: white;"))
         self.debug_off_btn.clicked.connect(lambda: self.send_cmd("balance debug off"))
         debug_layout.addWidget(self.debug_off_btn)
         
@@ -3058,13 +3507,44 @@ class DualPIDPanel(QWidget):
         self.send_cmd(f"balance mode {mode}")
         if mode == "pid":
             self.mode_label.setText("当前模式: 双环 PID (扭矩)")
-            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
         elif mode == "spid":
             self.mode_label.setText("当前模式: 单环 PID (速度)")
-            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #FF9800;")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF9800;"))
         else:
             self.mode_label.setText("当前模式: LQR")
-            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #2196F3;"))
+    
+    def set_loop_order(self, order):
+        """设置环路顺序并更新UI"""
+        self.send_cmd(f"balance dpid order {order}")
+        self.update_loop_order_ui(order)
+    
+    def update_loop_order_ui(self, order):
+        """根据环路顺序更新所有相关UI标签"""
+        self.loop_order = order
+        if order == 1:  # SPEED_FIRST
+            self.order_label.setText("当前: 速度优先 (SF)")
+            self.order_label.setStyleSheet(SS("font-size: 13px; font-weight: bold; color: #FF9800;"))
+            self.order_sf_btn.setStyleSheet(SS("background-color: #FF9800; color: white;"))
+            self.order_af_btn.setStyleSheet(SS(""))
+            self.desc_label.setText(
+                "控制架构: 速度环(外环) → 角度环(内环) → 扭矩输出\n"
+                "速度环: 0-轮速 → 目标倾角 | 角度环: 倾角误差 → 扭矩"
+            )
+            self.angle_group.setTitle("🎯 角度环 PID (内环: 倾角误差 → 扭矩)")
+            self.speed_group.setTitle("🔄 速度环 PID (外环: 0 - 轮速 → 目标倾角)")
+        else:  # ANGLE_FIRST
+            self.order_label.setText("当前: 角度优先 (AF)")
+            self.order_label.setStyleSheet(SS("font-size: 13px; font-weight: bold; color: #4CAF50;"))
+            self.order_af_btn.setStyleSheet(SS("background-color: #4CAF50; color: white;"))
+            self.order_sf_btn.setStyleSheet(SS(""))
+            self.desc_label.setText(
+                "控制架构: 角度环(外环) → 速度环(内环) → 扭矩输出\n"
+                "角度环: pitch → 目标速度 | 速度环: 速度误差 → 扭矩"
+            )
+            self.angle_group.setTitle("🎯 角度环 PID (外环: Pitch → 目标速度)")
+            self.speed_group.setTitle("🔄 速度环 PID (内环: 速度误差 → 扭矩)")
     
     def send_angle_pid(self):
         kp = self.angle_kp.value()
@@ -3125,7 +3605,7 @@ class DualPIDPanel(QWidget):
     
     def update_dpid_debug(self, pitch, err, rate, angle_p, angle_i, angle_d, tgt_spd, 
                           spd_err, speed_p, speed_i, speed_d, torque):
-        """更新双环 PID 调试数据 (解析 [DPID] 输出)"""
+        """更新双环 PID 调试数据 - 角度优先模式 (解析 [DPID-AF] 输出)"""
         self.dpid_pitch_label.setText(f"{pitch:.2f}°")
         self.angle_err_label.setText(f"{err:.2f}°")
         self.dpid_rate_label.setText(f"{rate:.1f}°/s")
@@ -3138,8 +3618,28 @@ class DualPIDPanel(QWidget):
         self.dpid_speed_i.setText(f"{speed_i:.3f}")
         self.dpid_speed_d.setText(f"{speed_d:.3f}")
         self.torque_label.setText(f"{torque:.3f} Nm")
-        self.debug_update_label.setText(f"调试数据: 双环 PID ✓")
-        self.debug_update_label.setStyleSheet("color: #4CAF50; font-size: 10px;")
+        self.debug_update_label.setText(f"调试数据: 双环 PID (角度优先) ✓")
+        self.debug_update_label.setStyleSheet(SS("color: #4CAF50; font-size: 10px;"))
+    
+    def update_dpid_debug_sf(self, pitch, spd, spd_err, speed_p, speed_i, speed_d, tgt_pitch,
+                              angle_err, angle_p, angle_i, angle_d, torque):
+        """更新双环 PID 调试数据 - 速度优先模式 (解析 [DPID-SF] 输出)"""
+        self.dpid_pitch_label.setText(f"{pitch:.2f}°")
+        self.dpid_rate_label.setText(f"spd={spd:.2f}")
+        # 速度环(外环)数据 → 显示在"直立环"行
+        self.angle_err_label.setText(f"{spd_err:.2f}")
+        self.dpid_angle_p.setText(f"{speed_p:.2f}")
+        self.dpid_angle_i.setText(f"{speed_i:.3f}")
+        self.dpid_angle_d.setText(f"{speed_d:.3f}")
+        self.target_speed_label.setText(f"{tgt_pitch:.2f}° (目标倾角)")
+        # 角度环(内环)数据 → 显示在"速度环"行
+        self.speed_err_label.setText(f"{angle_err:.2f}")
+        self.dpid_speed_p.setText(f"{angle_p:.2f}")
+        self.dpid_speed_i.setText(f"{angle_i:.3f}")
+        self.dpid_speed_d.setText(f"{angle_d:.3f}")
+        self.torque_label.setText(f"{torque:.3f} Nm")
+        self.debug_update_label.setText(f"调试数据: 双环 PID (速度优先) ✓")
+        self.debug_update_label.setStyleSheet(SS("color: #FF9800; font-size: 10px;"))
     
     def update_spid_debug(self, pitch, err, rate, p, i, d, speed, rpm):
         """更新单环 PID 调试数据 (解析 [SPID] 输出)"""
@@ -3152,19 +3652,19 @@ class DualPIDPanel(QWidget):
         self.spid_speed_label.setText(f"{speed:.2f} rad/s")
         self.spid_rpm_label.setText(f"({rpm:.0f} rpm)")
         self.debug_update_label.setText(f"调试数据: 单环 PID ✓")
-        self.debug_update_label.setStyleSheet("color: #FF9800; font-size: 10px;")
+        self.debug_update_label.setStyleSheet(SS("color: #FF9800; font-size: 10px;"))
     
     def update_mode(self, mode):
         """更新模式显示 (由主窗口解析数据后调用)"""
         if mode == "DUAL_PID":
             self.mode_label.setText("当前模式: 双环 PID (扭矩)")
-            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #4CAF50;")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
         elif mode == "SINGLE_PID":
             self.mode_label.setText("当前模式: 单环 PID (速度)")
-            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #FF9800;")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF9800;"))
         else:
             self.mode_label.setText("当前模式: LQR")
-            self.mode_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #2196F3;"))
 
 
 # ============================================================================
@@ -3187,9 +3687,9 @@ class YawDebugPanel(QWidget):
         status_layout.setSpacing(10)
         
         # 样式定义
-        title_style = "font-size: 14px; font-weight: bold; color: #888;"
-        value_style = "font-size: 24px; font-weight: bold; color: #00ccff;"
-        unit_style = "font-size: 12px; color: #888;"
+        title_style = SS("font-size: 14px; font-weight: bold; color: #888;")
+        value_style = SS("font-size: 24px; font-weight: bold; color: #00ccff;")
+        unit_style = SS("font-size: 12px; color: #888;")
         
         # 第一行: 角度信息
         row = 0
@@ -3221,7 +3721,7 @@ class YawDebugPanel(QWidget):
         status_layout.addWidget(self.yaw_current_angle, row, 1)
         
         self.yaw_angle_error = QLabel("--")
-        self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffcc00;")
+        self.yaw_angle_error.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #ffcc00;"))
         self.yaw_angle_error.setAlignment(Qt.AlignCenter)
         status_layout.addWidget(self.yaw_angle_error, row, 2)
         
@@ -3242,7 +3742,7 @@ class YawDebugPanel(QWidget):
         # 第四行: 控制信息数值
         row = 3
         self.yaw_output = QLabel("--")
-        self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff8800;")
+        self.yaw_output.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #ff8800;"))
         self.yaw_output.setAlignment(Qt.AlignCenter)
         status_layout.addWidget(self.yaw_output, row, 0)
         
@@ -3252,7 +3752,7 @@ class YawDebugPanel(QWidget):
         status_layout.addWidget(self.yaw_rate, row, 1)
         
         self.yaw_holding_status = QLabel("--")
-        self.yaw_holding_status.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+        self.yaw_holding_status.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00aaff;"))
         self.yaw_holding_status.setAlignment(Qt.AlignCenter)
         status_layout.addWidget(self.yaw_holding_status, row, 2)
         
@@ -3264,7 +3764,7 @@ class YawDebugPanel(QWidget):
         diag_layout = QVBoxLayout()
         
         self.yaw_diagnosis = QLabel("等待数据...")
-        self.yaw_diagnosis.setStyleSheet("font-size: 16px; color: #aaa; padding: 10px;")
+        self.yaw_diagnosis.setStyleSheet(SS("font-size: 16px; color: #aaa; padding: 10px;"))
         self.yaw_diagnosis.setWordWrap(True)
         self.yaw_diagnosis.setAlignment(Qt.AlignCenter)
         diag_layout.addWidget(self.yaw_diagnosis)
@@ -3278,18 +3778,18 @@ class YawDebugPanel(QWidget):
         
         # YAW 环开关
         self.yaw_enable_btn = QPushButton("开启 YAW 环")
-        self.yaw_enable_btn.setStyleSheet("font-size: 14px; padding: 10px 20px; background-color: #44aa44;")
+        self.yaw_enable_btn.setStyleSheet(SS("font-size: 14px; padding: 10px 20px; background-color: #44aa44;"))
         self.yaw_enable_btn.clicked.connect(lambda: self.send_cmd("balance loop Y on"))
         ctrl_layout.addWidget(self.yaw_enable_btn)
         
         self.yaw_disable_btn = QPushButton("关闭 YAW 环")
-        self.yaw_disable_btn.setStyleSheet("font-size: 14px; padding: 10px 20px; background-color: #aa4444;")
+        self.yaw_disable_btn.setStyleSheet(SS("font-size: 14px; padding: 10px 20px; background-color: #aa4444;"))
         self.yaw_disable_btn.clicked.connect(lambda: self.send_cmd("balance loop Y off"))
         ctrl_layout.addWidget(self.yaw_disable_btn)
         
         # 重置 YAW 角度
         self.yaw_reset_btn = QPushButton("重置目标角度")
-        self.yaw_reset_btn.setStyleSheet("font-size: 14px; padding: 10px 20px; background-color: #4488aa;")
+        self.yaw_reset_btn.setStyleSheet(SS("font-size: 14px; padding: 10px 20px; background-color: #4488aa;"))
         self.yaw_reset_btn.clicked.connect(lambda: self.send_cmd("balance yaw reset"))
         ctrl_layout.addWidget(self.yaw_reset_btn)
         
@@ -3304,7 +3804,7 @@ class YawDebugPanel(QWidget):
         # YAW 角度 PID (E)
         row = 0
         lbl = QLabel("角度 PID (E):")
-        lbl.setStyleSheet("font-weight: bold;")
+        lbl.setStyleSheet(SS("font-weight: bold;"))
         pid_layout.addWidget(lbl, row, 0)
         
         pid_layout.addWidget(QLabel("P:"), row, 1)
@@ -3339,7 +3839,7 @@ class YawDebugPanel(QWidget):
         # YAW 角速度 PID (F)
         row = 1
         lbl = QLabel("角速度 PID (F):")
-        lbl.setStyleSheet("font-weight: bold;")
+        lbl.setStyleSheet(SS("font-weight: bold;"))
         pid_layout.addWidget(lbl, row, 0)
         
         pid_layout.addWidget(QLabel("P:"), row, 1)
@@ -3391,7 +3891,7 @@ class YawDebugPanel(QWidget):
 
 <b>控制输出:</b> 左轮 = LQR_u + YAW输出, 右轮 = LQR_u - YAW输出
         """)
-        help_text.setStyleSheet("font-size: 12px; color: #aaa;")
+        help_text.setStyleSheet(SS("font-size: 12px; color: #aaa;"))
         help_text.setWordWrap(True)
         help_layout.addWidget(help_text)
         
@@ -3432,28 +3932,28 @@ class YawDebugPanel(QWidget):
         # 角度误差 (根据大小设置颜色)
         self.yaw_angle_error.setText(f"{error:.2f}°")
         if abs(error) < 1.0:
-            self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #00ff00;")
+            self.yaw_angle_error.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #00ff00;"))
         elif abs(error) < 5.0:
-            self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffcc00;")
+            self.yaw_angle_error.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #ffcc00;"))
         else:
-            self.yaw_angle_error.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff4444;")
+            self.yaw_angle_error.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #ff4444;"))
         
         # YAW 输出 (根据大小设置颜色)
         self.yaw_output.setText(f"{output:.3f}")
         if abs(output) < 0.1:
-            self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #00ff00;")
+            self.yaw_output.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #00ff00;"))
         elif abs(output) < 0.5:
-            self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff8800;")
+            self.yaw_output.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #ff8800;"))
         else:
-            self.yaw_output.setStyleSheet("font-size: 24px; font-weight: bold; color: #ff4444;")
+            self.yaw_output.setStyleSheet(SS("font-size: 24px; font-weight: bold; color: #ff4444;"))
         
         # 保持模式状态
         if holding:
             self.yaw_holding_status.setText("🔒 方向保持")
-            self.yaw_holding_status.setStyleSheet("font-size: 18px; font-weight: bold; color: #00aaff;")
+            self.yaw_holding_status.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #00aaff;"))
         else:
             self.yaw_holding_status.setText("🔄 角速度跟踪")
-            self.yaw_holding_status.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffaa00;")
+            self.yaw_holding_status.setStyleSheet(SS("font-size: 18px; font-weight: bold; color: #ffaa00;"))
         
         # 角速度
         self.yaw_rate.setText(f"{yaw_rate:.2f} rad/s")
@@ -3509,28 +4009,28 @@ class VMCDebugPanel(QWidget):
         ctrl_layout = QHBoxLayout()
         
         self.vmc_on_btn = QPushButton("✅ 开启 VMC")
-        self.vmc_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px 20px; font-size: 14px;")
+        self.vmc_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 10px 20px; font-size: 14px;"))
         self.vmc_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc on"))
         ctrl_layout.addWidget(self.vmc_on_btn)
         
         self.vmc_off_btn = QPushButton("❌ 关闭 VMC")
-        self.vmc_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 10px 20px; font-size: 14px;")
+        self.vmc_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 10px 20px; font-size: 14px;"))
         self.vmc_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc off"))
         ctrl_layout.addWidget(self.vmc_off_btn)
         
         self.vmc_status_btn = QPushButton("📊 查看状态")
-        self.vmc_status_btn.setStyleSheet("padding: 10px 20px; font-size: 14px;")
+        self.vmc_status_btn.setStyleSheet(SS("padding: 10px 20px; font-size: 14px;"))
         self.vmc_status_btn.clicked.connect(lambda: self.send_cmd("balance vmc status"))
         ctrl_layout.addWidget(self.vmc_status_btn)
         
         self.stream_on_btn = QPushButton("📈 开启数据流")
-        self.stream_on_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px 15px;")
+        self.stream_on_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 10px 15px;"))
         self.stream_on_btn.setToolTip("开启 VMC 实时数据流，用于 UI 监控")
         self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc stream on"))
         ctrl_layout.addWidget(self.stream_on_btn)
         
         self.stream_off_btn = QPushButton("⏹️ 关闭数据流")
-        self.stream_off_btn.setStyleSheet("padding: 10px 15px;")
+        self.stream_off_btn.setStyleSheet(SS("padding: 10px 15px;"))
         self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc stream off"))
         ctrl_layout.addWidget(self.stream_off_btn)
         
@@ -3555,7 +4055,7 @@ class VMCDebugPanel(QWidget):
         coord_layout.addWidget(self.coord_body_btn)
         
         self.coord_status = QLabel("当前: --")
-        self.coord_status.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.coord_status.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         coord_layout.addWidget(self.coord_status)
         
         coord_layout.addStretch()
@@ -3723,12 +4223,12 @@ class VMCDebugPanel(QWidget):
         pitch_ctrl_layout = QHBoxLayout()
         
         self.pitch_on_btn = QPushButton("✅ 开启 Pitch 补偿")
-        self.pitch_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 15px;")
+        self.pitch_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 15px;"))
         self.pitch_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc pitch on"))
         pitch_ctrl_layout.addWidget(self.pitch_on_btn)
         
         self.pitch_off_btn = QPushButton("❌ 关闭 Pitch 补偿")
-        self.pitch_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 15px;")
+        self.pitch_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 15px;"))
         self.pitch_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc pitch off"))
         pitch_ctrl_layout.addWidget(self.pitch_off_btn)
         
@@ -3786,13 +4286,13 @@ class VMCDebugPanel(QWidget):
         sync_ctrl_layout = QHBoxLayout()
         
         self.sync_on_btn = QPushButton("✅ 开启协调控制")
-        self.sync_on_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 15px;")
+        self.sync_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 15px;"))
         self.sync_on_btn.setToolTip("消除左右腿 body_angle 差异，保持机体姿态一致")
         self.sync_on_btn.clicked.connect(lambda: self.send_cmd("balance vmc sync on"))
         sync_ctrl_layout.addWidget(self.sync_on_btn)
         
         self.sync_off_btn = QPushButton("❌ 关闭协调控制")
-        self.sync_off_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 15px;")
+        self.sync_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 15px;"))
         self.sync_off_btn.clicked.connect(lambda: self.send_cmd("balance vmc sync off"))
         sync_ctrl_layout.addWidget(self.sync_off_btn)
         
@@ -3838,22 +4338,22 @@ class VMCDebugPanel(QWidget):
         sync_status_layout = QGridLayout()
         sync_status_layout.addWidget(QLabel("左腿角度:"), 0, 0)
         self.left_angle_label = QLabel("-- °")
-        self.left_angle_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.left_angle_label.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         sync_status_layout.addWidget(self.left_angle_label, 0, 1)
         
         sync_status_layout.addWidget(QLabel("右腿角度:"), 0, 2)
         self.right_angle_label = QLabel("-- °")
-        self.right_angle_label.setStyleSheet("font-weight: bold; color: #00ccff;")
+        self.right_angle_label.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
         sync_status_layout.addWidget(self.right_angle_label, 0, 3)
         
         sync_status_layout.addWidget(QLabel("角度差:"), 1, 0)
         self.angle_diff_label = QLabel("-- °")
-        self.angle_diff_label.setStyleSheet("font-weight: bold; color: #ffaa00;")
+        self.angle_diff_label.setStyleSheet(SS("font-weight: bold; color: #ffaa00;"))
         sync_status_layout.addWidget(self.angle_diff_label, 1, 1)
         
         sync_status_layout.addWidget(QLabel("F_sync:"), 1, 2)
         self.f_sync_label = QLabel("-- Nm")
-        self.f_sync_label.setStyleSheet("font-weight: bold; color: #ff6600;")
+        self.f_sync_label.setStyleSheet(SS("font-weight: bold; color: #ff6600;"))
         sync_status_layout.addWidget(self.f_sync_label, 1, 3)
         
         sync_layout.addLayout(sync_status_layout)
@@ -3887,30 +4387,30 @@ class VMCDebugPanel(QWidget):
         monitor_layout.addWidget(QLabel("【左腿】"), 0, 0)
         monitor_layout.addWidget(QLabel("腿长:"), 0, 1)
         self.left_leg_length_label = QLabel("-- m")
-        self.left_leg_length_label.setStyleSheet("color: #00ff00;")
+        self.left_leg_length_label.setStyleSheet(SS("color: #00ff00;"))
         monitor_layout.addWidget(self.left_leg_length_label, 0, 2)
         monitor_layout.addWidget(QLabel("F_L:"), 0, 3)
         self.left_fl_label = QLabel("-- N")
-        self.left_fl_label.setStyleSheet("color: #00ccff;")
+        self.left_fl_label.setStyleSheet(SS("color: #00ccff;"))
         monitor_layout.addWidget(self.left_fl_label, 0, 4)
         monitor_layout.addWidget(QLabel("F_α:"), 0, 5)
         self.left_fa_label = QLabel("-- Nm")
-        self.left_fa_label.setStyleSheet("color: #ffaa00;")
+        self.left_fa_label.setStyleSheet(SS("color: #ffaa00;"))
         monitor_layout.addWidget(self.left_fa_label, 0, 6)
         
         # 右腿状态
         monitor_layout.addWidget(QLabel("【右腿】"), 1, 0)
         monitor_layout.addWidget(QLabel("腿长:"), 1, 1)
         self.right_leg_length_label = QLabel("-- m")
-        self.right_leg_length_label.setStyleSheet("color: #00ff00;")
+        self.right_leg_length_label.setStyleSheet(SS("color: #00ff00;"))
         monitor_layout.addWidget(self.right_leg_length_label, 1, 2)
         monitor_layout.addWidget(QLabel("F_L:"), 1, 3)
         self.right_fl_label = QLabel("-- N")
-        self.right_fl_label.setStyleSheet("color: #00ccff;")
+        self.right_fl_label.setStyleSheet(SS("color: #00ccff;"))
         monitor_layout.addWidget(self.right_fl_label, 1, 4)
         monitor_layout.addWidget(QLabel("F_α:"), 1, 5)
         self.right_fa_label = QLabel("-- Nm")
-        self.right_fa_label.setStyleSheet("color: #ffaa00;")
+        self.right_fa_label.setStyleSheet(SS("color: #ffaa00;"))
         monitor_layout.addWidget(self.right_fa_label, 1, 6)
         
         # 扭矩输出
@@ -3942,10 +4442,10 @@ class VMCDebugPanel(QWidget):
         """更新坐标系状态显示"""
         if coord_type == "world":
             self.coord_status.setText("当前: 世界坐标系 (World)")
-            self.coord_status.setStyleSheet("font-weight: bold; color: #00ff00;")
+            self.coord_status.setStyleSheet(SS("font-weight: bold; color: #00ff00;"))
         elif coord_type == "body":
             self.coord_status.setText("当前: 机身坐标系 (Body)")
-            self.coord_status.setStyleSheet("font-weight: bold; color: #00ccff;")
+            self.coord_status.setStyleSheet(SS("font-weight: bold; color: #00ccff;"))
     
     def update_sync_status(self, left_angle, right_angle, angle_diff, f_sync):
         """更新双腿协调控制状态显示"""
@@ -3956,11 +4456,11 @@ class VMCDebugPanel(QWidget):
         
         # 根据角度差大小改变颜色
         if abs(angle_diff) < 1.0:
-            self.angle_diff_label.setStyleSheet("font-weight: bold; color: #00ff00;")  # 绿色 - 良好
+            self.angle_diff_label.setStyleSheet(SS("font-weight: bold; color: #00ff00;"))  # 绿色 - 良好
         elif abs(angle_diff) < 3.0:
-            self.angle_diff_label.setStyleSheet("font-weight: bold; color: #ffaa00;")  # 黄色 - 警告
+            self.angle_diff_label.setStyleSheet(SS("font-weight: bold; color: #ffaa00;"))  # 黄色 - 警告
         else:
-            self.angle_diff_label.setStyleSheet("font-weight: bold; color: #ff4444;")  # 红色 - 需调整
+            self.angle_diff_label.setStyleSheet(SS("font-weight: bold; color: #ff4444;"))  # 红色 - 需调整
     
     def update_vmc_monitor(self, data):
         """更新 VMC 实时监控数据
@@ -4031,12 +4531,12 @@ class SensorPanel(QWidget):
         btn_layout.addWidget(self.power_btn)
         
         self.mpower_on_btn = QPushButton("电机供电 ON")
-        self.mpower_on_btn.setStyleSheet("background-color: #44aa44;")
+        self.mpower_on_btn.setStyleSheet(SS("background-color: #44aa44;"))
         self.mpower_on_btn.clicked.connect(lambda: self.send_cmd("mpower on"))
         btn_layout.addWidget(self.mpower_on_btn)
         
         self.mpower_off_btn = QPushButton("电机供电 OFF")
-        self.mpower_off_btn.setStyleSheet("background-color: #aa4444;")
+        self.mpower_off_btn.setStyleSheet(SS("background-color: #aa4444;"))
         self.mpower_off_btn.clicked.connect(lambda: self.send_cmd("mpower off"))
         btn_layout.addWidget(self.mpower_off_btn)
         
@@ -4045,7 +4545,7 @@ class SensorPanel(QWidget):
         status_layout = QHBoxLayout()
         status_layout.addWidget(QLabel("电池:"))
         self.battery_label = QLabel("--")
-        self.battery_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.battery_label.setStyleSheet(SS("font-size: 16px; font-weight: bold;"))
         status_layout.addWidget(self.battery_label)
         status_layout.addWidget(QLabel("电机供电:"))
         self.mpower_label = QLabel("--")
@@ -4078,11 +4578,11 @@ class SensorPanel(QWidget):
         data_layout = QHBoxLayout()
         data_layout.addWidget(QLabel("温度:"))
         self.temp_label = QLabel("--")
-        self.temp_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #ff6600;")
+        self.temp_label.setStyleSheet(SS("font-size: 20px; font-weight: bold; color: #ff6600;"))
         data_layout.addWidget(self.temp_label)
         data_layout.addWidget(QLabel("湿度:"))
         self.humi_label = QLabel("--")
-        self.humi_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #0066ff;")
+        self.humi_label.setStyleSheet(SS("font-size: 20px; font-weight: bold; color: #0066ff;"))
         data_layout.addWidget(self.humi_label)
         sht_layout.addLayout(data_layout)
         sht_group.setLayout(sht_layout)
@@ -4093,7 +4593,7 @@ class SensorPanel(QWidget):
         wifi_layout = QHBoxLayout()
         
         self.wifi_start_btn = QPushButton("启动 WiFi AP")
-        self.wifi_start_btn.setStyleSheet("background-color: #4488ff;")
+        self.wifi_start_btn.setStyleSheet(SS("background-color: #4488ff;"))
         self.wifi_start_btn.clicked.connect(lambda: self.send_cmd("wifi start"))
         wifi_layout.addWidget(self.wifi_start_btn)
         
@@ -4140,7 +4640,7 @@ class TerminalPanel(QWidget):
         input_layout = QHBoxLayout()
         input_layout.addWidget(QLabel("命令:"))
         self.cmd_input = QLineEdit()
-        self.cmd_input.setStyleSheet("font-size: 14px; padding: 5px;")
+        self.cmd_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         self.cmd_input.returnPressed.connect(self.send_command)
         input_layout.addWidget(self.cmd_input)
         
@@ -4161,7 +4661,7 @@ class TerminalPanel(QWidget):
         
         # 说明
         help_label = QLabel("💡 提示: 在此面板可以直接输入任意命令发送到设备，输出显示在右侧日志窗口")
-        help_label.setStyleSheet("color: gray; font-size: 12px;")
+        help_label.setStyleSheet(SS("color: gray; font-size: 12px;"))
         layout.addWidget(help_label)
         
         layout.addStretch()
@@ -4184,7 +4684,19 @@ class PIDTunerUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("轮腿机器人控制面板 - PID调参 + 设备控制")
-        self.setGeometry(100, 100, 1200, 800)
+        # 自适应窗口大小: 占屏幕 75%
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            w = int(geo.width() * 0.85)
+            h = int(geo.height() * 0.75)
+            self.setGeometry(
+                geo.x() + (geo.width() - w) // 2,
+                geo.y() + (geo.height() - h) // 2,
+                w, h
+            )
+        else:
+            self.setGeometry(100, 100, 1200, 800)
         
         self.serial_thread = SerialThread()
         self.serial_thread.data_received.connect(self.process_serial_data)
@@ -4205,6 +4717,8 @@ class PIDTunerUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
         
         # ===== 串口控制区 =====
         serial_group = QGroupBox("串口连接")
@@ -4229,12 +4743,15 @@ class PIDTunerUI(QMainWindow):
         serial_layout.addWidget(self.test_btn)
         
         self.status_label = QLabel("未连接")
-        self.status_label.setStyleSheet("color: red; font-weight: bold; font-size: 14px;")
+        self.status_label.setStyleSheet(SS("color: red; font-weight: bold; font-size: 14px;"))
         serial_layout.addWidget(self.status_label)
         
         serial_layout.addStretch()
         serial_group.setLayout(serial_layout)
-        main_layout.addWidget(serial_group)
+        # 串口区域不拉伸, 只占最小高度
+        from PyQt5.QtWidgets import QSizePolicy
+        serial_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        main_layout.addWidget(serial_group, 0)  # stretch=0
         
         # ===== 主分割区域 =====
         splitter = QSplitter(Qt.Horizontal)
@@ -4245,96 +4762,96 @@ class PIDTunerUI(QMainWindow):
         # 根据Commander映射创建标签页
         # PID控制器 - 平衡控制相关
         self.pid_panels['angle'] = PIDControlPanel("角度控制 (Angle)", "A", self)
-        self.tab_widget.addTab(self.pid_panels['angle'], "A - 角度PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['angle']), "A - 角度PID")
         
         self.pid_panels['gyro'] = PIDControlPanel("角速度控制 (Gyro)", "B", self)
-        self.tab_widget.addTab(self.pid_panels['gyro'], "B - 角速度PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['gyro']), "B - 角速度PID")
         
         self.pid_panels['distance'] = PIDControlPanel("位移控制 (Distance)", "C", self)
-        self.tab_widget.addTab(self.pid_panels['distance'], "C - 位移PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['distance']), "C - 位移PID")
         
         self.pid_panels['speed'] = PIDControlPanel("速度控制 (Speed)", "D", self)
-        self.tab_widget.addTab(self.pid_panels['speed'], "D - 速度PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['speed']), "D - 速度PID")
         
         self.pid_panels['yaw_angle'] = PIDControlPanel("YAW角度控制", "E", self)
-        self.tab_widget.addTab(self.pid_panels['yaw_angle'], "E - YAW角度PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['yaw_angle']), "E - YAW角度PID")
         
         self.pid_panels['yaw_gyro'] = PIDControlPanel("YAW角速度控制", "F", self)
-        self.tab_widget.addTab(self.pid_panels['yaw_gyro'], "F - YAW角速度PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['yaw_gyro']), "F - YAW角速度PID")
         
         self.pid_panels['lqr_u'] = PIDControlPanel("LQR输出补偿", "H", self)
-        self.tab_widget.addTab(self.pid_panels['lqr_u'], "H - LQR输出PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['lqr_u']), "H - LQR输出PID")
         
         self.pid_panels['zeropoint'] = PIDControlPanel("零点自适应", "I", self)
-        self.tab_widget.addTab(self.pid_panels['zeropoint'], "I - 零点PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['zeropoint']), "I - 零点PID")
         
         self.pid_panels['roll_angle'] = PIDControlPanel("Roll轴平衡", "K", self)
-        self.tab_widget.addTab(self.pid_panels['roll_angle'], "K - Roll角度PID")
+        self.tab_widget.addTab(_make_scrollable(self.pid_panels['roll_angle']), "K - Roll角度PID")
         
         # 低通滤波器
         self.lpf_panels['joyy'] = LPFControlPanel("摇杆Y轴滤波", "G", self)
-        self.tab_widget.addTab(self.lpf_panels['joyy'], "G - 摇杆滤波")
+        self.tab_widget.addTab(_make_scrollable(self.lpf_panels['joyy']), "G - 摇杆滤波")
         
         self.lpf_panels['zeropoint'] = LPFControlPanel("零点滤波", "J", self)
-        self.tab_widget.addTab(self.lpf_panels['zeropoint'], "J - 零点滤波")
+        self.tab_widget.addTab(_make_scrollable(self.lpf_panels['zeropoint']), "J - 零点滤波")
         
         self.lpf_panels['roll'] = LPFControlPanel("Roll角度滤波", "L", self)
-        self.tab_widget.addTab(self.lpf_panels['roll'], "L - Roll滤波")
+        self.tab_widget.addTab(_make_scrollable(self.lpf_panels['roll']), "L - Roll滤波")
         
         # 速度自适应面板
         self.speed_adaptive_panel = SpeedAdaptivePanel(self)
-        self.tab_widget.addTab(self.speed_adaptive_panel, "M - 速度自适应P")
+        self.tab_widget.addTab(_make_scrollable(self.speed_adaptive_panel), "M - 速度自适应P")
         
         # 轮速调试面板 (用于离地检测阈值调试)
         # O - 左轮: 蓝线=速度(rad/s), 红线=加速度(rad/s²)
         # P - 右轮: 蓝线=速度(rad/s), 红线=加速度(rad/s²)
         self.wheel_panels = {}
         self.wheel_panels['left'] = PIDControlPanel("左轮调试 (蓝=速度rad/s, 红=加速度rad/s²)", "O", self)
-        self.tab_widget.addTab(self.wheel_panels['left'], "O - 左轮调试")
+        self.tab_widget.addTab(_make_scrollable(self.wheel_panels['left']), "O - 左轮调试")
         
         self.wheel_panels['right'] = PIDControlPanel("右轮调试 (蓝=速度rad/s, 红=加速度rad/s²)", "P", self)
-        self.tab_widget.addTab(self.wheel_panels['right'], "P - 右轮调试")
+        self.tab_widget.addTab(_make_scrollable(self.wheel_panels['right']), "P - 右轮调试")
         
         # 腿部控制面板
         self.leg_panel = LegControlPanel(self)
-        self.tab_widget.addTab(self.leg_panel, "🦿 腿部控制")
+        self.tab_widget.addTab(_make_scrollable(self.leg_panel), "🦿 腿部控制")
         
         # Web监控面板
         self.web_monitor = WebMonitorPanel(self)
-        self.tab_widget.addTab(self.web_monitor, "📱 Web监控")
+        self.tab_widget.addTab(_make_scrollable(self.web_monitor), "📱 Web监控")
         
         # ===== 新增设备控制面板 =====
         # 平衡控制面板
         self.balance_panel = BalanceControlPanel(self)
-        self.tab_widget.addTab(self.balance_panel, "🎮 平衡控制")
+        self.tab_widget.addTab(_make_scrollable(self.balance_panel), "🎮 平衡控制")
         
         # 双环 PID 调参面板
         self.dual_pid_panel = DualPIDPanel(self)
-        self.tab_widget.addTab(self.dual_pid_panel, "🎯 双环PID")
+        self.tab_widget.addTab(_make_scrollable(self.dual_pid_panel), "🎯 双环PID")
         
         # YAW 调试面板 (独立标签页)
         self.yaw_panel = YawDebugPanel(self)
-        self.tab_widget.addTab(self.yaw_panel, "🧭 YAW调试")
+        self.tab_widget.addTab(_make_scrollable(self.yaw_panel), "🧭 YAW调试")
         
         # VMC 调试面板
         self.vmc_panel = VMCDebugPanel(self)
-        self.tab_widget.addTab(self.vmc_panel, "🦿 VMC调试")
+        self.tab_widget.addTab(_make_scrollable(self.vmc_panel), "🦿 VMC调试")
         
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
-        self.tab_widget.addTab(self.motor_panel, "⚙️ 电机控制")
+        self.tab_widget.addTab(_make_scrollable(self.motor_panel), "⚙️ 电机控制")
         
         # IMU控制面板
         self.imu_panel = IMUControlPanel(self)
-        self.tab_widget.addTab(self.imu_panel, "📐 IMU")
+        self.tab_widget.addTab(_make_scrollable(self.imu_panel), "📐 IMU")
         
         # 传感器面板
         self.sensor_panel = SensorPanel(self)
-        self.tab_widget.addTab(self.sensor_panel, "🔧 传感器")
+        self.tab_widget.addTab(_make_scrollable(self.sensor_panel), "🔧 传感器")
         
         # 终端面板
         self.terminal_panel = TerminalPanel(self)
-        self.tab_widget.addTab(self.terminal_panel, "💻 终端")
+        self.tab_widget.addTab(_make_scrollable(self.terminal_panel), "💻 终端")
         
         splitter.addWidget(self.tab_widget)
         
@@ -4347,7 +4864,7 @@ class PIDTunerUI(QMainWindow):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas; font-size: 12px;")
+        self.log_text.setStyleSheet(SS("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas; font-size: 12px;"))
         log_inner_layout.addWidget(self.log_text)
         
         log_btn_layout = QHBoxLayout()
@@ -4377,9 +4894,11 @@ class PIDTunerUI(QMainWindow):
         log_layout.addWidget(log_group)
         
         splitter.addWidget(log_widget)
-        splitter.setSizes([800, 400])
+        splitter.setSizes([900, 300])
+        splitter.setStretchFactor(0, 3)   # tab 区域占更多
+        splitter.setStretchFactor(1, 1)   # 日志区域占较少
         
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(splitter, 1)  # stretch=1, 占满剩余空间
     
     def refresh_ports(self):
         self.port_combo.clear()
@@ -4395,7 +4914,7 @@ class PIDTunerUI(QMainWindow):
                 self.connect_btn.setText("断开")
                 self.test_btn.setEnabled(True)
                 self.status_label.setText("✓ 已连接")
-                self.status_label.setStyleSheet("color: green; font-weight: bold; font-size: 14px;")
+                self.status_label.setStyleSheet(SS("color: green; font-weight: bold; font-size: 14px;"))
                 self.log(f"✓ 已连接到 {port}")
             else:
                 QMessageBox.critical(self, "错误", "串口连接失败!")
@@ -4406,7 +4925,7 @@ class PIDTunerUI(QMainWindow):
             self.connect_btn.setText("连接")
             self.test_btn.setEnabled(False)
             self.status_label.setText("未连接")
-            self.status_label.setStyleSheet("color: red; font-weight: bold; font-size: 14px;")
+            self.status_label.setStyleSheet(SS("color: red; font-weight: bold; font-size: 14px;"))
             self.log("串口已断开")
     
     def test_communication(self):
@@ -4516,7 +5035,7 @@ class PIDTunerUI(QMainWindow):
         
         # 双环 PID 状态 (高频)
         if line.startswith("DPID_STATUS:"):
-            dpid_match = re.search(r'DPID_STATUS:PITCH_ERR=([-\d.]+),TGT_SPD=([-\d.]+),SPD_ERR=([-\d.]+),TORQUE=([-\d.]+)', line)
+            dpid_match = re.search(r'DPID_STATUS:PITCH_ERR=([-\d.]+),TGT_SPD=([-\d.]+),SPD_ERR=([-\d.]+),TORQUE=([-\d.]+)(?:,ORDER=(\d+))?', line)
             if dpid_match:
                 try:
                     pitch_err = float(dpid_match.group(1))
@@ -4525,18 +5044,23 @@ class PIDTunerUI(QMainWindow):
                     torque = float(dpid_match.group(4))
                     if hasattr(self, 'dual_pid_panel'):
                         self.dual_pid_panel.update_status(pitch_err, target_speed, speed_err, torque)
+                        # 更新环序UI
+                        if dpid_match.group(5) is not None:
+                            order = int(dpid_match.group(5))
+                            self.dual_pid_panel.update_loop_order_ui(order)
                 except:
                     pass
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         
         # 双环 PID 调试输出 (实时)
-        # 格式: [DPID] pitch=X° err=X° rate=X°/s | Angle: P=X I=X D=X → tgt_spd=X | Speed: err=X P=X I=X D=X → torque=X
-        if line.startswith("[DPID]"):
+        # 角度优先: [DPID-AF] pitch=X° err=X° rate=X°/s | Angle(外): P=X I=X D=X → tgt_spd=X | Speed(内): err=X P=X I=X D=X → torque=X
+        # 速度优先: [DPID-SF] pitch=X° spd=X | Speed(外): err=X P=X I=X D=X → tgt_pitch=X° | Angle(内): err=X P=X I=X D=X → torque=X
+        if line.startswith("[DPID-AF]"):
             dpid_debug_match = re.search(
-                r'\[DPID\] pitch=([-\d.]+)° err=([-\d.]+)° rate=([-\d.]+)°/s \| '
-                r'Angle: P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → tgt_spd=([-\d.]+) \| '
-                r'Speed: err=([-\d.]+) P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → torque=([-\d.]+)', line)
+                r'\[DPID-AF\] pitch=([-\d.]+)° err=([-\d.]+)° rate=([-\d.]+)°/s \| '
+                r'Angle\(外\): P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → tgt_spd=([-\d.]+) \| '
+                r'Speed\(内\): err=([-\d.]+) P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → torque=([-\d.]+)', line)
             if dpid_debug_match:
                 try:
                     pitch = float(dpid_debug_match.group(1))
@@ -4552,11 +5076,43 @@ class PIDTunerUI(QMainWindow):
                     speed_d = float(dpid_debug_match.group(11))
                     torque = float(dpid_debug_match.group(12))
                     if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_loop_order_ui(0)
                         self.dual_pid_panel.update_dpid_debug(
                             pitch, err, rate, angle_p, angle_i, angle_d, tgt_spd,
                             spd_err, speed_p, speed_i, speed_d, torque)
                 except:
                     pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return
+        
+        if line.startswith("[DPID-SF]"):
+            dpid_sf_match = re.search(
+                r'\[DPID-SF\] pitch=([-\d.]+)° spd=([-\d.]+) \| '
+                r'Speed\(外\): err=([-\d.]+) P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → tgt_pitch=([-\d.]+)° \| '
+                r'Angle\(内\): err=([-\d.]+) P=([-\d.]+) I=([-\d.]+) D=([-\d.]+) → torque=([-\d.]+)', line)
+            if dpid_sf_match:
+                try:
+                    pitch = float(dpid_sf_match.group(1))
+                    spd = float(dpid_sf_match.group(2))
+                    spd_err = float(dpid_sf_match.group(3))
+                    speed_p = float(dpid_sf_match.group(4))
+                    speed_i = float(dpid_sf_match.group(5))
+                    speed_d = float(dpid_sf_match.group(6))
+                    tgt_pitch = float(dpid_sf_match.group(7))
+                    angle_err = float(dpid_sf_match.group(8))
+                    angle_p = float(dpid_sf_match.group(9))
+                    angle_i = float(dpid_sf_match.group(10))
+                    angle_d = float(dpid_sf_match.group(11))
+                    torque = float(dpid_sf_match.group(12))
+                    if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_loop_order_ui(1)
+                        self.dual_pid_panel.update_dpid_debug_sf(
+                            pitch, spd, spd_err, speed_p, speed_i, speed_d, tgt_pitch,
+                            angle_err, angle_p, angle_i, angle_d, torque)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         
@@ -4582,6 +5138,26 @@ class PIDTunerUI(QMainWindow):
                     pass
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
+        
+        # X-Offset 调试输出
+        # 格式: [XOFF] spd=X → x_off=Xm (Kp=X Ki=X Kd=X lim=X)
+        if line.startswith("[XOFF]"):
+            xoff_match = re.search(
+                r'\[XOFF\] spd=([-\d.]+) → x_off=([-\d.]+)m', line)
+            if xoff_match:
+                try:
+                    spd = float(xoff_match.group(1))
+                    x_off = float(xoff_match.group(2))
+                    if hasattr(self, 'balance_panel'):
+                        self.balance_panel.xoffset_val_label.setText(
+                            f"x_offset: {x_off:.4f} m ({x_off*100:.2f} cm) | speed: {spd:.3f} m/s")
+                        self.balance_panel.xoffset_status.setText("状态: 已开启")
+                        self.balance_panel.xoffset_status.setStyleSheet(SS(
+                            "font-size: 14px; font-weight: bold; color: #4CAF50;"))
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return
         
         # 控制模式切换
         if line.startswith("CTRL_MODE:"):
@@ -4939,6 +5515,11 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     apply_dark_theme(app)
+    
+    # 计算 DPI 缩放因子并应用全局自适应样式
+    _compute_scale_factor(app)
+    app.setStyleSheet(_build_global_stylesheet())
+    print(f"[UI] Screen scale factor: {_SCALE_FACTOR:.2f}")
     
     window = PIDTunerUI()
     window.show()

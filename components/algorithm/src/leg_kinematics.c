@@ -327,6 +327,91 @@ void leg_kin_print_params(const leg_kin_params_t *params, bool is_left) {
 }
 
 // ============================================================================
+// Body 坐标系笛卡尔接口实现 (极坐标 ↔ 直角坐标)
+// ============================================================================
+// 坐标关系 (body 坐标系, 原点在髋关节):
+//   x = L * cos(α)    向后为正
+//   y = L * sin(α)    向上为正 (站立时 α=-90°, y=-L, 即向下)
+//   L = sqrt(x² + y²)
+//   α = atan2(y, x)
+
+void leg_kin_polar_to_cartesian(float leg_length, float body_angle_deg,
+                                float *x, float *y) {
+    if (x == NULL || y == NULL) return;
+    float alpha_rad = DEG2RAD(body_angle_deg);
+    *x = leg_length * cosf(alpha_rad);
+    *y = leg_length * sinf(alpha_rad);
+}
+
+void leg_kin_cartesian_to_polar(float x, float y,
+                                float *leg_length, float *body_angle_deg) {
+    if (leg_length == NULL || body_angle_deg == NULL) return;
+    *leg_length = sqrtf(x * x + y * y);
+    *body_angle_deg = RAD2DEG(atan2f(y, x));
+}
+
+esp_err_t leg_kin_inverse_cartesian_body(float x, float y, bool is_left,
+                                         const leg_kin_params_t *params,
+                                         leg_joint_state_t *joint) {
+    if (joint == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 笛卡尔 → 极坐标
+    float L = sqrtf(x * x + y * y);
+    float alpha_deg = RAD2DEG(atan2f(y, x));
+    
+    // 复用极坐标 IK
+    leg_workspace_state_t ws = {
+        .leg_length = L,
+        .body_angle = alpha_deg
+    };
+    return leg_kin_inverse(&ws, is_left, params, joint);
+}
+
+esp_err_t leg_kin_forward_cartesian_body(const leg_joint_state_t *joint,
+                                         bool is_left,
+                                         const leg_kin_params_t *params,
+                                         float *x, float *y) {
+    if (joint == NULL || x == NULL || y == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 先做极坐标 FK
+    leg_workspace_state_t ws;
+    esp_err_t ret = leg_kin_forward(joint, is_left, params, &ws);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    // 极坐标 → 笛卡尔
+    leg_kin_polar_to_cartesian(ws.leg_length, ws.body_angle, x, y);
+    return ESP_OK;
+}
+
+void leg_kin_clamp_cartesian_body(float *x, float *y,
+                                  const leg_kin_params_t *params) {
+    if (x == NULL || y == NULL) return;
+    
+    // 笛卡尔 → 极坐标
+    float L, alpha_deg;
+    leg_kin_cartesian_to_polar(*x, *y, &L, &alpha_deg);
+    
+    // 复用极坐标 clamp
+    leg_kin_clamp_workspace(&L, &alpha_deg, params);
+    
+    // 极坐标 → 笛卡尔
+    leg_kin_polar_to_cartesian(L, alpha_deg, x, y);
+}
+
+bool leg_kin_is_reachable_cartesian_body(float x, float y,
+                                         const leg_kin_params_t *params) {
+    float L = sqrtf(x * x + y * y);
+    float alpha_deg = RAD2DEG(atan2f(y, x));
+    return leg_kin_is_reachable(L, alpha_deg, params);
+}
+
+// ============================================================================
 // VMC (Virtual Model Control) 实现
 // ============================================================================
 

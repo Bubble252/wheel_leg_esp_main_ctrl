@@ -313,6 +313,19 @@ static bool g_roll_control_enabled = false;  // 默认禁用
 static bool g_pitch_leg_comp_enabled = false; // 默认禁用腿部角度补偿
 
 // ============================================================================
+// X-Offset 腿部速度自适应偏移 (独立腿部姿态控制)
+// ============================================================================
+// 功能: 根据当前轮速，用 PID 控制腿脚在笛卡尔 x 方向的偏移
+//   速度>0 (前进) → x_offset>0 (腿脚后摆) → 类似人跑步时支撑腿后蹬
+//   速度=0 → x_offset=0 (腿回中位)
+// 与平衡控制完全独立，只改变腿的几何形状，不影响轮力矩
+static bool g_xoffset_enabled = false;           // X-Offset 使能开关
+static pid_controller_t g_xoffset_pid;           // X-Offset PID 控制器
+static float g_xoffset_value = 0.0f;             // 当前 x_offset 输出 (米)
+static float g_xoffset_limit = 0.03f;            // X-Offset 限幅 (米), 默认 ±3cm
+static float g_xoffset_debug_speed = 0.0f;       // 调试用: 当时的速度输入
+
+// ============================================================================
 // VMC (Virtual Model Control) 力控模式
 // ============================================================================
 static bool g_vmc_enabled = false;           // VMC 力控使能 (与位置控制互斥)
@@ -736,21 +749,40 @@ static void output_pid_debug(const lqr_input_t *input) {
     
     if (g_control_mode == CTRL_MODE_DUAL_PID) {
         // 双环 PID 调试输出
-        printf("[DPID] pitch=%.2f° err=%.2f° rate=%.1f°/s | "
-               "Angle: P=%.2f I=%.3f D=%.3f → tgt_spd=%.2f | "
-               "Speed: err=%.2f P=%.2f I=%.3f D=%.3f → torque=%.3f\n",
-               pitch,
-               g_dual_pid_output.angle_error,
-               pitch_rate,
-               g_dual_pid_output.angle_p_out,
-               g_dual_pid_output.angle_i_out,
-               g_dual_pid_output.angle_d_out,
-               g_dual_pid_output.target_speed,
-               g_dual_pid_output.speed_error,
-               g_dual_pid_output.speed_p_out,
-               g_dual_pid_output.speed_i_out,
-               g_dual_pid_output.speed_d_out,
-               g_dual_pid_output.torque);
+        if (g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST) {
+            // 速度优先模式: 速度环(外)→角度环(内)
+            printf("[DPID-SF] pitch=%.2f° spd=%.2f | "
+                   "Speed(外): err=%.2f P=%.2f I=%.3f D=%.3f → tgt_pitch=%.2f° | "
+                   "Angle(内): err=%.2f P=%.2f I=%.3f D=%.3f → torque=%.3f\n",
+                   pitch, wheel_speed,
+                   g_dual_pid_output.speed_error,
+                   g_dual_pid_output.speed_p_out,
+                   g_dual_pid_output.speed_i_out,
+                   g_dual_pid_output.speed_d_out,
+                   g_dual_pid_output.target_speed,
+                   g_dual_pid_output.angle_error,
+                   g_dual_pid_output.angle_p_out,
+                   g_dual_pid_output.angle_i_out,
+                   g_dual_pid_output.angle_d_out,
+                   g_dual_pid_output.torque);
+        } else {
+            // 角度优先模式: 角度环(外)→速度环(内)
+            printf("[DPID-AF] pitch=%.2f° err=%.2f° rate=%.1f°/s | "
+                   "Angle(外): P=%.2f I=%.3f D=%.3f → tgt_spd=%.2f | "
+                   "Speed(内): err=%.2f P=%.2f I=%.3f D=%.3f → torque=%.3f\n",
+                   pitch,
+                   g_dual_pid_output.angle_error,
+                   pitch_rate,
+                   g_dual_pid_output.angle_p_out,
+                   g_dual_pid_output.angle_i_out,
+                   g_dual_pid_output.angle_d_out,
+                   g_dual_pid_output.target_speed,
+                   g_dual_pid_output.speed_error,
+                   g_dual_pid_output.speed_p_out,
+                   g_dual_pid_output.speed_i_out,
+                   g_dual_pid_output.speed_d_out,
+                   g_dual_pid_output.torque);
+        }
                
     } else if (g_control_mode == CTRL_MODE_SINGLE_PID) {
         // 单环 PID 调试输出
@@ -773,6 +805,13 @@ static void output_pid_debug(const lqr_input_t *input) {
                pitch, pitch_rate,
                g_lqr_distance, wheel_speed,
                g_last_lqr_u, g_yaw_output);
+    }
+    
+    // X-Offset 调试输出 (附加行，仅在启用时显示)
+    if (g_xoffset_enabled) {
+        printf("[XOFF] spd=%.3f → x_off=%.4fm (Kp=%.4f Ki=%.4f Kd=%.4f lim=%.3f)\n",
+               g_xoffset_debug_speed, g_xoffset_value,
+               g_xoffset_pid.kp, g_xoffset_pid.ki, g_xoffset_pid.kd, g_xoffset_limit);
     }
 }
 
@@ -1183,6 +1222,48 @@ bool balance_test_get_pitch_comp(void) {
 }
 
 // ============================================================================
+// X-Offset 腿部速度自适应偏移 API
+// ============================================================================
+
+/**
+ * @brief 使能/禁用 X-Offset
+ */
+void balance_test_set_xoffset(bool enable) {
+    g_xoffset_enabled = enable;
+    if (!enable) {
+        pid_reset(&g_xoffset_pid);
+        g_xoffset_value = 0.0f;
+    }
+    ESP_LOGI(TAG, "X-Offset %s", enable ? "ENABLED" : "DISABLED");
+}
+
+/**
+ * @brief 获取 X-Offset 状态
+ */
+bool balance_test_get_xoffset(void) {
+    return g_xoffset_enabled;
+}
+
+/**
+ * @brief 设置 X-Offset PID 增益
+ */
+void balance_test_set_xoffset_pid(float kp, float ki, float kd) {
+    pid_set_gains(&g_xoffset_pid, kp, ki, kd);
+    ESP_LOGI(TAG, "X-Offset PID: Kp=%.4f Ki=%.4f Kd=%.4f", kp, ki, kd);
+}
+
+/**
+ * @brief 设置 X-Offset 限幅
+ */
+void balance_test_set_xoffset_limit(float limit) {
+    if (limit < 0.001f) limit = 0.001f;
+    if (limit > 0.08f) limit = 0.08f;  // 最大 8cm
+    g_xoffset_limit = limit;
+    pid_set_output_limits(&g_xoffset_pid, -limit, limit);
+    ESP_LOGI(TAG, "X-Offset limit: %.3f m", limit);
+}
+
+// ============================================================================
 // 内部函数声明
 // ============================================================================
 
@@ -1195,6 +1276,7 @@ static void task_unified_control(void *arg);      // 合并任务 (IMU + 控制 
 static void update_remote_from_wifi(void);
 static void compute_balance_output(float dt);
 static void apply_motor_commands(void);
+static esp_err_t leg_ctrl_get_state_cached(bool is_left, leg_state_t *state);
 
 // ============================================================================
 // 初始化
@@ -1326,6 +1408,22 @@ esp_err_t balance_test_init(void) {
     // - query_callback: 收到查询命令时返回 LQR 实际参数
     commander_parser_init(commander_param_callback, commander_query_callback);
     ESP_LOGI(TAG, "Commander parser initialized with LQR callbacks");
+    
+    // 初始化 X-Offset PID (腿部速度自适应偏移)
+    {
+        pid_params_t xoffset_params = {
+            .kp = 0.01f,           // 默认比例增益 (m/s → m)
+            .ki = 0.0f,            // 默认无积分
+            .kd = 0.0f,            // 默认无微分
+            .output_min = -g_xoffset_limit,
+            .output_max = g_xoffset_limit,
+            .integral_max = g_xoffset_limit * 0.5f,
+            .d_filter_coef = 0.1f,
+        };
+        pid_init(&g_xoffset_pid, &xoffset_params);
+        ESP_LOGI(TAG, "X-Offset PID initialized (Kp=%.4f, limit=%.3fm)", 
+                 xoffset_params.kp, g_xoffset_limit);
+    }
     
     // 初始化 WiFi 遥控 (但不启动)
     ret = wifi_remote_init();
@@ -1592,7 +1690,13 @@ void balance_test_get_stats(balance_test_stats_t *stats) {
 void balance_test_set_angle_zeropoint(float zeropoint) {
     g_angle_zeropoint = zeropoint;
     lqr_set_angle_zeropoint(&g_lqr_ctrl, zeropoint);
-    ESP_LOGI(TAG, "Angle zeropoint set to %.2f", zeropoint);
+    if (g_dual_pid_initialized) {
+        dual_pid_set_angle_zeropoint(&g_dual_pid_ctrl, zeropoint);
+    }
+    if (g_single_pid_initialized) {
+        single_pid_set_angle_zeropoint(&g_single_pid_ctrl, zeropoint);
+    }
+    ESP_LOGI(TAG, "Angle zeropoint set to %.2f (synced to all controllers)", zeropoint);
 }
 
 float balance_test_get_angle_zeropoint(void) {
@@ -1614,6 +1718,10 @@ void balance_test_print_status(void) {
     ESP_LOGI(TAG, "Angle zeropoint: %.2f deg", g_angle_zeropoint);
     ESP_LOGI(TAG, "Roll control: %s", g_roll_control_enabled ? "ENABLED" : "DISABLED");
     ESP_LOGI(TAG, "Pitch leg comp: %s", g_pitch_leg_comp_enabled ? "ENABLED" : "DISABLED");
+    ESP_LOGI(TAG, "X-Offset: %s (val=%.4fm, speed=%.3fm/s, Kp=%.4f Ki=%.4f Kd=%.4f lim=%.3f)",
+             g_xoffset_enabled ? "ENABLED" : "DISABLED",
+             g_xoffset_value, g_xoffset_debug_speed,
+             g_xoffset_pid.kp, g_xoffset_pid.ki, g_xoffset_pid.kd, g_xoffset_limit);
     ESP_LOGI(TAG, "Leg control: %s", g_leg_control_enabled ? "ENABLED" : "DISABLED");
     if (g_leg_control_enabled) {
         ESP_LOGI(TAG, "  Leg targets: L=%.3fm/%.1fdeg, R=%.3fm/%.1fdeg",
@@ -1656,6 +1764,17 @@ void balance_test_print_status(void) {
     
     ESP_LOGI(TAG, "LQR distance: %.2f", g_lqr_distance);
     ESP_LOGI(TAG, "Distance zeropoint: %.2f", g_distance_zeropoint);
+    
+    // CAN 总线错误统计
+    uint32_t busoff_cnt, tx_err_cnt, recovery_cnt;
+    can_bus_get_error_stats(&busoff_cnt, &tx_err_cnt, &recovery_cnt);
+    if (busoff_cnt > 0 || tx_err_cnt > 0) {
+        ESP_LOGW(TAG, "CAN errors: Bus-Off=%lu, TX_fail=%lu, Recovered=%lu",
+                 busoff_cnt, tx_err_cnt, recovery_cnt);
+    } else {
+        ESP_LOGI(TAG, "CAN bus: OK (no errors)");
+    }
+    
     ESP_LOGI(TAG, "===========================");
 }
 
@@ -2112,12 +2231,12 @@ static void compute_balance_output(float dt) {
     // 当腿向前倾斜 body_angle > -90° 时，theta3 > pitch
     float pitch_for_control = imu.pitch;
     if (g_leg_control_enabled && g_pitch_leg_comp_enabled) {
-        // 使用 FK 从电机编码器获取实际的 body_angle
+        // 使用 FK 从电机编码器缓存获取实际的 body_angle (无阻塞)
         leg_state_t left_leg_state, right_leg_state;
         float avg_body_angle = -90.0f;  // 默认垂直
         
-        if (leg_ctrl_get_state(true, &left_leg_state) == ESP_OK && 
-            leg_ctrl_get_state(false, &right_leg_state) == ESP_OK &&
+        if (leg_ctrl_get_state_cached(true, &left_leg_state) == ESP_OK && 
+            leg_ctrl_get_state_cached(false, &right_leg_state) == ESP_OK &&
             left_leg_state.valid && right_leg_state.valid) {
             // 使用左右腿实际角度的平均值
             float left_body_angle = left_leg_state.workspace.body_angle;
@@ -2342,6 +2461,23 @@ static void compute_balance_output(float dt) {
         }
         g_last_lqr_u = output.lqr_u;  // 保存用于波形显示
         
+        // ======== X-Offset 计算 (腿部速度自适应偏移) ========
+        // 在 Roll 控制之前计算 x_offset，后面 Roll 控制中使用偏移后的角度
+        // 输入: 当前轮速 (g_lqr_speed, 所有模式都计算)
+        // 输出: g_xoffset_value (笛卡尔 x 方向偏移, 米)
+        if (g_xoffset_enabled && g_leg_control_enabled) {
+            g_xoffset_debug_speed = g_lqr_speed;
+            // PID: setpoint=当前速度, measurement=0
+            // 速度>0(前进) → error>0 → x_offset>0 (腿向后摆)
+            g_xoffset_value = pid_compute(&g_xoffset_pid, g_lqr_speed, 0.0f, dt);
+        } else {
+            g_xoffset_value = 0.0f;
+            g_xoffset_debug_speed = 0.0f;
+            if (!g_xoffset_enabled) {
+                pid_reset(&g_xoffset_pid);
+            }
+        }
+        
         // ======== Roll 控制 (腿长调节) ========
         // 仅在腿控制使能且 Roll 控制使能时执行
         // Roll 控制原理: 在基础腿长上对称调节左右腿长度
@@ -2363,6 +2499,23 @@ static void compute_balance_output(float dt) {
                 float new_right_length = g_leg_base_length + roll_output.right_leg_delta;
                 float left_angle = g_leg_base_angle;
                 float right_angle = g_leg_base_angle;
+                
+                // ---- X-Offset: 在笛卡尔空间偏移腿脚 x 位置 ----
+                if (fabsf(g_xoffset_value) > 0.0001f) {
+                    // 左腿: (L, α) → (x, y) → x += offset → (L', α')
+                    float lx, ly;
+                    leg_kin_polar_to_cartesian(new_left_length, left_angle, &lx, &ly);
+                    lx += g_xoffset_value;
+                    leg_kin_clamp_cartesian_body(&lx, &ly, NULL);
+                    leg_kin_cartesian_to_polar(lx, ly, &new_left_length, &left_angle);
+                    
+                    // 右腿: 同样偏移
+                    float rx, ry;
+                    leg_kin_polar_to_cartesian(new_right_length, right_angle, &rx, &ry);
+                    rx += g_xoffset_value;
+                    leg_kin_clamp_cartesian_body(&rx, &ry, NULL);
+                    leg_kin_cartesian_to_polar(rx, ry, &new_right_length, &right_angle);
+                }
                 
                 // 使用动态可调的腿长范围做限幅
                 if (new_left_length < g_leg_length_min) new_left_length = g_leg_length_min;
@@ -2396,10 +2549,42 @@ static void compute_balance_output(float dt) {
             }
         } else {
             // Roll 控制未启用时，使用基础腿长 (左右对称)
-            g_leg_left_target_length = g_leg_base_length;
-            g_leg_right_target_length = g_leg_base_length;
-            g_leg_left_target_angle = g_leg_base_angle;
-            g_leg_right_target_angle = g_leg_base_angle;
+            float base_length = g_leg_base_length;
+            float base_angle = g_leg_base_angle;
+            
+            // X-Offset: 即使 Roll 未启用，也可以应用 x_offset
+            if (g_leg_control_enabled && fabsf(g_xoffset_value) > 0.0001f) {
+                float lx, ly;
+                leg_kin_polar_to_cartesian(base_length, base_angle, &lx, &ly);
+                lx += g_xoffset_value;
+                leg_kin_clamp_cartesian_body(&lx, &ly, NULL);
+                
+                float new_length, new_angle;
+                leg_kin_cartesian_to_polar(lx, ly, &new_length, &new_angle);
+                
+                // IK 计算偏移后的关节角度
+                leg_workspace_state_t left_ws = { .leg_length = new_length, .body_angle = new_angle };
+                leg_workspace_state_t right_ws = { .leg_length = new_length, .body_angle = new_angle };
+                leg_joint_state_t left_joint, right_joint;
+                
+                if (leg_kin_inverse(&left_ws, true, NULL, &left_joint) == ESP_OK) {
+                    g_leg_left_target_length = new_length;
+                    g_leg_left_target_angle = new_angle;
+                    g_leg_left_hip_angle = left_joint.hip_angle;
+                    g_leg_left_knee_angle = left_joint.knee_angle;
+                }
+                if (leg_kin_inverse(&right_ws, false, NULL, &right_joint) == ESP_OK) {
+                    g_leg_right_target_length = new_length;
+                    g_leg_right_target_angle = new_angle;
+                    g_leg_right_hip_angle = right_joint.hip_angle;
+                    g_leg_right_knee_angle = right_joint.knee_angle;
+                }
+            } else {
+                g_leg_left_target_length = base_length;
+                g_leg_right_target_length = base_length;
+                g_leg_left_target_angle = base_angle;
+                g_leg_right_target_angle = base_angle;
+            }
             
             // 清零调试变量
             g_roll_output = 0.0f;
@@ -2410,9 +2595,23 @@ static void compute_balance_output(float dt) {
         }  // end of LQR balance_loop success
     }  // end of LQR mode
     
-    // ======== Roll 控制 (两种模式通用，在 LQR 模式之外也可用) ========
-    // 注: 双环PID模式下也可以使用 Roll 控制，只需保持腿部控制启用
-    if (g_control_mode == CTRL_MODE_DUAL_PID && g_leg_control_enabled && g_roll_control_enabled) {
+    // ======== X-Offset 计算 (非 LQR 模式: Dual PID / Single PID) ========
+    // LQR 模式的 x_offset 已在上面计算, 这里处理 Dual PID 和 Single PID 模式
+    if (g_control_mode != CTRL_MODE_LQR && g_xoffset_enabled && g_leg_control_enabled) {
+        g_xoffset_debug_speed = g_lqr_speed;
+        g_xoffset_value = pid_compute(&g_xoffset_pid, g_lqr_speed, 0.0f, dt);
+    } else if (g_control_mode != CTRL_MODE_LQR) {
+        g_xoffset_value = 0.0f;
+        g_xoffset_debug_speed = 0.0f;
+        if (!g_xoffset_enabled) {
+            pid_reset(&g_xoffset_pid);
+        }
+    }
+    
+    // ======== Roll 控制 + X-Offset (非 LQR 模式通用: Dual PID / Single PID) ========
+    // 注: 双环PID和单环PID模式下也可以使用 Roll 控制和 X-Offset
+    bool is_non_lqr = (g_control_mode == CTRL_MODE_DUAL_PID || g_control_mode == CTRL_MODE_SINGLE_PID);
+    if (is_non_lqr && g_leg_control_enabled && g_roll_control_enabled) {
         lqr_roll_output_t roll_output;
         esp_err_t roll_ret = lqr_roll_loop(&g_lqr_ctrl, &input, &roll_output);
         
@@ -2424,14 +2623,79 @@ static void compute_balance_output(float dt) {
             
             float new_left_length = g_leg_base_length + roll_output.left_leg_delta;
             float new_right_length = g_leg_base_length + roll_output.right_leg_delta;
+            float left_angle = g_leg_base_angle;
+            float right_angle = g_leg_base_angle;
             
             if (new_left_length < g_leg_length_min) new_left_length = g_leg_length_min;
             if (new_left_length > g_leg_length_max) new_left_length = g_leg_length_max;
             if (new_right_length < g_leg_length_min) new_right_length = g_leg_length_min;
             if (new_right_length > g_leg_length_max) new_right_length = g_leg_length_max;
             
-            g_leg_left_target_length = new_left_length;
-            g_leg_right_target_length = new_right_length;
+            // ---- X-Offset: 笛卡尔空间偏移 (非 LQR 模式) ----
+            if (fabsf(g_xoffset_value) > 0.0001f) {
+                float lx, ly;
+                leg_kin_polar_to_cartesian(new_left_length, left_angle, &lx, &ly);
+                lx += g_xoffset_value;
+                leg_kin_clamp_cartesian_body(&lx, &ly, NULL);
+                leg_kin_cartesian_to_polar(lx, ly, &new_left_length, &left_angle);
+                
+                float rx, ry;
+                leg_kin_polar_to_cartesian(new_right_length, right_angle, &rx, &ry);
+                rx += g_xoffset_value;
+                leg_kin_clamp_cartesian_body(&rx, &ry, NULL);
+                leg_kin_cartesian_to_polar(rx, ry, &new_right_length, &right_angle);
+            }
+            
+            // Clamp + IK (非 LQR 模式也需要完整 IK)
+            leg_kin_clamp_workspace(&new_left_length, &left_angle, NULL);
+            leg_kin_clamp_workspace(&new_right_length, &right_angle, NULL);
+            
+            leg_workspace_state_t left_ws = { .leg_length = new_left_length, .body_angle = left_angle };
+            leg_workspace_state_t right_ws = { .leg_length = new_right_length, .body_angle = right_angle };
+            leg_joint_state_t left_joint, right_joint;
+            
+            if (leg_kin_inverse(&left_ws, true, NULL, &left_joint) == ESP_OK) {
+                g_leg_left_target_length = new_left_length;
+                g_leg_left_target_angle = left_angle;
+                g_leg_left_hip_angle = left_joint.hip_angle;
+                g_leg_left_knee_angle = left_joint.knee_angle;
+            }
+            if (leg_kin_inverse(&right_ws, false, NULL, &right_joint) == ESP_OK) {
+                g_leg_right_target_length = new_right_length;
+                g_leg_right_target_angle = right_angle;
+                g_leg_right_hip_angle = right_joint.hip_angle;
+                g_leg_right_knee_angle = right_joint.knee_angle;
+            }
+        }
+    } else if (is_non_lqr && g_leg_control_enabled && !g_roll_control_enabled) {
+        // 非 LQR 模式, Roll 未启用, 但 x_offset 可能仍然有效
+        if (fabsf(g_xoffset_value) > 0.0001f) {
+            float base_length = g_leg_base_length;
+            float base_angle = g_leg_base_angle;
+            float lx, ly;
+            leg_kin_polar_to_cartesian(base_length, base_angle, &lx, &ly);
+            lx += g_xoffset_value;
+            leg_kin_clamp_cartesian_body(&lx, &ly, NULL);
+            
+            float new_length, new_angle;
+            leg_kin_cartesian_to_polar(lx, ly, &new_length, &new_angle);
+            
+            leg_workspace_state_t left_ws = { .leg_length = new_length, .body_angle = new_angle };
+            leg_workspace_state_t right_ws = { .leg_length = new_length, .body_angle = new_angle };
+            leg_joint_state_t left_joint, right_joint;
+            
+            if (leg_kin_inverse(&left_ws, true, NULL, &left_joint) == ESP_OK) {
+                g_leg_left_target_length = new_length;
+                g_leg_left_target_angle = new_angle;
+                g_leg_left_hip_angle = left_joint.hip_angle;
+                g_leg_left_knee_angle = left_joint.knee_angle;
+            }
+            if (leg_kin_inverse(&right_ws, false, NULL, &right_joint) == ESP_OK) {
+                g_leg_right_target_length = new_length;
+                g_leg_right_target_angle = new_angle;
+                g_leg_right_hip_angle = right_joint.hip_angle;
+                g_leg_right_knee_angle = right_joint.knee_angle;
+            }
         }
     }
     
@@ -2940,6 +3204,66 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else {
             printf("Unknown pitchcomp command: %s\n", token);
             printf("Usage: balance pitchcomp [on|off]\n");
+        }
+    }
+    // ===== X-Offset 腿部速度自适应偏移 =====
+    else if (strcmp(token, "xoffset") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            // 显示状态
+            printf("=== X-Offset Status ===\n");
+            printf("X-Offset: %s\n", g_xoffset_enabled ? "ENABLED" : "DISABLED");
+            printf("PID: Kp=%.4f Ki=%.4f Kd=%.4f\n", 
+                   g_xoffset_pid.kp, g_xoffset_pid.ki, g_xoffset_pid.kd);
+            printf("Limit: %.3f m (%.1f cm)\n", g_xoffset_limit, g_xoffset_limit * 100.0f);
+            printf("Current value: %.4f m (speed=%.3f m/s)\n", 
+                   g_xoffset_value, g_xoffset_debug_speed);
+            printf("Usage: balance xoffset [on|off|kp|ki|kd|limit]\n");
+        } else if (strcmp(token, "on") == 0) {
+            balance_test_set_xoffset(true);
+            printf("X-Offset enabled\n");
+        } else if (strcmp(token, "off") == 0) {
+            balance_test_set_xoffset(false);
+            printf("X-Offset disabled\n");
+        } else if (strcmp(token, "kp") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float kp = atof(token);
+                balance_test_set_xoffset_pid(kp, g_xoffset_pid.ki, g_xoffset_pid.kd);
+                printf("X-Offset Kp = %.4f\n", kp);
+            } else {
+                printf("Current Kp = %.4f\n", g_xoffset_pid.kp);
+            }
+        } else if (strcmp(token, "ki") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float ki = atof(token);
+                balance_test_set_xoffset_pid(g_xoffset_pid.kp, ki, g_xoffset_pid.kd);
+                printf("X-Offset Ki = %.4f\n", ki);
+            } else {
+                printf("Current Ki = %.4f\n", g_xoffset_pid.ki);
+            }
+        } else if (strcmp(token, "kd") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float kd = atof(token);
+                balance_test_set_xoffset_pid(g_xoffset_pid.kp, g_xoffset_pid.ki, kd);
+                printf("X-Offset Kd = %.4f\n", kd);
+            } else {
+                printf("Current Kd = %.4f\n", g_xoffset_pid.kd);
+            }
+        } else if (strcmp(token, "limit") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float limit = atof(token);
+                balance_test_set_xoffset_limit(limit);
+                printf("X-Offset limit = %.3f m\n", limit);
+            } else {
+                printf("Current limit = %.3f m (%.1f cm)\n", g_xoffset_limit, g_xoffset_limit * 100.0f);
+            }
+        } else {
+            printf("Unknown xoffset command: %s\n", token);
+            printf("Usage: balance xoffset [on|off|kp <val>|ki <val>|kd <val>|limit <val>]\n");
         }
     }
     // ===== VMC 力控模式 =====
@@ -3528,7 +3852,9 @@ void balance_test_process_cmd(const char *cmd_str) {
                     can_motor_set_mode(g_motor_left, MODE_TORQUE);
                     can_motor_set_mode(g_motor_right, MODE_TORQUE);
                 }
-                printf("Control mode set to DUAL_PID (torque mode)\n");
+                printf("Control mode set to DUAL_PID (torque mode, %s)\n",
+                       g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST 
+                           ? "SPEED_FIRST" : "ANGLE_FIRST");
                 printf("CTRL_MODE:DUAL_PID\n");
             }
         } else if (strcmp(token, "spid") == 0 || strcmp(token, "single") == 0 || strcmp(token, "2") == 0) {
@@ -3555,18 +3881,31 @@ void balance_test_process_cmd(const char *cmd_str) {
         token = strtok(NULL, " \t\n\r");
         if (token == NULL) {
             // 显示当前参数
+            const char *order_str = g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST
+                ? "SPEED_FIRST (速度环外→角度环内)" : "ANGLE_FIRST (角度环外→速度环内)";
             printf("=== Dual PID Parameters ===\n");
-            printf("Angle PID (outer loop): kp=%.2f ki=%.2f kd=%.3f limit=%.1f\n",
-                   g_dual_pid_ctrl.params.angle_kp, g_dual_pid_ctrl.params.angle_ki,
-                   g_dual_pid_ctrl.params.angle_kd, g_dual_pid_ctrl.params.angle_limit);
-            printf("Speed PID (inner loop): kp=%.2f ki=%.2f kd=%.3f limit=%.1f\n",
-                   g_dual_pid_ctrl.params.speed_kp, g_dual_pid_ctrl.params.speed_ki,
-                   g_dual_pid_ctrl.params.speed_kd, g_dual_pid_ctrl.params.speed_limit);
+            printf("Loop order: %s\n", order_str);
+            if (g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST) {
+                printf("Speed PID (outer): kp=%.2f ki=%.2f kd=%.3f limit=%.1f (max pitch target °)\n",
+                       g_dual_pid_ctrl.params.speed_kp, g_dual_pid_ctrl.params.speed_ki,
+                       g_dual_pid_ctrl.params.speed_kd, g_dual_pid_ctrl.params.speed_limit);
+                printf("Angle PID (inner): kp=%.2f ki=%.2f kd=%.3f limit=%.1f (max torque)\n",
+                       g_dual_pid_ctrl.params.angle_kp, g_dual_pid_ctrl.params.angle_ki,
+                       g_dual_pid_ctrl.params.angle_kd, g_dual_pid_ctrl.params.angle_limit);
+            } else {
+                printf("Angle PID (outer): kp=%.2f ki=%.2f kd=%.3f limit=%.1f (max target speed)\n",
+                       g_dual_pid_ctrl.params.angle_kp, g_dual_pid_ctrl.params.angle_ki,
+                       g_dual_pid_ctrl.params.angle_kd, g_dual_pid_ctrl.params.angle_limit);
+                printf("Speed PID (inner): kp=%.2f ki=%.2f kd=%.3f limit=%.1f (max torque)\n",
+                       g_dual_pid_ctrl.params.speed_kp, g_dual_pid_ctrl.params.speed_ki,
+                       g_dual_pid_ctrl.params.speed_kd, g_dual_pid_ctrl.params.speed_limit);
+            }
             printf("Angle zeropoint: %.2f deg\n", g_dual_pid_ctrl.params.angle_zeropoint);
             printf("Max torque: %.1f Nm\n", g_dual_pid_ctrl.params.max_torque);
             printf("\nUsage: balance dpid angle <kp> <ki> <kd>\n");
             printf("       balance dpid speed <kp> <ki> <kd>\n");
             printf("       balance dpid zero <degrees>\n");
+            printf("       balance dpid order <0|1>  (0=ANGLE_FIRST, 1=SPEED_FIRST)\n");
             printf("       balance dpid reset\n");
             printf("       balance dpid status\n");
         } else if (strcmp(token, "angle") == 0) {
@@ -3616,25 +3955,56 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else if (strcmp(token, "reset") == 0) {
             dual_pid_reset(&g_dual_pid_ctrl);
             printf("Dual PID controller reset\n");
+        } else if (strcmp(token, "order") == 0) {
+            // 设置环路顺序
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                int order = atoi(token);
+                if (order == 0 || order == 1) {
+                    dual_pid_set_loop_order(&g_dual_pid_ctrl, (uint8_t)order);
+                    printf("Dual PID loop order set to %s (%d)\n",
+                           order == DUAL_PID_SPEED_FIRST ? "SPEED_FIRST (速度环外,角度环内)" 
+                                                         : "ANGLE_FIRST (角度环外,速度环内)", order);
+                } else {
+                    printf("Invalid order. Use 0=ANGLE_FIRST, 1=SPEED_FIRST\n");
+                }
+            } else {
+                printf("Current loop order: %s (%d)\n",
+                       g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST 
+                           ? "SPEED_FIRST (速度环外,角度环内)" 
+                           : "ANGLE_FIRST (角度环外,速度环内)",
+                       g_dual_pid_ctrl.params.loop_order);
+                printf("Usage: balance dpid order <0|1>  (0=ANGLE_FIRST, 1=SPEED_FIRST)\n");
+            }
         } else if (strcmp(token, "status") == 0) {
             // 显示实时状态
             printf("=== Dual PID Status ===\n");
             printf("Control mode: %s\n", g_control_mode == CTRL_MODE_DUAL_PID ? "ACTIVE" : "INACTIVE");
-            printf("Angle error: %.2f deg\n", g_dual_pid_output.angle_error);
-            printf("Target speed: %.2f rad/s\n", g_dual_pid_output.target_speed);
-            printf("Speed error: %.2f rad/s\n", g_dual_pid_output.speed_error);
+            printf("Loop order: %s\n", 
+                   g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST 
+                       ? "SPEED_FIRST (速度环外→角度环内)" : "ANGLE_FIRST (角度环外→速度环内)");
+            if (g_dual_pid_ctrl.params.loop_order == DUAL_PID_SPEED_FIRST) {
+                printf("Speed error: %.2f rad/s\n", g_dual_pid_output.speed_error);
+                printf("Pitch target: %.2f deg\n", g_dual_pid_output.target_speed);
+                printf("Angle error: %.2f deg\n", g_dual_pid_output.angle_error);
+            } else {
+                printf("Angle error: %.2f deg\n", g_dual_pid_output.angle_error);
+                printf("Target speed: %.2f rad/s\n", g_dual_pid_output.target_speed);
+                printf("Speed error: %.2f rad/s\n", g_dual_pid_output.speed_error);
+            }
             printf("Output torque: %.2f Nm\n", g_dual_pid_output.torque);
             printf("Angle PID: P=%.2f I=%.2f D=%.3f\n",
                    g_dual_pid_output.angle_p_out, g_dual_pid_output.angle_i_out, g_dual_pid_output.angle_d_out);
             printf("Speed PID: P=%.2f I=%.2f D=%.3f\n",
                    g_dual_pid_output.speed_p_out, g_dual_pid_output.speed_i_out, g_dual_pid_output.speed_d_out);
             // 输出 Qt 可解析格式
-            printf("DPID_STATUS:PITCH_ERR=%.2f,TGT_SPD=%.2f,SPD_ERR=%.2f,TORQUE=%.2f\n",
+            printf("DPID_STATUS:PITCH_ERR=%.2f,TGT_SPD=%.2f,SPD_ERR=%.2f,TORQUE=%.2f,ORDER=%d\n",
                    g_dual_pid_output.angle_error, g_dual_pid_output.target_speed,
-                   g_dual_pid_output.speed_error, g_dual_pid_output.torque);
+                   g_dual_pid_output.speed_error, g_dual_pid_output.torque,
+                   g_dual_pid_ctrl.params.loop_order);
         } else {
             printf("Unknown dpid command: %s\n", token);
-            printf("Usage: balance dpid [angle|speed|zero|reset|status]\n");
+            printf("Usage: balance dpid [angle|speed|zero|order|reset|status]\n");
         }
     }
     // ===== 单环 PID 调参命令 =====
@@ -3801,6 +4171,8 @@ static esp_err_t leg_ctrl_request_position(bool is_left) {
 /**
  * @brief 读取当前腿部状态 (从编码器)
  * @note 会自动请求电机位置更新，确保读取到最新数据
+ * @warning 此函数包含 CAN 请求和阻塞延时 (~48ms/次)，不要在控制循环中使用！
+ *          控制循环中请使用 leg_ctrl_get_state_cached()
  */
 esp_err_t leg_ctrl_get_state(bool is_left, leg_state_t *state) {
     if (state == NULL) {
@@ -3832,6 +4204,45 @@ esp_err_t leg_ctrl_get_state(bool is_left, leg_state_t *state) {
     state->is_left = is_left;
     
     // 调用运动学正解
+    esp_err_t ret = leg_kin_forward(&joint, is_left, NULL, &state->workspace);
+    state->valid = (ret == ESP_OK);
+    
+    return ret;
+}
+
+/**
+ * @brief 读取当前腿部状态 (从缓存，无阻塞)
+ * @note 直接从电机驱动缓存中读取位置，不发送 CAN 请求。
+ *       适合在 200Hz 控制循环中使用，延迟 < 1us。
+ *       数据由 can_motor_process_rx() 在电机通信中自动更新。
+ */
+static esp_err_t leg_ctrl_get_state_cached(bool is_left, leg_state_t *state) {
+    if (state == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    leg_joint_state_t joint;
+    
+    if (is_left) {
+        if (g_motor_left_hip == NULL || g_motor_left_knee == NULL) {
+            state->valid = false;
+            return ESP_ERR_INVALID_STATE;
+        }
+        joint.hip_angle = can_motor_read_position(g_motor_left_hip);
+        joint.knee_angle = can_motor_read_position(g_motor_left_knee);
+    } else {
+        if (g_motor_right_hip == NULL || g_motor_right_knee == NULL) {
+            state->valid = false;
+            return ESP_ERR_INVALID_STATE;
+        }
+        joint.hip_angle = can_motor_read_position(g_motor_right_hip);
+        joint.knee_angle = can_motor_read_position(g_motor_right_knee);
+    }
+    
+    state->joint = joint;
+    state->is_left = is_left;
+    
+    // 调用运动学正解 (纯数学计算，无阻塞)
     esp_err_t ret = leg_kin_forward(&joint, is_left, NULL, &state->workspace);
     state->valid = (ret == ESP_OK);
     

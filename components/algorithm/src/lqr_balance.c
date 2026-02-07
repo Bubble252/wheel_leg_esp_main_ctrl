@@ -630,6 +630,9 @@ static const dual_pid_params_t dual_pid_default_params = {
     
     // 输出限幅
     .max_torque = 8.0f,
+    
+    // 环路顺序: 角度优先 (默认)
+    .loop_order = DUAL_PID_ANGLE_FIRST,
 };
 
 void dual_pid_get_default_params(dual_pid_params_t *params) {
@@ -680,7 +683,8 @@ esp_err_t dual_pid_init(dual_pid_controller_t *ctrl, const dual_pid_params_t *pa
     
     ctrl->initialized = true;
     
-    ESP_LOGI(TAG, "Dual PID controller initialized");
+    ESP_LOGI(TAG, "Dual PID controller initialized (loop_order=%s)",
+             p->loop_order == DUAL_PID_SPEED_FIRST ? "SPEED_FIRST" : "ANGLE_FIRST");
     ESP_LOGI(TAG, "  Angle PID: kp=%.2f, ki=%.2f, kd=%.3f, limit=%.1f",
              p->angle_kp, p->angle_ki, p->angle_kd, p->angle_limit);
     ESP_LOGI(TAG, "  Speed PID: kp=%.2f, ki=%.2f, kd=%.3f, limit=%.1f",
@@ -737,6 +741,16 @@ void dual_pid_set_angle_zeropoint(dual_pid_controller_t *ctrl, float zeropoint) 
     ctrl->params.angle_zeropoint = zeropoint;
 }
 
+void dual_pid_set_loop_order(dual_pid_controller_t *ctrl, uint8_t loop_order) {
+    if (ctrl == NULL) return;
+    ctrl->params.loop_order = loop_order;
+    // 切换模式时重置PID积分，避免遗留积分导致跳变
+    pid_reset(&ctrl->pid_angle);
+    pid_reset(&ctrl->pid_speed);
+    ESP_LOGI(TAG, "Dual PID loop order set to %s", 
+             loop_order == DUAL_PID_SPEED_FIRST ? "SPEED_FIRST" : "ANGLE_FIRST");
+}
+
 bool dual_pid_check_emergency(dual_pid_controller_t *ctrl, float pitch) {
     if (ctrl == NULL) return true;
     return fabsf(pitch) > ctrl->params.emergency_angle;
@@ -769,42 +783,97 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         return ESP_ERR_INVALID_STATE;
     }
     
-    // ===== 直立环 (外环): pitch → target_speed =====
-    // 目标: 让 pitch 趋近于 angle_zeropoint (通常是 0)
-    // 当机器人前倾 (pitch > 0) 时，需要向前加速 (正速度)
-    // 当机器人后倾 (pitch < 0) 时，需要向后加速 (负速度)
-    float angle_error = pitch - ctrl->params.angle_zeropoint;
-    
-    // 直立环 PID 计算
-    // 注意: 误差取负号，因为我们希望 pitch 减小时输出正速度
-    float target_speed = pid_compute(&ctrl->pid_angle, 0.0f, -angle_error, dt);
-    
-    // 保存直立环调试信息
-    output->angle_error = angle_error;
-    output->target_speed = target_speed;
-    // PID 内部分量 (简化版，使用参数和误差估算)
-    output->angle_p_out = ctrl->params.angle_kp * (-angle_error);
-    output->angle_i_out = ctrl->pid_angle.integral;
-    output->angle_d_out = ctrl->pid_angle.prev_d_term;
-    
-    // ===== 速度环 (内环): speed_error → torque =====
-    // 目标: 让 wheel_speed 趋近于 target_speed
-    float speed_error = target_speed - wheel_speed;
-    
-    // 速度环 PID 计算
-    // 注意: 使用 -speed_error 作为 measurement，使得 error = 0 - (-speed_error) = speed_error
-    // 这样当 target_speed > wheel_speed 时，输出正扭矩来加速
-    float torque = pid_compute(&ctrl->pid_speed, 0.0f, -speed_error, dt);
-    
-    // 输出限幅
-    torque = clamp_f(torque, -ctrl->params.max_torque, ctrl->params.max_torque);
-    
-    // 保存速度环调试信息
-    output->speed_error = speed_error;
-    output->torque = -torque;
-    output->speed_p_out = ctrl->params.speed_kp * speed_error;  // 显示正确的 P 分量
-    output->speed_i_out = ctrl->pid_speed.integral;
-    output->speed_d_out = ctrl->pid_speed.prev_d_term;
+    if (ctrl->params.loop_order == DUAL_PID_SPEED_FIRST) {
+        // =============================================================
+        // 速度优先模式 (经典串级PID):
+        //   外环: 速度环  0 - wheel_speed → pitch_target (目标倾角)
+        //   内环: 角度环  pitch_target - pitch → torque (输出扭矩)
+        //
+        // 物理直觉: 速度偏了 → 倾斜去纠正 → 扭矩维持倾斜
+        // =============================================================
+        
+        // ===== 速度环 (外环): 0 - wheel_speed → pitch_target =====
+        // 目标速度 = 0 (原地平衡)
+        // 当 wheel_speed > 0 (机器人向前走) → 需要后倾 (pitch_target < 0) 来减速
+        // 当 wheel_speed < 0 (机器人向后走) → 需要前倾 (pitch_target > 0) 来减速
+        // pid_compute(0, wheel_speed): error = 0 - wheel_speed
+        //   wheel_speed > 0 → error < 0 → output < 0 (负倾角=后倾) ✓
+        float pitch_target = pid_compute(&ctrl->pid_speed, 0.0f, wheel_speed, dt);
+        
+        // 保存速度环调试信息 (复用 output 字段)
+        output->speed_error = 0.0f - wheel_speed;
+        output->target_speed = pitch_target;  // 在此模式下含义 = pitch_target
+        output->speed_p_out = ctrl->params.speed_kp * (-wheel_speed);
+        output->speed_i_out = ctrl->pid_speed.integral;
+        output->speed_d_out = ctrl->pid_speed.prev_d_term;
+        
+        // ===== 角度环 (内环): pitch_target - pitch → torque =====
+        // 目标: 让 pitch 趋近 pitch_target (而非0)
+        // pitch_target 已含 angle_zeropoint 的补偿意义，但为了与 angle-first 模式
+        // 保持一致的 zeropoint 行为，将 zeropoint 也加到 target 上
+        float adjusted_target = pitch_target + ctrl->params.angle_zeropoint;
+        float angle_error = pitch - adjusted_target;
+        
+        // pid_compute(0, -angle_error): error = 0 - (-angle_error) = angle_error
+        //   pitch > adjusted_target → angle_error > 0 → output > 0
+        //   前倾超过目标 → 需要正扭矩(向前加速追上去) ✓
+        float torque = pid_compute(&ctrl->pid_angle, 0.0f, -angle_error, dt);
+        
+        // 输出限幅
+        torque = clamp_f(torque, -ctrl->params.max_torque, ctrl->params.max_torque);
+        
+        // 保存角度环调试信息
+        output->angle_error = angle_error;
+        output->torque = -torque;  // 与 angle-first 模式保持一致的符号约定
+        output->angle_p_out = ctrl->params.angle_kp * (-angle_error);
+        output->angle_i_out = ctrl->pid_angle.integral;
+        output->angle_d_out = ctrl->pid_angle.prev_d_term;
+        
+    } else {
+        // =============================================================
+        // 角度优先模式 (默认，原有逻辑):
+        //   外环: 角度环  pitch → target_speed (目标轮速)
+        //   内环: 速度环  speed_error → torque (输出扭矩)
+        //
+        // 物理直觉: 倒了 → 给速度追 → 扭矩实现该速度
+        // =============================================================
+        
+        // ===== 角度环 (外环): pitch → target_speed =====
+        // 目标: 让 pitch 趋近于 angle_zeropoint (通常是 0)
+        // 当机器人前倾 (pitch > 0) 时，需要向前加速 (正速度)
+        // 当机器人后倾 (pitch < 0) 时，需要向后加速 (负速度)
+        float angle_error = pitch - ctrl->params.angle_zeropoint;
+        
+        // 直立环 PID 计算
+        // 注意: 误差取负号，因为我们希望 pitch 减小时输出正速度
+        float target_speed = pid_compute(&ctrl->pid_angle, 0.0f, -angle_error, dt);
+        
+        // 保存直立环调试信息
+        output->angle_error = angle_error;
+        output->target_speed = target_speed;
+        output->angle_p_out = ctrl->params.angle_kp * (-angle_error);
+        output->angle_i_out = ctrl->pid_angle.integral;
+        output->angle_d_out = ctrl->pid_angle.prev_d_term;
+        
+        // ===== 速度环 (内环): speed_error → torque =====
+        // 目标: 让 wheel_speed 趋近于 target_speed
+        float speed_error = target_speed - wheel_speed;
+        
+        // 速度环 PID 计算
+        // 注意: 使用 -speed_error 作为 measurement，使得 error = 0 - (-speed_error) = speed_error
+        // 这样当 target_speed > wheel_speed 时，输出正扭矩来加速
+        float torque = pid_compute(&ctrl->pid_speed, 0.0f, -speed_error, dt);
+        
+        // 输出限幅
+        torque = clamp_f(torque, -ctrl->params.max_torque, ctrl->params.max_torque);
+        
+        // 保存速度环调试信息
+        output->speed_error = speed_error;
+        output->torque = -torque;
+        output->speed_p_out = ctrl->params.speed_kp * speed_error;
+        output->speed_i_out = ctrl->pid_speed.integral;
+        output->speed_d_out = ctrl->pid_speed.prev_d_term;
+    }
     
     output->emergency = false;
     

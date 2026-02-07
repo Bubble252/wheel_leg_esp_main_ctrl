@@ -49,6 +49,11 @@ struct can_motor {
 static can_motor_handle_t g_motors[MOTOR_COUNT] = {NULL};
 static bool g_can_initialized = false;
 
+// CAN Bus-Off 恢复统计
+static uint32_t g_can_busoff_count = 0;
+static uint32_t g_can_tx_error_count = 0;
+static uint32_t g_can_recovery_count = 0;
+
 // ============================================================================
 // 角度安全处理辅助函数
 // ============================================================================
@@ -148,7 +153,22 @@ static esp_err_t can_send_frame(uint32_t id, uint8_t *data, uint8_t len) {
     memset(msg.data, 0, 8);
     memcpy(msg.data, data, len > 8 ? 8 : len);
     
-    return twai_transmit(&msg, pdMS_TO_TICKS(10));
+    esp_err_t ret = twai_transmit(&msg, pdMS_TO_TICKS(10));
+    if (ret != ESP_OK) {
+        g_can_tx_error_count++;
+        // TX 失败可能是 Bus-Off，尝试检查和恢复
+        if (ret == ESP_ERR_INVALID_STATE || ret == ESP_ERR_NOT_FOUND) {
+            // ESP_ERR_INVALID_STATE: 驱动不在运行状态 (可能 Bus-Off)
+            // ESP_ERR_NOT_FOUND: TX 队列被禁用
+            can_bus_check_and_recover();
+        }
+        // 每 100 次错误打印一次警告，避免日志洪泛
+        if ((g_can_tx_error_count % 100) == 1) {
+            ESP_LOGW(TAG, "CAN TX error #%lu: %s (id=0x%03lx)", 
+                     g_can_tx_error_count, esp_err_to_name(ret), id);
+        }
+    }
+    return ret;
 }
 
 /**
@@ -243,6 +263,9 @@ esp_err_t can_bus_init(gpio_num_t tx_pin, gpio_num_t rx_pin) {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(tx_pin, rx_pin, TWAI_MODE_NORMAL);
     g_config.rx_queue_len = 16;
     g_config.tx_queue_len = 16;
+    // 启用 Bus-Off 和错误告警，用于自动恢复
+    g_config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_ERR_PASS 
+                            | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ABOVE_ERR_WARN;
     
     // 波特率配置 - 1Mbps
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
@@ -282,6 +305,89 @@ esp_err_t can_bus_deinit(void) {
     
     ESP_LOGI(TAG, "CAN bus deinitialized");
     return ESP_OK;
+}
+
+/**
+ * @brief 检查 CAN 总线状态并在 Bus-Off 时自动恢复
+ * @return ESP_OK: 总线正常, ESP_ERR_INVALID_STATE: 恢复失败
+ */
+esp_err_t can_bus_check_and_recover(void) {
+    if (!g_can_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    uint32_t alerts;
+    // 非阻塞读取告警 (timeout = 0)
+    if (twai_read_alerts(&alerts, 0) != ESP_OK) {
+        return ESP_OK;  // 没有告警，总线正常
+    }
+    
+    if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) {
+        ESP_LOGW(TAG, "CAN bus error warning (TX/RX error counter high)");
+    }
+    
+    if (alerts & TWAI_ALERT_ERR_PASS) {
+        ESP_LOGW(TAG, "CAN bus entered error-passive state");
+    }
+    
+    if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+        g_can_recovery_count++;
+        ESP_LOGI(TAG, "CAN bus recovered from Bus-Off (recovery #%lu)", g_can_recovery_count);
+        // 恢复后需要重新启动
+        esp_err_t ret = twai_start();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "CAN bus restarted successfully after recovery");
+            return ESP_OK;
+        } else {
+            ESP_LOGE(TAG, "Failed to restart CAN after recovery: %s", esp_err_to_name(ret));
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    
+    if (alerts & TWAI_ALERT_BUS_OFF) {
+        g_can_busoff_count++;
+        ESP_LOGE(TAG, "CAN Bus-Off detected! (count: %lu) Initiating recovery...", g_can_busoff_count);
+        
+        // 发起恢复流程 (CAN 控制器将等待 128 * 11 个连续隐性位)
+        esp_err_t ret = twai_initiate_recovery();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initiate CAN recovery: %s", esp_err_to_name(ret));
+            return ESP_ERR_INVALID_STATE;
+        }
+        
+        // 等待恢复完成 (最多等 500ms)
+        for (int i = 0; i < 50; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (twai_read_alerts(&alerts, 0) == ESP_OK) {
+                if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+                    g_can_recovery_count++;
+                    ESP_LOGI(TAG, "CAN bus recovered after %d ms (recovery #%lu)", 
+                             (i + 1) * 10, g_can_recovery_count);
+                    ret = twai_start();
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(TAG, "CAN bus restarted successfully");
+                        return ESP_OK;
+                    }
+                    ESP_LOGE(TAG, "Failed to restart CAN: %s", esp_err_to_name(ret));
+                    return ESP_ERR_INVALID_STATE;
+                }
+            }
+        }
+        
+        ESP_LOGE(TAG, "CAN recovery timeout (500ms)");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief 获取 CAN 总线错误统计
+ */
+void can_bus_get_error_stats(uint32_t *busoff_count, uint32_t *tx_error_count, uint32_t *recovery_count) {
+    if (busoff_count) *busoff_count = g_can_busoff_count;
+    if (tx_error_count) *tx_error_count = g_can_tx_error_count;
+    if (recovery_count) *recovery_count = g_can_recovery_count;
 }
 
 // ============================================================================
@@ -374,6 +480,9 @@ esp_err_t can_motor_request_status(can_motor_handle_t motor) {
 
 esp_err_t can_motor_process_rx(void) {
     if (!g_can_initialized) return ESP_ERR_INVALID_STATE;
+    
+    // 每次处理 RX 时顺带检查 Bus-Off 状态 (非阻塞)
+    can_bus_check_and_recover();
     
     twai_message_t msg;
     

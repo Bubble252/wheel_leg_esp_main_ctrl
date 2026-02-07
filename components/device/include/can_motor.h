@@ -40,6 +40,21 @@ esp_err_t can_bus_init(gpio_num_t tx_pin, gpio_num_t rx_pin);
  */
 esp_err_t can_bus_deinit(void);
 
+/**
+ * @brief 检查 CAN 总线状态并在 Bus-Off 时自动恢复
+ * @return ESP_OK: 总线正常或已恢复, ESP_ERR_INVALID_STATE/ESP_ERR_TIMEOUT: 恢复失败
+ * @note 非阻塞调用 (除 Bus-Off 恢复外)。Bus-Off 恢复最多等待 500ms。
+ */
+esp_err_t can_bus_check_and_recover(void);
+
+/**
+ * @brief 获取 CAN 总线错误统计
+ * @param busoff_count  Bus-Off 次数 (可为 NULL)
+ * @param tx_error_count TX 失败次数 (可为 NULL)
+ * @param recovery_count 恢复成功次数 (可为 NULL)
+ */
+void can_bus_get_error_stats(uint32_t *busoff_count, uint32_t *tx_error_count, uint32_t *recovery_count);
+
 // ============================================================================
 // 电机实例管理
 // ============================================================================

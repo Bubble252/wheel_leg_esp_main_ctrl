@@ -489,6 +489,14 @@ static void cmd_stop(int id) {
 
 static void cmd_stop_all(void) {
     printf("Stopping all motors...\n");
+    
+    // 如果平衡控制正在运行，先禁用平衡输出，否则控制循环会立即覆盖停止命令
+    balance_test_state_t state = balance_test_get_state();
+    if (state == BALANCE_TEST_RUNNING) {
+        printf("  Balance control is running, disabling first...\n");
+        balance_test_disable();
+    }
+    
     can_motor_all_set_idle();
     printf("All motors stopped\n");
 }

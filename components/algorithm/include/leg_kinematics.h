@@ -198,6 +198,81 @@ esp_err_t leg_kin_jacobian(const leg_joint_state_t *joint, bool is_left,
                            float J[4]);
 
 // ============================================================================
+// Body 坐标系笛卡尔接口 (极坐标 ↔ 直角坐标转换)
+// ============================================================================
+// 坐标关系 (body 坐标系):
+//   x = L * cos(α)    (α=-90° 时 x=0, α=0° 时 x=L)
+//   y = L * sin(α)    (α=-90° 时 y=-L, 垂直向下)
+//   L = sqrt(x² + y²)
+//   α = atan2(y, x)
+
+/**
+ * @brief 极坐标 → 笛卡尔坐标 (body 坐标系)
+ * @param leg_length 腿长 (米)
+ * @param body_angle 身体夹角 (度)
+ * @param x 输出水平位置 (米), 向后为正
+ * @param y 输出垂直位置 (米), 向下为负
+ */
+void leg_kin_polar_to_cartesian(float leg_length, float body_angle_deg,
+                                float *x, float *y);
+
+/**
+ * @brief 笛卡尔坐标 → 极坐标 (body 坐标系)
+ * @param x 水平位置 (米), 向后为正
+ * @param y 垂直位置 (米), 向下为负
+ * @param leg_length 输出腿长 (米)
+ * @param body_angle 输出身体夹角 (度)
+ */
+void leg_kin_cartesian_to_polar(float x, float y,
+                                float *leg_length, float *body_angle_deg);
+
+/**
+ * @brief 笛卡尔逆运动学 (body 坐标系): (x, y) → 关节角度
+ * @param x 水平位置 (米), 向后为正
+ * @param y 垂直位置 (米), 向下为负
+ * @param is_left 是否为左腿
+ * @param params 运动学参数 (NULL 使用默认参数)
+ * @param joint 输出关节状态
+ * @return ESP_OK 成功, ESP_ERR_INVALID_ARG 目标不可达
+ */
+esp_err_t leg_kin_inverse_cartesian_body(float x, float y, bool is_left,
+                                         const leg_kin_params_t *params,
+                                         leg_joint_state_t *joint);
+
+/**
+ * @brief 正运动学: 关节角度 → 笛卡尔坐标 (body 坐标系)
+ * @param joint 关节状态
+ * @param is_left 是否为左腿
+ * @param params 运动学参数 (NULL 使用默认参数)
+ * @param x 输出水平位置 (米)
+ * @param y 输出垂直位置 (米)
+ * @return ESP_OK 成功
+ */
+esp_err_t leg_kin_forward_cartesian_body(const leg_joint_state_t *joint,
+                                         bool is_left,
+                                         const leg_kin_params_t *params,
+                                         float *x, float *y);
+
+/**
+ * @brief 限制笛卡尔坐标到可达范围 (body 坐标系)
+ * @param x 输入/输出水平位置 (米)
+ * @param y 输入/输出垂直位置 (米)
+ * @param params 运动学参数 (NULL 使用默认参数)
+ */
+void leg_kin_clamp_cartesian_body(float *x, float *y,
+                                  const leg_kin_params_t *params);
+
+/**
+ * @brief 检查笛卡尔坐标是否可达 (body 坐标系)
+ * @param x 水平位置 (米)
+ * @param y 垂直位置 (米)
+ * @param params 运动学参数 (NULL 使用默认参数)
+ * @return true 可达, false 不可达
+ */
+bool leg_kin_is_reachable_cartesian_body(float x, float y,
+                                         const leg_kin_params_t *params);
+
+// ============================================================================
 // VMC (Virtual Model Control) 数据结构和 API
 // ============================================================================
 

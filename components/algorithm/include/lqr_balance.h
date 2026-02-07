@@ -447,25 +447,42 @@ float lqr_yaw_angle_addup(float current_yaw, float last_yaw, float *yaw_total);
 // ============================================================================
 
 /**
+ * @brief 双环PID环路顺序
+ */
+#define DUAL_PID_ANGLE_FIRST  0   // 角度优先: 角度环(外)→速度环(内) → 输出扭矩
+#define DUAL_PID_SPEED_FIRST  1   // 速度优先: 速度环(外)→角度环(内) → 输出扭矩
+
+/**
  * @brief 双环PID参数结构体
  * 
- * 控制架构:
- *   目标角度(0°) → [直立环PID] → 目标速度 → [速度环PID] → 输出扭矩
- *       ↑                              ↑
- *   实际Pitch                      实际速度
+ * 控制架构 (取决于 loop_order):
+ * 
+ *   ANGLE_FIRST (默认):
+ *     目标角度(0°) → [角度环PID] → 目标速度 → [速度环PID] → 输出扭矩
+ *         ↑                              ↑
+ *     实际Pitch                      实际轮速
+ * 
+ *   SPEED_FIRST (经典串级):
+ *     目标速度(0) → [速度环PID] → 目标倾角 → [角度环PID] → 输出扭矩
+ *         ↑                              ↑
+ *     实际轮速                       实际Pitch
  */
 typedef struct {
-    // 直立环 PID (外环): pitch → target_speed
-    float angle_kp;         // 角度P (默认 15.0)
+    // 角度环 PID
+    //   ANGLE_FIRST 时为外环: pitch → target_speed
+    //   SPEED_FIRST 时为内环: pitch_target - pitch → torque
+    float angle_kp;         // 角度P (默认 1.5)
     float angle_ki;         // 角度I (默认 0.0)
-    float angle_kd;         // 角度D (默认 0.5)
-    float angle_limit;      // 输出限幅 - 最大目标速度 (默认 10.0 rad/s)
+    float angle_kd;         // 角度D (默认 0.3)
+    float angle_limit;      // 输出限幅 (默认 20.0)
     
-    // 速度环 PID (内环): speed_error → torque
-    float speed_kp;         // 速度P (默认 0.5)
-    float speed_ki;         // 速度I (默认 0.1)
-    float speed_kd;         // 速度D (默认 0.01)
-    float speed_limit;      // 输出限幅 - 最大扭矩 (默认 8.0 Nm)
+    // 速度环 PID
+    //   ANGLE_FIRST 时为内环: speed_error → torque
+    //   SPEED_FIRST 时为外环: 0 - wheel_speed → pitch_target
+    float speed_kp;         // 速度P (默认 0.4)
+    float speed_ki;         // 速度I (默认 0.05)
+    float speed_kd;         // 速度D (默认 0.0)
+    float speed_limit;      // 输出限幅 (默认 12.0)
     
     // 角度零点
     float angle_zeropoint;  // 机械零点偏移 (默认 0.0)
@@ -475,6 +492,9 @@ typedef struct {
     
     // 输出限幅
     float max_torque;       // 最大输出扭矩 (默认 8.0)
+    
+    // 环路顺序
+    uint8_t loop_order;     // DUAL_PID_ANGLE_FIRST(0) 或 DUAL_PID_SPEED_FIRST(1)
 } dual_pid_params_t;
 
 /**
@@ -562,6 +582,13 @@ void dual_pid_set_speed_gains(dual_pid_controller_t *ctrl, float kp, float ki, f
 void dual_pid_set_angle_zeropoint(dual_pid_controller_t *ctrl, float zeropoint);
 
 /**
+ * @brief 设置环路顺序
+ * @param ctrl 控制器实例
+ * @param loop_order DUAL_PID_ANGLE_FIRST(0) 或 DUAL_PID_SPEED_FIRST(1)
+ */
+void dual_pid_set_loop_order(dual_pid_controller_t *ctrl, uint8_t loop_order);
+
+/**
  * @brief 双环PID平衡控制循环
  * @param ctrl 控制器实例
  * @param pitch 当前俯仰角 (度)
@@ -571,11 +598,13 @@ void dual_pid_set_angle_zeropoint(dual_pid_controller_t *ctrl, float zeropoint);
  * @param output 控制输出
  * @return ESP_OK 成功
  * 
- * @note 控制流程:
- *   1. 直立环: angle_error = 0 - (pitch - zeropoint)
- *              target_speed = PID_angle(angle_error)
- *   2. 速度环: speed_error = target_speed - wheel_speed
- *              torque = PID_speed(speed_error)
+ * @note 控制流程取决于 loop_order:
+ *   ANGLE_FIRST:
+ *     1. 角度环(外): pitch_error → target_speed
+ *     2. 速度环(内): speed_error → torque
+ *   SPEED_FIRST:
+ *     1. 速度环(外): 0 - wheel_speed → pitch_target
+ *     2. 角度环(内): pitch_target - pitch → torque
  */
 esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl, 
                                  float pitch, float pitch_rate,
