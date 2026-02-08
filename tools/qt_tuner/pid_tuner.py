@@ -2406,6 +2406,72 @@ class BalanceControlPanel(QWidget):
         xoffset_group.setLayout(xoffset_layout)
         layout.addWidget(xoffset_group)
         
+        # Leg Sync 防劈叉 (左右腿同步补偿)
+        sync_group = QGroupBox("🔗 Leg Sync 防劈叉 (左右腿同步)")
+        sync_layout = QVBoxLayout()
+        
+        # 第一行: 状态 + 开关
+        sync_ctrl_layout = QHBoxLayout()
+        
+        self.leg_sync_status = QLabel("状态: 未知")
+        self.leg_sync_status.setStyleSheet(SS("font-size: 14px; font-weight: bold;"))
+        sync_ctrl_layout.addWidget(self.leg_sync_status)
+        
+        sync_ctrl_layout.addStretch()
+        
+        self.leg_sync_on_btn = QPushButton("✅ 开启 Sync")
+        self.leg_sync_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 20px;"))
+        self.leg_sync_on_btn.clicked.connect(lambda: self.send_leg_sync_cmd("on"))
+        sync_ctrl_layout.addWidget(self.leg_sync_on_btn)
+        
+        self.leg_sync_off_btn = QPushButton("❌ 关闭 Sync")
+        self.leg_sync_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 20px;"))
+        self.leg_sync_off_btn.clicked.connect(lambda: self.send_leg_sync_cmd("off"))
+        sync_ctrl_layout.addWidget(self.leg_sync_off_btn)
+        
+        self.leg_sync_query_btn = QPushButton("📊 状态")
+        self.leg_sync_query_btn.clicked.connect(lambda: self.send_cmd("balance sync"))
+        sync_ctrl_layout.addWidget(self.leg_sync_query_btn)
+        
+        sync_layout.addLayout(sync_ctrl_layout)
+        
+        # 第二行: 参数设置
+        sync_param_layout = QGridLayout()
+        sync_param_layout.setSpacing(6)
+        
+        sync_param_layout.addWidget(QLabel("增益 (0~1):"), 0, 0)
+        self.leg_sync_gain = QDoubleSpinBox()
+        self.leg_sync_gain.setRange(0.0, 1.0)
+        self.leg_sync_gain.setSingleStep(0.05)
+        self.leg_sync_gain.setDecimals(2)
+        self.leg_sync_gain.setValue(0.30)
+        sync_param_layout.addWidget(self.leg_sync_gain, 0, 1)
+        
+        sync_param_layout.addWidget(QLabel("最大修正 (°):"), 0, 2)
+        self.leg_sync_max = QDoubleSpinBox()
+        self.leg_sync_max.setRange(1.0, 45.0)
+        self.leg_sync_max.setSingleStep(1.0)
+        self.leg_sync_max.setDecimals(1)
+        self.leg_sync_max.setValue(15.0)
+        sync_param_layout.addWidget(self.leg_sync_max, 0, 3)
+        
+        self.leg_sync_apply_btn = QPushButton("📤 应用参数")
+        self.leg_sync_apply_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 6px 16px;"))
+        self.leg_sync_apply_btn.clicked.connect(self.apply_leg_sync_params)
+        sync_param_layout.addWidget(self.leg_sync_apply_btn, 0, 4)
+        
+        sync_layout.addLayout(sync_param_layout)
+        
+        # 第三行: 实时值显示
+        sync_val_layout = QHBoxLayout()
+        self.leg_sync_val_label = QLabel("diff: --- ° | correction: --- °")
+        self.leg_sync_val_label.setStyleSheet(SS("font-size: 12px; color: #aaa; background: #1a1a2e; padding: 4px; border-radius: 3px;"))
+        sync_val_layout.addWidget(self.leg_sync_val_label)
+        sync_layout.addLayout(sync_val_layout)
+        
+        sync_group.setLayout(sync_layout)
+        layout.addWidget(sync_group)
+        
         # 角度零点设置
         zero_group = QGroupBox("角度零点设置")
         zero_layout = QHBoxLayout()
@@ -2855,6 +2921,32 @@ class BalanceControlPanel(QWidget):
         self.parent_window.send_command(f"balance xoffset kd {kd:.4f}")
         self.parent_window.send_command(f"balance xoffset limit {limit:.3f}")
         self.parent_window.log(f"X-Offset: Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f} Limit={limit:.3f}m")
+    
+    def send_leg_sync_cmd(self, state):
+        """发送 Leg Sync 控制命令"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        cmd = f"balance sync {state}"
+        if self.parent_window.send_command(cmd):
+            self.parent_window.log(f"发送: {cmd}")
+            if state == "on":
+                self.leg_sync_status.setText("状态: 已开启")
+                self.leg_sync_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #4CAF50;"))
+            else:
+                self.leg_sync_status.setText("状态: 已关闭")
+                self.leg_sync_status.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #f44336;"))
+    
+    def apply_leg_sync_params(self):
+        """应用 Leg Sync 参数"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        gain = self.leg_sync_gain.value()
+        max_corr = self.leg_sync_max.value()
+        self.parent_window.send_command(f"balance sync gain {gain:.2f}")
+        self.parent_window.send_command(f"balance sync max {max_corr:.1f}")
+        self.parent_window.log(f"Leg Sync: gain={gain:.2f} max={max_corr:.1f}°")
     
     def do_balance_init(self):
         self.send_cmd("balance init")
@@ -5159,6 +5251,28 @@ class PIDTunerUI(QMainWindow):
             if not self.debug_mode and not self.show_high_freq_data:
                 return
         
+        # Leg Sync 调试输出
+        # 格式: [SYNC] diff=X.XX° → corr=X.XX° (gain=X.XX max=X.X°)
+        if line.startswith("[SYNC]"):
+            sync_match = re.search(
+                r'\[SYNC\] diff=([-\d.]+)° → corr=([-\d.]+)° \(gain=([-\d.]+) max=([-\d.]+)°\)', line)
+            if sync_match:
+                try:
+                    diff = float(sync_match.group(1))
+                    corr = float(sync_match.group(2))
+                    gain = float(sync_match.group(3))
+                    max_c = float(sync_match.group(4))
+                    if hasattr(self, 'balance_panel'):
+                        self.balance_panel.leg_sync_val_label.setText(
+                            f"diff: {diff:.2f}° | correction: {corr:.2f}° | gain: {gain:.2f} | max: {max_c:.1f}°")
+                        self.balance_panel.leg_sync_status.setText("状态: 已开启")
+                        self.balance_panel.leg_sync_status.setStyleSheet(SS(
+                            "font-size: 14px; font-weight: bold; color: #4CAF50;"))
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return
+        
         # 控制模式切换
         if line.startswith("CTRL_MODE:"):
             ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID|SINGLE_PID)', line)
@@ -5334,6 +5448,9 @@ class PIDTunerUI(QMainWindow):
             limit = float(match.group(5))
             
             current_widget = self.tab_widget.currentWidget()
+            # QScrollArea 包裹时，需要取出内部的实际 widget
+            if isinstance(current_widget, QScrollArea):
+                current_widget = current_widget.widget()
             if isinstance(current_widget, PIDControlPanel):
                 current_widget.update_display(p, i, d, limit, ramp)
         
@@ -5342,6 +5459,9 @@ class PIDTunerUI(QMainWindow):
         if match:
             tf = float(match.group(1))
             current_widget = self.tab_widget.currentWidget()
+            # QScrollArea 包裹时，需要取出内部的实际 widget
+            if isinstance(current_widget, QScrollArea):
+                current_widget = current_widget.widget()
             if isinstance(current_widget, LPFControlPanel):
                 current_widget.update_display(tf)
         

@@ -233,6 +233,30 @@ void leg_ctrl_print_status(void);
  */
 void balance_test_print_status(void);
 
+// ============================================================================
+// Leg Sync (防劈叉) API
+// ============================================================================
+
+/**
+ * @brief 使能/禁用 Leg Sync (左右腿同步补偿)
+ */
+void balance_test_set_leg_sync(bool enable);
+
+/**
+ * @brief 获取 Leg Sync 状态
+ */
+bool balance_test_get_leg_sync(void);
+
+/**
+ * @brief 设置 Leg Sync 增益 (0~1)
+ */
+void balance_test_set_leg_sync_gain(float gain);
+
+/**
+ * @brief 设置 Leg Sync 最大修正量 (度)
+ */
+void balance_test_set_leg_sync_max(float max_deg);
+
 /**
  * @brief 处理测试命令
  * @param cmd_str 命令字符串

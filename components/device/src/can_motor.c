@@ -54,6 +54,10 @@ static uint32_t g_can_busoff_count = 0;
 static uint32_t g_can_tx_error_count = 0;
 static uint32_t g_can_recovery_count = 0;
 
+// 保存初始化引脚，用于恢复失败时重新初始化
+static gpio_num_t g_can_tx_pin = GPIO_NUM_NC;
+static gpio_num_t g_can_rx_pin = GPIO_NUM_NC;
+
 // ============================================================================
 // 角度安全处理辅助函数
 // ============================================================================
@@ -289,6 +293,8 @@ esp_err_t can_bus_init(gpio_num_t tx_pin, gpio_num_t rx_pin) {
     }
     
     g_can_initialized = true;
+    g_can_tx_pin = tx_pin;
+    g_can_rx_pin = rx_pin;
     ESP_LOGI(TAG, "CAN bus initialized (TX: GPIO%d, RX: GPIO%d, 1Mbps)", tx_pin, rx_pin);
     
     return ESP_OK;
@@ -323,11 +329,39 @@ esp_err_t can_bus_check_and_recover(void) {
     }
     
     if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) {
-        ESP_LOGW(TAG, "CAN bus error warning (TX/RX error counter high)");
+        // 限流打印：每秒最多1次，避免日志洪泛
+        static uint32_t last_warn_log = 0;
+        static uint32_t warn_suppressed = 0;
+        uint32_t now = (uint32_t)(esp_log_timestamp());
+        if (now - last_warn_log > 1000) {
+            if (warn_suppressed > 0) {
+                ESP_LOGW(TAG, "CAN bus error warning (TX/RX error counter high) [suppressed %lu times]", warn_suppressed);
+            } else {
+                ESP_LOGW(TAG, "CAN bus error warning (TX/RX error counter high)");
+            }
+            last_warn_log = now;
+            warn_suppressed = 0;
+        } else {
+            warn_suppressed++;
+        }
     }
     
     if (alerts & TWAI_ALERT_ERR_PASS) {
-        ESP_LOGW(TAG, "CAN bus entered error-passive state");
+        // 限流打印：每秒最多1次
+        static uint32_t last_pass_log = 0;
+        static uint32_t pass_suppressed = 0;
+        uint32_t now = (uint32_t)(esp_log_timestamp());
+        if (now - last_pass_log > 1000) {
+            if (pass_suppressed > 0) {
+                ESP_LOGW(TAG, "CAN bus entered error-passive state [suppressed %lu times]", pass_suppressed);
+            } else {
+                ESP_LOGW(TAG, "CAN bus entered error-passive state");
+            }
+            last_pass_log = now;
+            pass_suppressed = 0;
+        } else {
+            pass_suppressed++;
+        }
     }
     
     if (alerts & TWAI_ALERT_BUS_RECOVERED) {
@@ -374,7 +408,25 @@ esp_err_t can_bus_check_and_recover(void) {
             }
         }
         
-        ESP_LOGE(TAG, "CAN recovery timeout (500ms)");
+        ESP_LOGE(TAG, "CAN recovery timeout (500ms), forcing re-init...");
+        
+        // 恢复超时，强制卸载再重装 TWAI 驱动 (硬重启 CAN 控制器)
+        twai_stop();           // 可能失败，忽略
+        twai_driver_uninstall();
+        g_can_initialized = false;
+        
+        // 重新初始化
+        if (g_can_tx_pin != GPIO_NUM_NC && g_can_rx_pin != GPIO_NUM_NC) {
+            esp_err_t reinit_ret = can_bus_init(g_can_tx_pin, g_can_rx_pin);
+            if (reinit_ret == ESP_OK) {
+                g_can_recovery_count++;
+                ESP_LOGI(TAG, "CAN bus re-initialized successfully (recovery #%lu)", g_can_recovery_count);
+                return ESP_OK;
+            } else {
+                ESP_LOGE(TAG, "CAN bus re-init failed: %s", esp_err_to_name(reinit_ret));
+            }
+        }
+        
         return ESP_ERR_TIMEOUT;
     }
     

@@ -924,7 +924,7 @@ esp_err_t motor_test_start(void) {
     g_running = true;
     
     // 启动 CAN 接收任务 - 绑定到 CPU1，优先级2
-    xTaskCreatePinnedToCore(can_rx_task, "can_rx", 2048, NULL, 2, &g_rx_task, 1);
+    xTaskCreatePinnedToCore(can_rx_task, "can_rx", 4096, NULL, 2, &g_rx_task, 1);
     
     // 启动状态显示任务 - 绑定到 CPU1，优先级2
     xTaskCreatePinnedToCore(status_display_task, "status", 2048, NULL, 2, &g_status_task, 1);

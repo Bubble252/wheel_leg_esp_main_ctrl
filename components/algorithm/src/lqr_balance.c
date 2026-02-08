@@ -19,25 +19,25 @@ static const lqr_params_t default_params = {
     .angle_kp = 3.0f,
     .angle_ki = 0.5f,
     .angle_kd = 0.0001f,
-    .angle_limit = 10.0f,
+    .angle_limit = 20.0f,
     
     // 角速度环 PID
     .gyro_kp = 5.00f,
     .gyro_ki = 0.0f,
     .gyro_kd = 0.0f,
-    .gyro_limit = 8.0f,
+    .gyro_limit = 16.0f,
     
     // 位移环 PID
     .distance_kp = 0.0f,
     .distance_ki = 0.0f,
     .distance_kd = 0.0f,
-    .distance_limit = 8.0f,
+    .distance_limit = 16.0f,
     
     // 速度环 PID
     .speed_kp = 1.5f,
     .speed_ki = 0.0f,
     .speed_kd = 0.0f,
-    .speed_limit = 8.0f,
+    .speed_limit = 16.0f,
     .speed_kp_min = 0.3f,
     .speed_kp_max = 1.0f,
     
@@ -45,13 +45,13 @@ static const lqr_params_t default_params = {
     .lqr_u_kp = 1.0f,
     .lqr_u_ki = 0.0f,
     .lqr_u_kd = 0.0f,
-    .lqr_u_limit = 8.0f,
+    .lqr_u_limit = 16.0f,
     
     // 偏航控制 PID
     .yaw_angle_kp = 0.0f,
     .yaw_angle_ki = 0.0f,
     .yaw_angle_kd = 0.0f,
-    .yaw_angle_limit = 5.0f,
+    .yaw_angle_limit = 10.0f,
     
     .yaw_gyro_kp = 0.00f,
     .yaw_gyro_ki = 0.0f,
@@ -71,7 +71,7 @@ static const lqr_params_t default_params = {
     .zeropoint_limit = 5.0f,
     
     // 角度零点
-    .angle_zeropoint = -0.1f,
+    .angle_zeropoint = -0.0f,
     
     // 低通滤波器
     .lpf_joyy_tf = 0.2f,
@@ -614,14 +614,14 @@ static const dual_pid_params_t dual_pid_default_params = {
     .angle_kp = 1.5f,
     .angle_ki = 0.0f,
     .angle_kd = 0.3f,
-    .angle_limit = 20.0f,       // 最大目标速度 20 rad/s
+    .angle_limit = 50.0f,       // 最大目标速度 50 rad/s
 
     // 速度环 (内环): speed_error → torque
     .speed_kp = 0.4f,
     .speed_ki = 0.05f,
     .speed_kd = 0.0f,
-    .speed_limit = 12.0f,        // 最大扭矩 12 Nm
-    
+    .speed_limit = 20.0f,        // 最大扭矩 20 Nm
+
     // 角度零点
     .angle_zeropoint = 0.0f,
     
@@ -629,7 +629,7 @@ static const dual_pid_params_t dual_pid_default_params = {
     .emergency_angle = 45.0f,
     
     // 输出限幅
-    .max_torque = 8.0f,
+    .max_torque = 15.0f,
     
     // 环路顺序: 角度优先 (默认)
     .loop_order = DUAL_PID_ANGLE_FIRST,

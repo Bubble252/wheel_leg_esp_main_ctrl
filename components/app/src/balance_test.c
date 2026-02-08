@@ -61,7 +61,7 @@ static const char *TAG = "BAL_TEST";
 #define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (≈300Hz)
 #define BALANCE_CTRL_PERIOD_MS      5       // 200Hz 平衡控制
 #define MOTOR_COMM_PERIOD_MS        5       // 200Hz 电机通信 (与控制同步)
-#define LEG_MOTOR_DIVIDER           10      // 腿电机分频 (200Hz / 10 = 20Hz)
+#define LEG_MOTOR_DIVIDER           4       // 腿电机分频 (200Hz / 4 = 50Hz)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 
 // ===== 合并任务配置 =====
@@ -324,6 +324,19 @@ static pid_controller_t g_xoffset_pid;           // X-Offset PID 控制器
 static float g_xoffset_value = 0.0f;             // 当前 x_offset 输出 (米)
 static float g_xoffset_limit = 0.03f;            // X-Offset 限幅 (米), 默认 ±3cm
 static float g_xoffset_debug_speed = 0.0f;       // 调试用: 当时的速度输入
+
+// ============================================================================
+// Leg Sync 左右腿同步控制 (防劈叉)
+// ============================================================================
+// 功能: 读取左右腿实际 body_angle，用交叉耦合补偿消除差异
+//   左右腿角度差 → 按比例修正各自的目标角度
+//   相当于在两条腿之间加一根"虚拟弹簧"
+// 与 X-Offset 正交: X-Offset 是两腿同方向偏移，Sync 是反方向补偿
+static bool g_leg_sync_enabled = false;           // Leg Sync 使能开关
+static float g_leg_sync_gain = 0.3f;              // 同步增益 (0~1), 0.3 = 修正30%的差异
+static float g_leg_sync_max_correction = 15.0f;   // 最大修正量 (度), 防止过大跳变
+static float g_leg_sync_debug_diff = 0.0f;        // 调试: 左右腿角度差 (度)
+static float g_leg_sync_debug_correction = 0.0f;  // 调试: 实际修正量 (度)
 
 // ============================================================================
 // VMC (Virtual Model Control) 力控模式
@@ -813,6 +826,13 @@ static void output_pid_debug(const lqr_input_t *input) {
                g_xoffset_debug_speed, g_xoffset_value,
                g_xoffset_pid.kp, g_xoffset_pid.ki, g_xoffset_pid.kd, g_xoffset_limit);
     }
+    
+    // Leg Sync 调试输出 (附加行，仅在启用时显示)
+    if (g_leg_sync_enabled) {
+        printf("[SYNC] diff=%.2f° → corr=%.2f° (gain=%.2f max=%.1f°)\n",
+               g_leg_sync_debug_diff, g_leg_sync_debug_correction,
+               g_leg_sync_gain, g_leg_sync_max_correction);
+    }
 }
 
 // ============================================================================
@@ -1138,6 +1158,9 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
     }
 }
 
+// Forward declaration for leg sync
+static esp_err_t leg_ctrl_get_state_cached(bool is_left, leg_state_t *state);
+
 /**
  * @brief 发送腿部电机命令 (在 motor_comm 任务中调用)
  * @note 支持两种模式:
@@ -1163,17 +1186,75 @@ static void apply_leg_motor_commands(void) {
         }
     } else if (!g_vmc_enabled) {
         // ===== 位置控制模式 =====
+        
+        // ---- Leg Sync: 左右腿同步补偿 (防劈叉) ----
+        float left_hip_cmd = g_leg_left_hip_angle;
+        float left_knee_cmd = g_leg_left_knee_angle;
+        float right_hip_cmd = g_leg_right_hip_angle;
+        float right_knee_cmd = g_leg_right_knee_angle;
+        
+        if (g_leg_sync_enabled) {
+            // 读取左右腿实际 body_angle (从电机缓存，无阻塞)
+            leg_state_t left_state, right_state;
+            if (leg_ctrl_get_state_cached(true, &left_state) == ESP_OK &&
+                leg_ctrl_get_state_cached(false, &right_state) == ESP_OK &&
+                left_state.valid && right_state.valid) {
+                
+                float left_actual = left_state.workspace.body_angle;
+                float right_actual = right_state.workspace.body_angle;
+                float angle_diff = left_actual - right_actual;  // 正值=左腿比右腿更偏前
+                
+                // 计算修正量 (按比例修正差异)
+                float correction = angle_diff * g_leg_sync_gain;
+                
+                // 限幅
+                if (correction > g_leg_sync_max_correction) correction = g_leg_sync_max_correction;
+                if (correction < -g_leg_sync_max_correction) correction = -g_leg_sync_max_correction;
+                
+                // 保存调试值
+                g_leg_sync_debug_diff = angle_diff;
+                g_leg_sync_debug_correction = correction;
+                
+                // 应用修正: 通过修改 body_angle → 重新 IK
+                // 左腿角度偏大 → 减小左腿目标角度, 增大右腿目标角度
+                if (fabsf(correction) > 0.1f) {
+                    float left_target_angle = g_leg_left_target_angle - correction;
+                    float right_target_angle = g_leg_right_target_angle + correction;
+                    
+                    // 重新 IK 计算修正后的关节角度
+                    leg_workspace_state_t left_ws = { .leg_length = g_leg_left_target_length, .body_angle = left_target_angle };
+                    leg_workspace_state_t right_ws = { .leg_length = g_leg_right_target_length, .body_angle = right_target_angle };
+                    
+                    leg_kin_clamp_workspace(&left_ws.leg_length, &left_ws.body_angle, NULL);
+                    leg_kin_clamp_workspace(&right_ws.leg_length, &right_ws.body_angle, NULL);
+                    
+                    leg_joint_state_t left_joint, right_joint;
+                    if (leg_kin_inverse(&left_ws, true, NULL, &left_joint) == ESP_OK) {
+                        left_hip_cmd = left_joint.hip_angle;
+                        left_knee_cmd = left_joint.knee_angle;
+                    }
+                    if (leg_kin_inverse(&right_ws, false, NULL, &right_joint) == ESP_OK) {
+                        right_hip_cmd = right_joint.hip_angle;
+                        right_knee_cmd = right_joint.knee_angle;
+                    }
+                }
+            }
+        } else {
+            g_leg_sync_debug_diff = 0.0f;
+            g_leg_sync_debug_correction = 0.0f;
+        }
+        
         if (g_motor_left_hip) {
-            can_motor_set_position(g_motor_left_hip, g_leg_left_hip_angle, g_leg_move_speed);
+            can_motor_set_position(g_motor_left_hip, left_hip_cmd, g_leg_move_speed);
         }
         if (g_motor_left_knee) {
-            can_motor_set_position(g_motor_left_knee, g_leg_left_knee_angle, g_leg_move_speed);
+            can_motor_set_position(g_motor_left_knee, left_knee_cmd, g_leg_move_speed);
         }
         if (g_motor_right_hip) {
-            can_motor_set_position(g_motor_right_hip, g_leg_right_hip_angle, g_leg_move_speed);
+            can_motor_set_position(g_motor_right_hip, right_hip_cmd, g_leg_move_speed);
         }
         if (g_motor_right_knee) {
-            can_motor_set_position(g_motor_right_knee, g_leg_right_knee_angle, g_leg_move_speed);
+            can_motor_set_position(g_motor_right_knee, right_knee_cmd, g_leg_move_speed);
         }
     }
 }
@@ -1261,6 +1342,51 @@ void balance_test_set_xoffset_limit(float limit) {
     g_xoffset_limit = limit;
     pid_set_output_limits(&g_xoffset_pid, -limit, limit);
     ESP_LOGI(TAG, "X-Offset limit: %.3f m", limit);
+}
+
+// ============================================================================
+// Leg Sync (防劈叉) API
+// ============================================================================
+
+/**
+ * @brief 使能/禁用 Leg Sync
+ */
+void balance_test_set_leg_sync(bool enable) {
+    g_leg_sync_enabled = enable;
+    if (!enable) {
+        g_leg_sync_debug_diff = 0.0f;
+        g_leg_sync_debug_correction = 0.0f;
+    }
+    ESP_LOGI(TAG, "Leg Sync %s (gain=%.2f max=%.1f°)",
+             enable ? "ENABLED" : "DISABLED",
+             g_leg_sync_gain, g_leg_sync_max_correction);
+}
+
+/**
+ * @brief 获取 Leg Sync 状态
+ */
+bool balance_test_get_leg_sync(void) {
+    return g_leg_sync_enabled;
+}
+
+/**
+ * @brief 设置 Leg Sync 增益
+ */
+void balance_test_set_leg_sync_gain(float gain) {
+    if (gain < 0.0f) gain = 0.0f;
+    if (gain > 1.0f) gain = 1.0f;
+    g_leg_sync_gain = gain;
+    ESP_LOGI(TAG, "Leg Sync gain: %.2f", gain);
+}
+
+/**
+ * @brief 设置 Leg Sync 最大修正量
+ */
+void balance_test_set_leg_sync_max(float max_deg) {
+    if (max_deg < 1.0f) max_deg = 1.0f;
+    if (max_deg > 45.0f) max_deg = 45.0f;
+    g_leg_sync_max_correction = max_deg;
+    ESP_LOGI(TAG, "Leg Sync max correction: %.1f°", max_deg);
 }
 
 // ============================================================================
@@ -1486,6 +1612,10 @@ esp_err_t balance_test_start(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi remote start failed");
     }
+    
+    // 等待 WiFi PA 电流稳定，避免与电机通信同时启动导致欠压
+    ESP_LOGI(TAG, "Waiting 2s for WiFi power stabilization...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
     
     // 重置 LQR 控制器
     lqr_reset(&g_lqr_ctrl);
@@ -1722,6 +1852,10 @@ void balance_test_print_status(void) {
              g_xoffset_enabled ? "ENABLED" : "DISABLED",
              g_xoffset_value, g_xoffset_debug_speed,
              g_xoffset_pid.kp, g_xoffset_pid.ki, g_xoffset_pid.kd, g_xoffset_limit);
+    ESP_LOGI(TAG, "Leg Sync: %s (gain=%.2f max=%.1f° diff=%.2f° corr=%.2f°)",
+             g_leg_sync_enabled ? "ENABLED" : "DISABLED",
+             g_leg_sync_gain, g_leg_sync_max_correction,
+             g_leg_sync_debug_diff, g_leg_sync_debug_correction);
     ESP_LOGI(TAG, "Leg control: %s", g_leg_control_enabled ? "ENABLED" : "DISABLED");
     if (g_leg_control_enabled) {
         ESP_LOGI(TAG, "  Leg targets: L=%.3fm/%.1fdeg, R=%.3fm/%.1fdeg",
@@ -2824,7 +2958,7 @@ void balance_test_process_cmd(const char *cmd_str) {
     
     char *token = strtok(cmd, " \t\n\r");
     if (token == NULL) {
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero <deg>]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|pitchcomp|xoffset|sync|vmc|...]\n");
         return;
     }
     
@@ -3264,6 +3398,47 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else {
             printf("Unknown xoffset command: %s\n", token);
             printf("Usage: balance xoffset [on|off|kp <val>|ki <val>|kd <val>|limit <val>]\n");
+        }
+    }
+    // ===== Leg Sync (防劈叉) =====
+    else if (strcmp(token, "sync") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            // 显示 Sync 状态
+            printf("=== Leg Sync Status ===\n");
+            printf("Leg Sync: %s\n", g_leg_sync_enabled ? "ENABLED" : "DISABLED");
+            printf("Gain: %.2f\n", g_leg_sync_gain);
+            printf("Max correction: %.1f°\n", g_leg_sync_max_correction);
+            printf("Current: diff=%.2f° corr=%.2f°\n",
+                   g_leg_sync_debug_diff, g_leg_sync_debug_correction);
+            printf("Usage: balance sync [on|off|gain <0~1>|max <deg>]\n");
+        } else if (strcmp(token, "on") == 0) {
+            balance_test_set_leg_sync(true);
+            printf("Leg Sync enabled\n");
+        } else if (strcmp(token, "off") == 0) {
+            balance_test_set_leg_sync(false);
+            printf("Leg Sync disabled\n");
+        } else if (strcmp(token, "gain") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float gain = atof(token);
+                balance_test_set_leg_sync_gain(gain);
+                printf("Leg Sync gain = %.2f\n", gain);
+            } else {
+                printf("Current gain = %.2f\n", g_leg_sync_gain);
+            }
+        } else if (strcmp(token, "max") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float max_deg = atof(token);
+                balance_test_set_leg_sync_max(max_deg);
+                printf("Leg Sync max correction = %.1f°\n", max_deg);
+            } else {
+                printf("Current max correction = %.1f°\n", g_leg_sync_max_correction);
+            }
+        } else {
+            printf("Unknown sync command: %s\n", token);
+            printf("Usage: balance sync [on|off|gain <0~1>|max <deg>]\n");
         }
     }
     // ===== VMC 力控模式 =====

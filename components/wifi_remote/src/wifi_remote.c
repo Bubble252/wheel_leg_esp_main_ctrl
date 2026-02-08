@@ -351,7 +351,7 @@ esp_err_t wifi_remote_start(void) {
     // 可选值: 8(2dBm), 20(5dBm), 28(7dBm), 34(8.5dBm), 44(11dBm), 52(13dBm), 60(15dBm), 68(17dBm), 76(19dBm), 78(19.5dBm), 84(21dBm)
     // 原项目使用默认值(约78)，但ESP32-S3可能需要降低以避免欠压
     // 如果WiFi能正常启动，可以逐步提高此值以增强信号强度
-    esp_wifi_set_max_tx_power(44);  // 11dBm，中等功率，平衡信号和稳定性
+    esp_wifi_set_max_tx_power(20);  // 19.5dBm，接近最大功率，增强信号覆盖
     
     int8_t power;
     esp_wifi_get_max_tx_power(&power);
