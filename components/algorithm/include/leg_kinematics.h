@@ -43,43 +43,43 @@ extern "C" {
 // ============================================================================
 
 #ifndef LEG_THIGH_LENGTH
-#define LEG_THIGH_LENGTH            0.10f   // 大腿长度 (米)
+#define LEG_THIGH_LENGTH            0.065f  // 大腿长度 (米)
 #endif
 
 #ifndef LEG_SHANK_LENGTH
-#define LEG_SHANK_LENGTH            0.10f   // 小腿长度 (米)
+#define LEG_SHANK_LENGTH            0.065f  // 小腿长度 (米)
 #endif
 
 // 电机零点偏移 (将电机编码器角度转换为运动学角度)
 // 运动学定义: theta2=0 表示小腿伸直，顺时针弯曲为负
-// 左腿校准: 电机读数 Hip=-60°, Knee=-55° 时，腿部垂直向下(body_angle=-90°)，大小腿夹角90°
+// 左腿校准: 电机读数 Hip=-65°, Knee=-35° 时，腿部垂直向下(body_angle=-90°)，大小腿夹角90°
 // 此时: theta2 = -90°, beta = -45°, theta1 = body_angle - beta = -90 - (-45) = -45°
-// theta_knee = motor_knee - knee_offset  =>  -90 = -55 - offset  =>  offset = 35
-// theta_hip = motor_hip - hip_offset  =>  -45 = -60 - offset  =>  offset = -15
+// theta_knee = motor_knee - knee_offset  =>  -90 = -35 - offset  =>  offset = 55
+// theta_hip = motor_hip - hip_offset  =>  -45 = -65 - offset  =>  offset = -20
 #ifndef LEG_LEFT_HIP_OFFSET
-#define LEG_LEFT_HIP_OFFSET         (-15.0f)
+#define LEG_LEFT_HIP_OFFSET         (-20.0f)
 #endif
 
 #ifndef LEG_LEFT_KNEE_OFFSET
-#define LEG_LEFT_KNEE_OFFSET        (35.0f)
+#define LEG_LEFT_KNEE_OFFSET        (55.0f)
 #endif
 
 // 右腿: 镜像对称
 #ifndef LEG_RIGHT_HIP_OFFSET
-#define LEG_RIGHT_HIP_OFFSET        (15.0f)
+#define LEG_RIGHT_HIP_OFFSET        (20.0f)
 #endif
 
 #ifndef LEG_RIGHT_KNEE_OFFSET
-#define LEG_RIGHT_KNEE_OFFSET       (-35.0f)
+#define LEG_RIGHT_KNEE_OFFSET       (-55.0f)
 #endif
 
 // 腿部工作空间限位
 #ifndef LEG_LENGTH_MIN
-#define LEG_LENGTH_MIN              0.07f   // 最小腿长 (米)
+#define LEG_LENGTH_MIN              0.045f  // 最小腿长 (米)
 #endif
 
 #ifndef LEG_LENGTH_MAX
-#define LEG_LENGTH_MAX              0.17f   // 最大腿长 (米)
+#define LEG_LENGTH_MAX              0.11f   // 最大腿长 (米)
 #endif
 
 #ifndef LEG_BODY_ANGLE_MIN
@@ -296,6 +296,26 @@ typedef enum {
 } vmc_coord_type_t;
 
 /**
+ * @brief VMC 速度估计方法 (通用)
+ * 
+ * 适用于: 单腿 VMC 力闭环 (dL, dα) 和双腿协调控制 (角度差变化率)
+ * 
+ * VMC_DIFF_NUMERIC:  数值微分
+ *   rate = (value - last_value) * freq
+ *   优点: 简单
+ *   缺点: 有一个采样周期的延迟，噪声被放大
+ * 
+ * VMC_DIFF_JACOBIAN: 雅可比速度 (默认)
+ *   rate = J × joint_velocity  (解析计算)
+ *   优点: 无延迟，解析精确，噪声小
+ *   缺点: 依赖关节速度反馈质量
+ */
+typedef enum {
+    VMC_DIFF_JACOBIAN = 0,    // 雅可比速度 (默认)
+    VMC_DIFF_NUMERIC  = 1     // 数值微分
+} vmc_diff_method_t;
+
+/**
  * @brief VMC 控制参数 (世界坐标系)
  * 
  * 控制策略:
@@ -337,6 +357,10 @@ typedef struct {
     float K_sync;           // 协调控制 P 增益 (Nm/rad), 典型值: 0.5~2
     float D_sync;           // 协调控制 D 增益 (Nm·s/rad), 典型值: 0.05~0.2
     bool sync_enable;       // 协调控制使能
+    vmc_diff_method_t sync_diff_method; // 协调控制角速度差估计方法 (默认: 雅可比)
+    
+    // 单腿 VMC 力闭环速度估计方法
+    vmc_diff_method_t vmc_diff_method;  // dL/dα 速度估计方法 (默认: 雅可比)
     
     // 重力补偿
     float gravity_comp;     // 重力补偿系数 (0~1), 1.0=完全补偿
@@ -520,7 +544,14 @@ typedef struct {
     // 状态估计 (可选使用)
     float current_leg_length;   // 当前腿长 (m)
     float current_body_angle;   // 当前身体夹角 (度)
+    float current_body_angle_rate; // 当前身体角速度 (度/秒), 由雅可比计算
+    float current_leg_length_rate; // 当前腿长变化率 (m/s)
     float current_height;       // 当前离地高度 (m), 世界坐标系
+    
+    // 数值微分内部状态 (调用者不要手动修改，跨周期保持 output 即可)
+    float _last_L;              // 上一次腿长 (m), 数值微分用
+    float _last_alpha_rad;      // 上一次身体角度 (rad), 数值微分用
+    bool  _diff_initialized;    // 数值微分初始化标志
     
     // 调试信息
     vmc_output_t debug;     // 详细调试输出

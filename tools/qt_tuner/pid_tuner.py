@@ -269,11 +269,13 @@ class SerialThread(QThread):
 class PIDControlPanel(QWidget):
     """单个PID控制器的参数面板"""
     
-    def __init__(self, name, commander_id, parent=None):
+    def __init__(self, name, commander_id, parent=None, output_channel_id=None, output_dual=False):
         super().__init__(parent)
         self.name = name
         self.commander_id = commander_id
         self.parent_window = parent
+        self.output_channel_id = output_channel_id  # 环路输出通道 ID (Q/R/S/T/U/V)
+        self.output_dual = output_dual  # 是否双线模式 (target + control)
         
         # 数据缓存 (最多保存500个点)
         self.max_points = 500
@@ -281,6 +283,12 @@ class PIDControlPanel(QWidget):
         self.target_data = deque(maxlen=self.max_points)
         self.control_data = deque(maxlen=self.max_points)
         self.data_counter = 0
+        
+        # 环路输出波形数据缓存
+        self.output_time_data = deque(maxlen=self.max_points)
+        self.output_data = deque(maxlen=self.max_points)
+        self.output_data2 = deque(maxlen=self.max_points)  # 双线模式第二条线
+        self.output_counter = 0
         
         self.init_ui()
     
@@ -438,6 +446,67 @@ class PIDControlPanel(QWidget):
         
         plot_group.setLayout(plot_layout)
         layout.addWidget(plot_group)
+        
+        # 环路输出波形显示区 (仅当指定了输出通道时显示)
+        if self.output_channel_id:
+            if self.output_dual:
+                output_group = QGroupBox(f"📊 环路输出对比 (通道 {self.output_channel_id}: 蓝=处理前, 绿=处理后)")
+            else:
+                output_group = QGroupBox(f"📊 环路输出大小 (通道 {self.output_channel_id})")
+            output_plot_layout = QVBoxLayout()
+            
+            # 当前输出值显示
+            self.output_value_label = QLabel("当前输出: --")
+            self.output_value_label.setStyleSheet(SS(
+                "font-size: 16px; font-weight: bold; color: #00ff88; "
+                "background-color: #1a2a1a; padding: 8px; border-radius: 5px; "
+                "border: 1px solid #00ff88;"
+            ))
+            self.output_value_label.setAlignment(Qt.AlignCenter)
+            output_plot_layout.addWidget(self.output_value_label)
+            
+            self.output_plot_widget = pg.PlotWidget()
+            self.output_plot_widget.setBackground('#1a1a2e')
+            self.output_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+            self.output_plot_widget.setLabel('left', '输出大小')
+            self.output_plot_widget.setLabel('bottom', '时间 (采样点)')
+            self.output_plot_widget.setMinimumHeight(150)
+            self.output_plot_widget.setMaximumHeight(200)
+            
+            # 零线
+            self.output_plot_widget.addLine(y=0, pen=pg.mkPen(color='w', width=1, style=Qt.DashLine))
+            
+            if self.output_dual:
+                self.output_plot_widget.addLegend()
+                # 蓝色 = 处理前 (raw), 绿色 = 处理后 (final)
+                self.output_curve2 = self.output_plot_widget.plot(
+                    pen=pg.mkPen(color='#4488ff', width=2), name='处理前(raw)'
+                )
+                self.output_curve = self.output_plot_widget.plot(
+                    pen=pg.mkPen(color='#00ff88', width=2), name='处理后(final)'
+                )
+            else:
+                self.output_curve = self.output_plot_widget.plot(
+                    pen=pg.mkPen(color='#00ff88', width=2), name='环路输出'
+                )
+            
+            output_plot_layout.addWidget(self.output_plot_widget)
+            
+            # 输出波形控制按钮
+            out_btn_layout = QHBoxLayout()
+            self.clear_output_btn = QPushButton("清空输出波形")
+            self.clear_output_btn.clicked.connect(self.clear_output_plot)
+            out_btn_layout.addWidget(self.clear_output_btn)
+            
+            self.pause_output_btn = QPushButton("暂停")
+            self.pause_output_btn.setCheckable(True)
+            out_btn_layout.addWidget(self.pause_output_btn)
+            
+            out_btn_layout.addStretch()
+            output_plot_layout.addLayout(out_btn_layout)
+            
+            output_group.setLayout(output_plot_layout)
+            layout.addWidget(output_group)
     
     def create_param_display(self, text):
         """创建参数显示标签"""
@@ -531,6 +600,46 @@ class PIDControlPanel(QWidget):
         self.data_counter = 0
         self.target_curve.setData([], [])
         self.control_curve.setData([], [])
+    
+    def update_output_plot(self, value, value2=None):
+        """更新环路输出波形数据
+        
+        Args:
+            value: 主输出值 (单线模式) 或处理后值 (双线模式)
+            value2: 双线模式的处理前值 (raw)
+        """
+        if not self.output_channel_id:
+            return
+        if hasattr(self, 'pause_output_btn') and self.pause_output_btn.isChecked():
+            return
+        
+        self.output_counter += 1
+        self.output_time_data.append(self.output_counter)
+        self.output_data.append(value)
+        
+        self.output_curve.setData(list(self.output_time_data), list(self.output_data))
+        
+        # 双线模式
+        if self.output_dual and value2 is not None:
+            self.output_data2.append(value2)
+            self.output_curve2.setData(list(self.output_time_data), list(self.output_data2))
+            self.output_value_label.setText(f"raw: {value2:.4f}  →  final: {value:.4f}")
+        else:
+            # 更新数值显示
+            self.output_value_label.setText(f"当前输出: {value:.4f}")
+    
+    def clear_output_plot(self):
+        """清除环路输出波形数据"""
+        self.output_time_data.clear()
+        self.output_data.clear()
+        self.output_data2.clear()
+        self.output_counter = 0
+        if hasattr(self, 'output_curve'):
+            self.output_curve.setData([], [])
+        if hasattr(self, 'output_curve2'):
+            self.output_curve2.setData([], [])
+        if hasattr(self, 'output_value_label'):
+            self.output_value_label.setText("当前输出: --")
 
 
 # ============================================================================
@@ -1016,10 +1125,10 @@ class LegControlPanel(QWidget):
     """
     
     # 运动学参数 (与 leg_kinematics.h 保持一致)
-    LEG_THIGH_LENGTH = 0.10  # 大腿长度 (m)
-    LEG_SHANK_LENGTH = 0.10  # 小腿长度 (m)
-    DEFAULT_LEG_LENGTH_MIN = 0.07    # 默认最小腿长 (m) - 与 C 代码一致
-    DEFAULT_LEG_LENGTH_MAX = 0.17    # 默认最大腿长 (m) - 与 C 代码一致
+    LEG_THIGH_LENGTH = 0.065  # 大腿长度 (m)
+    LEG_SHANK_LENGTH = 0.065  # 小腿长度 (m)
+    DEFAULT_LEG_LENGTH_MIN = 0.045   # 默认最小腿长 (m) - 与 C 代码一致
+    DEFAULT_LEG_LENGTH_MAX = 0.11    # 默认最大腿长 (m) - 与 C 代码一致
     LEG_BODY_ANGLE_MIN = -160.0  # 最小身体夹角 (度), 向前蹬腿
     LEG_BODY_ANGLE_MAX = -20.0   # 最大身体夹角 (度), 向后蹬腿
     
@@ -1630,8 +1739,8 @@ class LegControlPanel(QWidget):
         
         # ===== 与 C 代码一致的 IK 算法 =====
         # 左腿 offset (校准: Hip=-60°, Knee=-55° → body_angle=-90°, theta2=-90°)
-        hip_offset = -15.0
-        knee_offset = 35.0
+        hip_offset = -20.0
+        knee_offset = 55.0
         
         # Step 1: 余弦定理求膝关节角度 theta2
         cos_theta2 = (length*length - L1*L1 - L2*L2) / (2 * L1 * L2)
@@ -1800,12 +1909,12 @@ class LegControlPanel(QWidget):
             left_state: dict with keys: length, angle, hip, knee
             right_state: dict with keys: length, angle, hip, knee
         """
-        # 左腿 offset (校准: Hip=-60°, Knee=-55° → body_angle=-90°)
-        left_hip_offset = -15.0
-        left_knee_offset = 35.0
+        # 左腿 offset (校准: Hip=-65°, Knee=-35° → body_angle=-90°)
+        left_hip_offset = -20.0
+        left_knee_offset = 55.0
         # 右腿 offset (镜像)
-        right_hip_offset = 15.0
-        right_knee_offset = -35.0
+        right_hip_offset = 20.0
+        right_knee_offset = -55.0
         
         if left_state:
             self.left_length_label.setText(f"{left_state.get('length', 0):.3f}")
@@ -4853,25 +4962,25 @@ class PIDTunerUI(QMainWindow):
         
         # 根据Commander映射创建标签页
         # PID控制器 - 平衡控制相关
-        self.pid_panels['angle'] = PIDControlPanel("角度控制 (Angle)", "A", self)
+        self.pid_panels['angle'] = PIDControlPanel("角度控制 (Angle)", "A", self, output_channel_id='Q')
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['angle']), "A - 角度PID")
         
-        self.pid_panels['gyro'] = PIDControlPanel("角速度控制 (Gyro)", "B", self)
+        self.pid_panels['gyro'] = PIDControlPanel("角速度控制 (Gyro)", "B", self, output_channel_id='R')
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['gyro']), "B - 角速度PID")
         
-        self.pid_panels['distance'] = PIDControlPanel("位移控制 (Distance)", "C", self)
+        self.pid_panels['distance'] = PIDControlPanel("位移控制 (Distance)", "C", self, output_channel_id='S')
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['distance']), "C - 位移PID")
         
-        self.pid_panels['speed'] = PIDControlPanel("速度控制 (Speed)", "D", self)
+        self.pid_panels['speed'] = PIDControlPanel("速度控制 (Speed)", "D", self, output_channel_id='T')
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['speed']), "D - 速度PID")
         
-        self.pid_panels['yaw_angle'] = PIDControlPanel("YAW角度控制", "E", self)
+        self.pid_panels['yaw_angle'] = PIDControlPanel("YAW角度控制", "E", self, output_channel_id='U')
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['yaw_angle']), "E - YAW角度PID")
         
-        self.pid_panels['yaw_gyro'] = PIDControlPanel("YAW角速度控制", "F", self)
+        self.pid_panels['yaw_gyro'] = PIDControlPanel("YAW角速度控制", "F", self, output_channel_id='U')
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['yaw_gyro']), "F - YAW角速度PID")
         
-        self.pid_panels['lqr_u'] = PIDControlPanel("LQR输出补偿", "H", self)
+        self.pid_panels['lqr_u'] = PIDControlPanel("LQR输出补偿", "H", self, output_channel_id='V', output_dual=True)
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['lqr_u']), "H - LQR输出PID")
         
         self.pid_panels['zeropoint'] = PIDControlPanel("零点自适应", "I", self)
@@ -5072,6 +5181,16 @@ class PIDTunerUI(QMainWindow):
                         'P': 'right'      # 右轮调试
                     }
                     
+                    # 环路输出映射 (通道ID → PID面板key)
+                    output_map = {
+                        'Q': 'angle',      # 角度环输出
+                        'R': 'gyro',       # 角速度环输出
+                        'S': 'distance',   # 位移环输出
+                        'T': 'speed',      # 速度环输出
+                        'U': 'yaw_angle',  # YAW控制输出 (同时更新yaw_gyro面板)
+                        'V': 'lqr_u',      # LQR输出PID处理前后对比
+                    }
+                    
                     if panel_id in panel_map:
                         panel_key = panel_map[panel_id]
                         if panel_key in self.pid_panels:
@@ -5084,6 +5203,18 @@ class PIDTunerUI(QMainWindow):
                         panel_key = wheel_map[panel_id]
                         if panel_key in self.wheel_panels:
                             self.wheel_panels[panel_key].update_plot(target, control)
+                    elif panel_id in output_map:
+                        panel_key = output_map[panel_id]
+                        if panel_key in self.pid_panels:
+                            panel = self.pid_panels[panel_key]
+                            if panel.output_dual:
+                                # 双线模式: target=处理前(raw), control=处理后(final)
+                                panel.update_output_plot(control, value2=target)
+                            else:
+                                panel.update_output_plot(control)
+                        # YAW输出同时更新 yaw_gyro 面板
+                        if panel_id == 'U' and 'yaw_gyro' in self.pid_panels:
+                            self.pid_panels['yaw_gyro'].update_output_plot(control)
                 except (ValueError, IndexError) as e:
                     if self.debug_mode:
                         self.log(f"解析数据失败: {line} ({e})", is_error=True)

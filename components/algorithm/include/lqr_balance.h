@@ -183,7 +183,8 @@ typedef struct {
     float gyro_control;         // 角速度控制量
     float distance_control;     // 位移控制量
     float speed_control;        // 速度控制量
-    float lqr_u;                // LQR 综合输出
+    float lqr_u;                // LQR 综合输出 (经 pid_lqr_u 处理后)
+    float lqr_u_raw;            // LQR 原始输出 (pid_lqr_u 处理前)
     float yaw_control;          // 偏航控制量
     float roll_control;         // 横滚控制量 (用于腿长控制)
     

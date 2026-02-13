@@ -453,6 +453,10 @@ void vmc_get_default_params(vmc_params_t *params) {
     params->K_sync = 0.0f;          // 协调控制 P 增益 (Nm/rad)
     params->D_sync = 0.0f;         // 协调控制 D 增益 (Nm·s/rad)
     params->sync_enable = false;    // 默认关闭
+    params->sync_diff_method = VMC_DIFF_JACOBIAN; // 默认雅可比
+    
+    // 单腿 VMC 速度估计方法
+    params->vmc_diff_method = VMC_DIFF_JACOBIAN; // 默认雅可比 (解析精确、无延迟)
     
     // 重力补偿
     params->gravity_comp = 0.0f;    // 50% 重力补偿 (保守起见)
@@ -803,11 +807,6 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
         .knee_angle = input->sensor.knee_angle
     };
     
-    // 关节速度: rpm → rad/s
-    const float rpm_to_rad_s = M_PI / 30.0f;
-    float hip_vel_rad = input->sensor.hip_velocity * rpm_to_rad_s;
-    float knee_vel_rad = input->sensor.knee_velocity * rpm_to_rad_s;
-    
     // IMU: deg → rad
     float pitch_rad = DEG2RAD(input->pitch_deg);
     float pitch_rate_rad = DEG2RAD(input->pitch_rate_deg);
@@ -818,22 +817,45 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
     float current_L = workspace.leg_length;
     float current_alpha_rad = DEG2RAD(workspace.body_angle);
     
-    // === 3. 机身坐标系雅可比: 计算腿长变化率和身体角速度 ===
-    float J_body[4];
-    leg_kin_jacobian(&joint, is_left, NULL, J_body);
-    float current_dL = J_body[0] * hip_vel_rad + J_body[1] * knee_vel_rad;
-    float current_dalpha = J_body[2] * hip_vel_rad + J_body[3] * knee_vel_rad;
+    // === 3. 速度估计: 根据配置选择雅可比或数值微分 ===
+    float current_dL, current_dalpha;
+    float current_vy = 0.0f;
+    
+    if (params->vmc_diff_method == VMC_DIFF_NUMERIC) {
+        // === 数值微分方法: 不需要电机速度反馈 ===
+        if (output->_diff_initialized) {
+            // 假设 200Hz 调用频率
+            current_dL = (current_L - output->_last_L) * 200.0f;
+            current_dalpha = (current_alpha_rad - output->_last_alpha_rad) * 200.0f;
+        } else {
+            // 首次调用，无历史数据
+            current_dL = 0.0f;
+            current_dalpha = 0.0f;
+        }
+        // 世界坐标系垂直速度也用数值微分 (通过 current_y 差分)
+        // 注: current_vy 留 0, 世界坐标系模式下精度会降低
+    } else {
+        // === 雅可比方法 (默认): 需要电机速度反馈 ===
+        const float rpm_to_rad_s = M_PI / 30.0f;
+        float hip_vel_rad = input->sensor.hip_velocity * rpm_to_rad_s;
+        float knee_vel_rad = input->sensor.knee_velocity * rpm_to_rad_s;
+        
+        float J_body[4];
+        leg_kin_jacobian(&joint, is_left, NULL, J_body);
+        current_dL = J_body[0] * hip_vel_rad + J_body[1] * knee_vel_rad;
+        current_dalpha = J_body[2] * hip_vel_rad + J_body[3] * knee_vel_rad;
+        
+        // 世界坐标系雅可比: 计算垂直速度
+        float J_world[4];
+        leg_kin_jacobian_cartesian(&joint, is_left, NULL, pitch_rad, J_world);
+        current_vy = J_world[2] * hip_vel_rad + J_world[3] * knee_vel_rad;
+    }
     
     // === 4. 世界坐标系 FK: 计算离地高度 ===
     float current_x, current_y;
     leg_kin_forward_cartesian(&joint, is_left, NULL, pitch_rad, &current_x, &current_y);
     
-    // === 5. 世界坐标系雅可比: 计算垂直速度 ===
-    float J_world[4];
-    leg_kin_jacobian_cartesian(&joint, is_left, NULL, pitch_rad, J_world);
-    float current_vy = J_world[2] * hip_vel_rad + J_world[3] * knee_vel_rad;
-    
-    // === 6. 填充 VMC 输入 ===
+    // === 5. 填充 VMC 输入 ===
     vmc_input_t vmc_input = {0};
     
     // 世界坐标系输入
@@ -860,7 +882,7 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
     vmc_input.current_pitch = pitch_rad;
     vmc_input.current_pitch_rate = pitch_rate_rad;
     
-    // === 7. 调用底层 VMC 计算 ===
+    // === 6. 调用底层 VMC 计算 ===
     vmc_output_t vmc_output = {0};
     esp_err_t ret = vmc_compute_torque(params, &vmc_input, &joint, is_left, pitch_rad, &vmc_output);
     
@@ -868,15 +890,22 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
         return ret;
     }
     
-    // === 8. 填充输出 ===
+    // === 7. 填充输出 ===
     output->hip_torque = vmc_output.hip_torque;
     output->knee_torque = vmc_output.knee_torque;
     output->current_leg_length = current_L;
     output->current_body_angle = workspace.body_angle;
+    output->current_body_angle_rate = current_dalpha * (180.0f / M_PI);  // rad/s → deg/s
+    output->current_leg_length_rate = current_dL;  // m/s
     output->current_height = current_y;
     output->debug = vmc_output;
     
-    // === 9. 右腿扭矩方向修正 ===
+    // 保存当前值供下一次数值微分使用
+    output->_last_L = current_L;
+    output->_last_alpha_rad = current_alpha_rad;
+    output->_diff_initialized = true;
+    
+    // === 8. 右腿扭矩方向修正 ===
     // 雅可比是基于镜像后的运动学角度计算的（统一的工作空间定义）
     // 但右腿电机是镜像安装的，所以实际扭矩需要取反
     if (!is_left) {
@@ -942,18 +971,28 @@ esp_err_t vmc_dual_compute(const vmc_params_t *params,
         float angle_diff_deg = output->left.current_body_angle - output->right.current_body_angle;
         float angle_diff_rad = angle_diff_deg * (M_PI / 180.0f);
         
-        // 角速度差估计 (数值微分)
-        // 使用静态变量保存上一次的角度差
-        static float last_angle_diff_rad = 0.0f;
-        static bool first_call = true;
-        
+        // 角速度差估计 (根据配置选择方法)
         float angle_diff_rate_rad = 0.0f;
-        if (!first_call) {
-            // 假设 200Hz 调用频率
-            angle_diff_rate_rad = (angle_diff_rad - last_angle_diff_rad) * 200.0f;
+        
+        if (params->sync_diff_method == VMC_DIFF_JACOBIAN) {
+            // === 雅可比方法: 直接使用 vmc_ctrl_compute 输出的身体角速度 ===
+            // angle_diff_rate = left.body_angle_rate - right.body_angle_rate
+            // 无延迟，解析精确
+            float left_rate_rad = output->left.current_body_angle_rate * (M_PI / 180.0f);
+            float right_rate_rad = output->right.current_body_angle_rate * (M_PI / 180.0f);
+            angle_diff_rate_rad = left_rate_rad - right_rate_rad;
+        } else {
+            // === 数值微分方法 (默认): 使用静态变量保存上一次角度差 ===
+            static float last_angle_diff_rad = 0.0f;
+            static bool first_call = true;
+            
+            if (!first_call) {
+                // 假设 200Hz 调用频率
+                angle_diff_rate_rad = (angle_diff_rad - last_angle_diff_rad) * 200.0f;
+            }
+            first_call = false;
+            last_angle_diff_rad = angle_diff_rad;
         }
-        first_call = false;
-        last_angle_diff_rad = angle_diff_rad;
         
         // PD 控制计算 F_sync
         // 当 diff > 0 (左腿更靠后) 时，F_sync > 0

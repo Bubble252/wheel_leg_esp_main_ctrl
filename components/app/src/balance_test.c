@@ -61,7 +61,7 @@ static const char *TAG = "BAL_TEST";
 #define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (≈300Hz)
 #define BALANCE_CTRL_PERIOD_MS      5       // 200Hz 平衡控制
 #define MOTOR_COMM_PERIOD_MS        5       // 200Hz 电机通信 (与控制同步)
-#define LEG_MOTOR_DIVIDER           4       // 腿电机分频 (200Hz / 4 = 50Hz)
+#define LEG_MOTOR_DIVIDER           1       // 腿电机分频 (200Hz / 1 = 200Hz)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 
 // ===== 合并任务配置 =====
@@ -239,13 +239,14 @@ static float g_angle_zeropoint = 0.0f;      // 角度零点 (需要根据实际�
 static int g_move_stop_flag = 0;            // 停止标志
 static int g_uncontrolable = 0;             // 失控标志
 
-// 轮速加速度计算 (用于离地检测调试)
+// 轮速加速度计算 (用于离地检测)
 static float g_left_wheel_speed_rad = 0.0f;     // 左轮速度 (rad/s)
 static float g_right_wheel_speed_rad = 0.0f;    // 右轮速度 (rad/s)
 static float g_left_wheel_accel = 0.0f;         // 左轮加速度 (rad/s²)
 static float g_right_wheel_accel = 0.0f;        // 右轮加速度 (rad/s²)
 static float g_prev_left_wheel_speed = 0.0f;    // 上次左轮速度
 static float g_prev_right_wheel_speed = 0.0f;   // 上次右轮速度
+static bool g_wheel_off_ground = false;          // 轮子离地标志
 
 // YAW 轴控制 (带过零处理)
 static float g_yaw_angle_last = 0.0f;       // 上一次 YAW 角度 (用于过零处理)
@@ -292,18 +293,18 @@ static float g_leg_right_knee_angle = 0.0f;  // 右小腿角度
 static float g_leg_move_speed = 50.0f;        // 腿部电机运动速度 (rpm)
 
 // 腿长范围限制 (可通过 UI 或 CLI 调节)
-static float g_leg_length_min = 0.07f;        // 最小腿长 (m), 默认与 LEG_LENGTH_MIN 一致
-static float g_leg_length_max = 0.17f;        // 最大腿长 (m), 默认与 LEG_LENGTH_MAX 一致
+static float g_leg_length_min = 0.045f;       // 最小腿长 (m), 默认与 LEG_LENGTH_MIN 一致
+static float g_leg_length_max = 0.11f;        // 最大腿长 (m), 默认与 LEG_LENGTH_MAX 一致
 
 // 腿部目标状态 (运动学空间)
 // 基础腿长/角度: 用户设定的"高度"，Roll控制不修改这些值
-static float g_leg_base_length = 0.14f;          // 基础腿长 (米) - 决定机器人高度
+static float g_leg_base_length = 0.09f;           // 基础腿长 (米) - 决定机器人高度
 static float g_leg_base_angle = -90.0f;          // 基础身体夹角 (度), -90=垂直向下
 
 // 实际发送给电机的目标 (= 基础值 + Roll调整)
-static float g_leg_left_target_length = 0.14f;   // 左腿实际目标腿长 (米)
+static float g_leg_left_target_length = 0.09f;   // 左腿实际目标腿长 (米)
 static float g_leg_left_target_angle = -90.0f;   // 左腿实际目标身体夹角 (度)
-static float g_leg_right_target_length = 0.14f;  // 右腿实际目标腿长 (米)
+static float g_leg_right_target_length = 0.09f;  // 右腿实际目标腿长 (米)
 static float g_leg_right_target_angle = -90.0f;  // 右腿实际目标身体夹角 (度), -90=垂直向下
 
 // Roll 闭环控制开关 (与腿长相关，纯轮测试时禁用)
@@ -344,7 +345,7 @@ static float g_leg_sync_debug_correction = 0.0f;  // 调试: 实际修正量 (�
 static bool g_vmc_enabled = false;           // VMC 力控使能 (与位置控制互斥)
 static vmc_params_t g_vmc_params;            // VMC 参数
 static float g_vmc_target_vx = 0.0f;         // 目标水平速度 (m/s), 由平衡控制给出
-static float g_vmc_target_y = 0.14f;         // 目标机身高度 (m), 默认 0.14m
+static float g_vmc_target_y = 0.09f;         // 目标机身高度 (m), 默认 0.09m
 
 // VMC 调试输出
 static vmc_dual_output_t g_vmc_dual_output = {0};  // 双腿 VMC 输出 (包含协调控制)
@@ -735,6 +736,25 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     // P - 右轮: target=速度(rad/s), control=加速度(rad/s²)
     printf("#DATA,P,%.2f,%.2f\n", g_right_wheel_speed_rad, g_right_wheel_accel);
     
+    // ===== 各环路控制输出量 (用于观察每个环路的贡献) =====
+    // Q - 角度环输出: target=0, control=angle_control
+    printf("#DATA,Q,0.0,%.4f\n", output->angle_control);
+    
+    // R - 角速度环输出: target=0, control=gyro_control
+    printf("#DATA,R,0.0,%.4f\n", output->gyro_control);
+    
+    // S - 位移环输出: target=0, control=distance_control
+    printf("#DATA,S,0.0,%.4f\n", output->distance_control);
+    
+    // T - 速度环输出: target=0, control=speed_control
+    printf("#DATA,T,0.0,%.4f\n", output->speed_control);
+    
+    // U - YAW 控制输出: target=0, control=yaw_control
+    printf("#DATA,U,0.0,%.4f\n", g_yaw_output);
+    
+    // V - LQR 输出 PID 处理前后对比: target=处理前(raw), control=处理后(final)
+    printf("#DATA,V,%.4f,%.4f\n", output->lqr_u_raw, output->lqr_u);
+    
     // Y - YAW 调试输出 (专用通道，用于 YAW 面板)
     printf("#DATA,Y,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
     
@@ -1085,6 +1105,10 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
         return;
     }
     
+    // 刷新 CAN 接收缓冲区，确保读取到最新的电机回复数据
+    // (上一轮发送命令后电机的回复可能还在 RX 队列中未处理)
+    can_motor_process_rx();
+    
     // ===== 1. 获取公共数据 =====
     // IMU 数据
     float pitch_deg = 0.0f, pitch_rate_deg = 0.0f;
@@ -1105,6 +1129,9 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
     bool right_valid = (g_motor_right_hip && g_motor_right_knee);
     
     if (left_valid || right_valid) {
+        // 数值微分模式下不需要读取电机速度 (减少 CAN 通信)
+        bool need_velocity = (g_vmc_params.vmc_diff_method == VMC_DIFF_JACOBIAN);
+        
         vmc_dual_input_t dual_input = {
             .pitch_deg = pitch_deg,
             .pitch_rate_deg = pitch_rate_deg,
@@ -1116,8 +1143,8 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                 .sensor = {
                     .hip_angle = left_valid ? can_motor_read_position(g_motor_left_hip) : 0,
                     .knee_angle = left_valid ? can_motor_read_position(g_motor_left_knee) : 0,
-                    .hip_velocity = left_valid ? can_motor_read_speed(g_motor_left_hip) * 6.0f : 0,
-                    .knee_velocity = left_valid ? can_motor_read_speed(g_motor_left_knee) * 6.0f : 0
+                    .hip_velocity = (left_valid && need_velocity) ? can_motor_read_speed(g_motor_left_hip) * 6.0f : 0,
+                    .knee_velocity = (left_valid && need_velocity) ? can_motor_read_speed(g_motor_left_knee) * 6.0f : 0
                 }
             },
             .right = {
@@ -1126,8 +1153,8 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                 .sensor = {
                     .hip_angle = right_valid ? can_motor_read_position(g_motor_right_hip) : 0,
                     .knee_angle = right_valid ? can_motor_read_position(g_motor_right_knee) : 0,
-                    .hip_velocity = right_valid ? can_motor_read_speed(g_motor_right_hip) * 6.0f : 0,
-                    .knee_velocity = right_valid ? can_motor_read_speed(g_motor_right_knee) * 6.0f : 0
+                    .hip_velocity = (right_valid && need_velocity) ? can_motor_read_speed(g_motor_right_hip) * 6.0f : 0,
+                    .knee_velocity = (right_valid && need_velocity) ? can_motor_read_speed(g_motor_right_knee) * 6.0f : 0
                 }
             }
         };
@@ -1845,6 +1872,10 @@ void balance_test_print_status(void) {
              g_control_mode == CTRL_MODE_SINGLE_PID ? "speed output" : "torque output");
     ESP_LOGI(TAG, "Safety check: %s (uncontrolable=%d)", 
              g_uncontrolable_check_enabled ? "ENABLED" : "DISABLED", g_uncontrolable);
+    ESP_LOGI(TAG, "Wheel off-ground: %s (spd_th=%.1f acc_th=%.1f)",
+             g_wheel_off_ground ? "OFF GROUND" : "on ground",
+             g_lqr_ctrl.params.wheel_off_ground_speed_threshold,
+             g_lqr_ctrl.params.wheel_off_ground_accel_threshold);
     ESP_LOGI(TAG, "Angle zeropoint: %.2f deg", g_angle_zeropoint);
     ESP_LOGI(TAG, "Roll control: %s", g_roll_control_enabled ? "ENABLED" : "DISABLED");
     ESP_LOGI(TAG, "Pitch leg comp: %s", g_pitch_leg_comp_enabled ? "ENABLED" : "DISABLED");
@@ -2037,11 +2068,24 @@ static void task_motor_comm(void *arg) {
              1000 / MOTOR_COMM_PERIOD_MS / LEG_MOTOR_DIVIDER);
     
     while (g_tasks_running) {
-        // 处理 CAN 接收 (每次都处理，保证缓冲区不溢出)
+        // ======== 先发送上一轮计算好的电机命令 ========
+        // 尽早发送，让电机有更多时间回复
+        apply_motor_commands();
+        g_motor_count_per_sec++;
+        
+        // 腿电机 (分频执行)
+        leg_divider_count++;
+        if (leg_divider_count >= LEG_MOTOR_DIVIDER) {
+            leg_divider_count = 0;
+            apply_leg_motor_commands();
+            g_leg_count_per_sec++;
+        }
+        
+        // ======== 处理 CAN 接收 ========
+        // 发送命令后电机回复 + 上一轮的回复都在此处理
         can_motor_process_rx();
         
-        // ======== 轮电机: 200Hz (每次都执行) ========
-        // 读取轮电机状态
+        // ======== 读取轮电机状态 (用最新缓存) ========
         xSemaphoreTake(g_wheel_state_mutex, portMAX_DELAY);
         g_wheel_state.left_position = can_motor_read_position(g_motor_left);
         g_wheel_state.left_speed = can_motor_read_speed(g_motor_left);
@@ -2051,19 +2095,6 @@ static void task_motor_comm(void *arg) {
         g_wheel_state.right_online = can_motor_is_online(g_motor_right, 100);
         g_wheel_state.timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
         xSemaphoreGive(g_wheel_state_mutex);
-        
-        // 发送轮电机力矩命令
-        apply_motor_commands();
-        g_motor_count_per_sec++;
-        
-        // ======== 腿电机: 50Hz (分频执行) ========
-        leg_divider_count++;
-        if (leg_divider_count >= LEG_MOTOR_DIVIDER) {
-            leg_divider_count = 0;
-            // 发送腿部电机位置命令 (固定角度)
-            apply_leg_motor_commands();
-            g_leg_count_per_sec++;
-        }
         
         g_stats.motor_cmd_count++;
         
@@ -2079,8 +2110,9 @@ static void task_motor_comm(void *arg) {
  * @brief 合并任务: IMU读取 + 控制算法 + 电机通信 (Core 1, 5ms 周期)
  * 
  * 将三个任务合并到一个任务中执行，减少任务切换开销和同步延迟。
- * 执行顺序: 1.读IMU → 2.计算控制 → 3.发送电机命令
- * 全部在同一个 5ms 周期内完成。
+ * 执行顺序: 1.发送电机命令 → 2.读IMU → 3.处理CAN接收 → 4.计算控制
+ * 先发命令让电机有时间回复，IMU读取期间(~0.3-1ms)电机回复到达，
+ * 然后 process_rx 获取最新数据，控制计算用的是最新电机状态。
  */
 static void task_unified_control(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
@@ -2096,9 +2128,22 @@ static void task_unified_control(void *arg) {
     while (g_tasks_running) {
         uint64_t cycle_start = esp_timer_get_time();
         
-        // ======== Step 1: 读取 IMU 数据 (直接读，不通过互斥锁) ========
+        // ======== Step 1: 先发送上一轮计算好的电机命令 ========
+        // 尽早发送命令，让电机有更多时间回复
+        // (首次循环发送的是初始值 0，无影响)
+        apply_motor_commands();
+        g_motor_count_per_sec++;
+        
+        // 腿电机 (分频执行)
+        leg_divider_count++;
+        if (leg_divider_count >= LEG_MOTOR_DIVIDER) {
+            leg_divider_count = 0;
+            apply_leg_motor_commands();
+            g_leg_count_per_sec++;
+        }
+        
+        // ======== Step 2: 读取 IMU 数据 ========
         if (imu_read_data(&imu_raw) == ESP_OK && imu_raw.is_valid) {
-            // 直接更新共享数据 (单任务，不需要锁)
             g_imu_data.pitch = imu_raw.pitch;
             g_imu_data.pitch_rate = imu_raw.gyro_y;
             g_imu_data.roll = imu_raw.roll;
@@ -2113,10 +2158,12 @@ static void task_unified_control(void *arg) {
             g_imu_count_per_sec++;
         }
         
-        // ======== Step 2: 处理 CAN 接收 (保证缓冲区不溢出) ========
+        // ======== Step 3: 处理 CAN 接收 ========
+        // 此时上一轮命令的电机回复 + 刚发命令后的快速回复都可能已到达
+        // IMU 读取耗时 ~0.3-1ms，给了电机足够的回复时间
         can_motor_process_rx();
         
-        // ======== Step 3: 读取轮电机状态 ========
+        // ======== Step 4: 读取轮电机状态 ========
         g_wheel_state.left_position = can_motor_read_position(g_motor_left);
         g_wheel_state.left_speed = can_motor_read_speed(g_motor_left);
         g_wheel_state.left_online = can_motor_is_online(g_motor_left, 100);
@@ -2125,32 +2172,21 @@ static void task_unified_control(void *arg) {
         g_wheel_state.right_online = can_motor_is_online(g_motor_right, 100);
         g_wheel_state.timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
         
-        // ======== Step 4: 更新遥控数据 ========
+        // ======== Step 5: 更新遥控数据 ========
         update_remote_from_wifi();
         
-        // ======== Step 5: 计算平衡控制输出 ========
+        // ======== Step 6: 计算平衡控制输出 ========
+        // 此时电机状态是最新的 (刚 process_rx 过)
         uint64_t ctrl_start = esp_timer_get_time();
         compute_balance_output(dt);
         uint64_t ctrl_end = esp_timer_get_time();
         
-        // 延迟统计 (简化版，同一任务内延迟很小)
+        // 延迟统计
         g_latency_imu_to_ctrl_us = (float)(ctrl_start - cycle_start);
         g_latency_ctrl_calc_us = (float)(ctrl_end - ctrl_start);
         
         g_stats.control_loop_count++;
         g_ctrl_count_per_sec++;
-        
-        // ======== Step 6: 发送轮电机力矩命令 ========
-        apply_motor_commands();
-        g_motor_count_per_sec++;
-        
-        // ======== Step 7: 腿电机 (分频执行, 默认 20Hz) ========
-        leg_divider_count++;
-        if (leg_divider_count >= LEG_MOTOR_DIVIDER) {
-            leg_divider_count = 0;
-            apply_leg_motor_commands();
-            g_leg_count_per_sec++;
-        }
         
         g_stats.motor_cmd_count++;
         
@@ -2330,7 +2366,7 @@ static void compute_balance_output(float dt) {
     float left_vel_rad = wheel.left_speed * 0.10472f;   // rpm to rad/s
     float right_vel_rad = wheel.right_speed * 0.10472f;
     
-    // ======== 计算轮子加速度 (用于离地检测调试) ========
+    // ======== 计算轮子加速度 (用于离地检测) ========
     // 加速度 = (当前速度 - 上次速度) / dt
     g_left_wheel_speed_rad = left_vel_rad;
     g_right_wheel_speed_rad = right_vel_rad;
@@ -2338,6 +2374,22 @@ static void compute_balance_output(float dt) {
     g_right_wheel_accel = (right_vel_rad - g_prev_right_wheel_speed) / dt;
     g_prev_left_wheel_speed = left_vel_rad;
     g_prev_right_wheel_speed = right_vel_rad;
+    
+    // ======== 轮子离地检测 (参考 shibo_wheel_leg) ========
+    // 任一轮: 速度 > 阈值 且 加速度 > 阈值 → 判定离地
+    {
+        float speed_th = g_lqr_ctrl.params.wheel_off_ground_speed_threshold;
+        float accel_th = g_lqr_ctrl.params.wheel_off_ground_accel_threshold;
+        bool left_off = (fabsf(left_vel_rad) > speed_th) || (fabsf(g_left_wheel_accel) > accel_th);
+        bool right_off = (fabsf(right_vel_rad) > speed_th) || (fabsf(g_right_wheel_accel) > accel_th);
+        bool off_ground_now = left_off || right_off;
+        
+        if (off_ground_now && !g_wheel_off_ground) {
+            ESP_LOGW(TAG, "WHEEL OFF GROUND! L: spd=%.1f acc=%.1f  R: spd=%.1f acc=%.1f",
+                     left_vel_rad, g_left_wheel_accel, right_vel_rad, g_right_wheel_accel);
+        }
+        g_wheel_off_ground = off_ground_now;
+    }
     
     // 累积位移和速度 (考虑轮子半径，转换为实际距离/速度)
     // 位移公式: s = r * θ (θ为弧度)
@@ -2492,6 +2544,12 @@ static void compute_balance_output(float dt) {
             g_last_lqr_u = torque;
         }
         
+        // 轮子离地保护: 重置位移零点 (Dual PID 无位移环，但保持零点同步)
+        if (g_wheel_off_ground) {
+            g_distance_zeropoint = g_lqr_distance;
+            lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        }
+        
         // 填充兼容字段用于波形显示
         output.angle_control = g_dual_pid_output.angle_p_out;
         output.gyro_control = g_dual_pid_output.angle_d_out;
@@ -2534,6 +2592,12 @@ static void compute_balance_output(float dt) {
             g_last_lqr_u = target_speed;
         }
         
+        // 轮子离地保护: 重置位移零点 (Single PID 无位移环，但保持零点同步)
+        if (g_wheel_off_ground) {
+            g_distance_zeropoint = g_lqr_distance;
+            lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        }
+        
         // 填充兼容字段用于波形显示
         output.angle_control = g_single_pid_output.angle_p_out;
         output.gyro_control = g_single_pid_output.angle_d_out;
@@ -2571,6 +2635,16 @@ static void compute_balance_output(float dt) {
             output.right_wheel_torque = 0;
             g_last_lqr_u = 0;
         } else {
+        // ======== 轮子离地保护 (参考 shibo_wheel_leg) ========
+        // 离地时: 位移零点重置，只输出角度+角速度(不输出位移/速度分量)，积分清零
+        if (g_wheel_off_ground) {
+            g_distance_zeropoint = g_lqr_distance;
+            lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+            // 只保留角度+角速度控制，去掉位移和速度分量
+            output.lqr_u = output.angle_control + output.gyro_control;
+            pid_reset(&g_lqr_ctrl.pid_lqr_u);
+        }
+        
         // ======== YAW 轴转向控制 (仅在 go=true 且 YAW 环使能时生效) ========
         // 修改: go 只控制 YAW 环路是否加入
         if (remote.go && g_uncontrolable == 0 && g_yaw_control_enabled) {
@@ -2853,8 +2927,14 @@ static void compute_balance_output(float dt) {
     
     // ======== 更新轮命令 ========
     xSemaphoreTake(g_wheel_cmd_mutex, portMAX_DELAY);
-    g_wheel_cmd.left_torque = output.left_wheel_torque;
-    g_wheel_cmd.right_torque = output.right_wheel_torque;
+    if (g_wheel_off_ground) {
+        // 离地时清零输出，防止轮子空转
+        g_wheel_cmd.left_torque = 0;
+        g_wheel_cmd.right_torque = 0;
+    } else {
+        g_wheel_cmd.left_torque = output.left_wheel_torque;
+        g_wheel_cmd.right_torque = output.right_wheel_torque;
+    }
     // 单环 PID 模式使用速度模式，其他模式使用扭矩模式
     g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID);
     // enabled 状态由 balance_test_enable/disable 控制
@@ -3995,6 +4075,37 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance safety [on|off]\n");
         }
     }
+    // ===== 离地检测命令 =====
+    else if (strcmp(token, "airborne") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("=== Wheel Off-Ground Detection ===\n");
+            printf("Status: %s\n", g_wheel_off_ground ? "OFF GROUND" : "ON GROUND");
+            printf("Speed threshold:  %.1f rad/s (current: L=%.1f R=%.1f)\n",
+                   g_lqr_ctrl.params.wheel_off_ground_speed_threshold,
+                   g_left_wheel_speed_rad, g_right_wheel_speed_rad);
+            printf("Accel threshold:  %.1f rad/s² (current: L=%.1f R=%.1f)\n",
+                   g_lqr_ctrl.params.wheel_off_ground_accel_threshold,
+                   g_left_wheel_accel, g_right_wheel_accel);
+            printf("Usage: balance airborne [speed <val>|accel <val>]\n");
+        } else if (strcmp(token, "speed") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_lqr_ctrl.params.wheel_off_ground_speed_threshold = atof(token);
+                printf("Off-ground speed threshold = %.1f rad/s\n",
+                       g_lqr_ctrl.params.wheel_off_ground_speed_threshold);
+            }
+        } else if (strcmp(token, "accel") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_lqr_ctrl.params.wheel_off_ground_accel_threshold = atof(token);
+                printf("Off-ground accel threshold = %.1f rad/s²\n",
+                       g_lqr_ctrl.params.wheel_off_ground_accel_threshold);
+            }
+        } else {
+            printf("Usage: balance airborne [speed <val>|accel <val>]\n");
+        }
+    }
     // ===== 控制模式切换命令 =====
     else if (strcmp(token, "mode") == 0) {
         token = strtok(NULL, " \t\n\r");
@@ -4261,7 +4372,7 @@ void balance_test_process_cmd(const char *cmd_str) {
     }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|mode|dpid|spid]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid]\n");
     }
 }
 
@@ -4274,9 +4385,9 @@ void balance_test_process_cmd(const char *cmd_str) {
  */
 void leg_ctrl_init(void) {
     // 设置初始目标为站立姿态 (垂直向下)
-    g_leg_left_target_length = 0.14f;
+    g_leg_left_target_length = 0.09f;
     g_leg_left_target_angle = -90.0f;  // 垂直向下
-    g_leg_right_target_length = 0.14f;
+    g_leg_right_target_length = 0.09f;
     g_leg_right_target_angle = -90.0f; // 垂直向下
     
     // 用逆运动学计算初始电机角度

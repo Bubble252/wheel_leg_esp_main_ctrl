@@ -7,6 +7,7 @@
  */
 
 #include "lqr_balance.h"
+#include "leg_kinematics.h"
 #include "esp_log.h"
 #include <string.h>
 #include <math.h>
@@ -18,45 +19,45 @@ static const lqr_params_t default_params = {
     // 角度环 PID
     .angle_kp = 3.0f,
     .angle_ki = 0.5f,
-    .angle_kd = 0.0001f,
-    .angle_limit = 20.0f,
+    .angle_kd = 1.0f,
+    .angle_limit = 30.0f,
     
     // 角速度环 PID
-    .gyro_kp = 5.00f,
+    .gyro_kp = 3.00f,
     .gyro_ki = 0.0f,
     .gyro_kd = 0.0f,
     .gyro_limit = 16.0f,
     
     // 位移环 PID
-    .distance_kp = 0.0f,
+    .distance_kp = 0.9f,
     .distance_ki = 0.0f,
     .distance_kd = 0.0f,
     .distance_limit = 16.0f,
     
     // 速度环 PID
-    .speed_kp = 1.5f,
+    .speed_kp = 0.5f,
     .speed_ki = 0.0f,
-    .speed_kd = 0.0f,
+    .speed_kd = 0.01f,
     .speed_limit = 16.0f,
-    .speed_kp_min = 0.3f,
-    .speed_kp_max = 1.0f,
+    .speed_kp_min = 0.951f,
+    .speed_kp_max = 0.951f,
     
     // LQR 输出 PID
     .lqr_u_kp = 1.0f,
-    .lqr_u_ki = 0.0f,
+    .lqr_u_ki = 0.3f,
     .lqr_u_kd = 0.0f,
-    .lqr_u_limit = 16.0f,
+    .lqr_u_limit = 20.0f,
     
     // 偏航控制 PID
-    .yaw_angle_kp = 0.0f,
+    .yaw_angle_kp = 0.1f,
     .yaw_angle_ki = 0.0f,
     .yaw_angle_kd = 0.0f,
     .yaw_angle_limit = 10.0f,
     
-    .yaw_gyro_kp = 0.00f,
+    .yaw_gyro_kp = 0.50f,
     .yaw_gyro_ki = 0.0f,
     .yaw_gyro_kd = 0.0f,
-    .yaw_gyro_limit = 3.0f,
+    .yaw_gyro_limit = 7.0f,
     
     // 横滚控制 PID
     .roll_kp = 0.0f,
@@ -82,8 +83,8 @@ static const lqr_params_t default_params = {
     .emergency_angle = 45.0f,
     
     // 轮子离地检测
-    .wheel_off_ground_speed_threshold = 50.0f,
-    .wheel_off_ground_accel_threshold = 100.0f,
+    .wheel_off_ground_speed_threshold = 25.0f,
+    .wheel_off_ground_accel_threshold = 450.0f,
     
     // 输出限幅
     .max_wheel_torque = 8.0f,
@@ -361,6 +362,7 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     output->distance_control = distance_control;
     output->speed_control = speed_control;
     output->lqr_u = lqr_u;
+    output->lqr_u_raw = lqr_u_raw;
     output->filtered_target_speed = filtered_target_speed;  // 滤波后的目标速度
     output->zeropoint_adjust_raw = zeropoint_adjust_raw;    // 零点调整原始值
     output->zeropoint_adjust_filtered = zeropoint_adjust_filtered; // 零点调整滤波后
@@ -447,8 +449,8 @@ void lqr_adaptive_speed_p(lqr_controller_t *ctrl, float leg_height) {
     
     // 腿越高，速度P越小 (稳定性优先)
     // 腿越低，速度P越大 (响应速度优先)
-    // 假设腿高范围 0.1m ~ 0.3m
-    float height_normalized = (leg_height - 0.1f) / 0.2f;  // 归一化到 0~1
+    // 腿高范围由 LEG_LENGTH_MIN ~ LEG_LENGTH_MAX 决定
+    float height_normalized = (leg_height - LEG_LENGTH_MIN) / (LEG_LENGTH_MAX - LEG_LENGTH_MIN);  // 归一化到 0~1
     height_normalized = clamp_f(height_normalized, 0.0f, 1.0f);
     
     // P 值从 speed_kp_max 线性降低到 speed_kp_min
