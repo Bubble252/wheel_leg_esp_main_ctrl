@@ -18,7 +18,7 @@ static const char *TAG = "WIT_IMU";
 // ============ 配置参数 ============
 #define WIT_I2C_SCL_GPIO        GPIO_NUM_11
 #define WIT_I2C_SDA_GPIO        GPIO_NUM_12
-#define WIT_I2C_FREQ_HZ         100000      // 100kHz
+#define WIT_I2C_FREQ_HZ         400000      // 400kHz (Fast Mode, 支持500Hz控制频率)
 #define WIT_I2C_TIMEOUT_MS      1000
 #define WIT_DEFAULT_ADDR        0x50
 

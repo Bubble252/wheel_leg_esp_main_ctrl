@@ -2710,6 +2710,12 @@ class BalanceControlPanel(QWidget):
         self.loop_checks["Y"] = cb_yaw
         yaw_layout.addWidget(cb_yaw)
         
+        self.cb_yaw_force = QCheckBox("强制使能(无遥控)")
+        self.cb_yaw_force.setToolTip("无需遥控器remote.go即可启用YAW控制\n对应CLI: balance yaw on/off")
+        self.cb_yaw_force.setChecked(False)
+        self.cb_yaw_force.stateChanged.connect(self.on_yaw_force_toggle)
+        yaw_layout.addWidget(self.cb_yaw_force)
+        
         yaw_layout.addStretch()
         loop_layout.addLayout(yaw_layout)
         
@@ -3100,6 +3106,13 @@ class BalanceControlPanel(QWidget):
             self.send_cmd(f"balance loop {loop_code} on")
         else:
             self.send_cmd(f"balance loop {loop_code} off")
+    
+    def on_yaw_force_toggle(self, state):
+        """YAW强制使能开关 (无需遥控器)"""
+        if state == Qt.Checked:
+            self.send_cmd("balance yaw on")
+        else:
+            self.send_cmd("balance yaw off")
     
     def set_loop_gain(self):
         """设置环路增益"""

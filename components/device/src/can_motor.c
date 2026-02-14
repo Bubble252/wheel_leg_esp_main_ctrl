@@ -157,7 +157,7 @@ static esp_err_t can_send_frame(uint32_t id, uint8_t *data, uint8_t len) {
     memset(msg.data, 0, 8);
     memcpy(msg.data, data, len > 8 ? 8 : len);
     
-    esp_err_t ret = twai_transmit(&msg, pdMS_TO_TICKS(10));
+    esp_err_t ret = twai_transmit(&msg, pdMS_TO_TICKS(1));  // 1ms 超时，避免阻塞高频控制循环
     if (ret != ESP_OK) {
         g_can_tx_error_count++;
         // TX 失败可能是 Bus-Off，尝试检查和恢复
@@ -265,8 +265,8 @@ esp_err_t can_bus_init(gpio_num_t tx_pin, gpio_num_t rx_pin) {
     
     // 通用配置
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(tx_pin, rx_pin, TWAI_MODE_NORMAL);
-    g_config.rx_queue_len = 16;
-    g_config.tx_queue_len = 16;
+    g_config.rx_queue_len = 32;   // 增大 RX 队列，防止 500Hz 下丢帧
+    g_config.tx_queue_len = 8;    // TX 队列适当大小，避免堆积过多
     // 启用 Bus-Off 和错误告警，用于自动恢复
     g_config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_ERR_PASS 
                             | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ABOVE_ERR_WARN;
@@ -386,17 +386,47 @@ esp_err_t can_bus_check_and_recover(void) {
         esp_err_t ret = twai_initiate_recovery();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initiate CAN recovery: %s", esp_err_to_name(ret));
+            // 强制重初始化
+            twai_stop();
+            twai_driver_uninstall();
+            g_can_initialized = false;
+            if (g_can_tx_pin != GPIO_NUM_NC && g_can_rx_pin != GPIO_NUM_NC) {
+                esp_err_t reinit_ret = can_bus_init(g_can_tx_pin, g_can_rx_pin);
+                if (reinit_ret == ESP_OK) {
+                    g_can_recovery_count++;
+                    ESP_LOGI(TAG, "CAN bus re-initialized successfully (recovery #%lu)", g_can_recovery_count);
+                    return ESP_OK;
+                }
+            }
             return ESP_ERR_INVALID_STATE;
         }
         
-        // 等待恢复完成 (最多等 500ms)
-        for (int i = 0; i < 50; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+        // 非阻塞恢复: 记录时间戳，下次调用时检查是否已恢复
+        // 不再在此处阻塞等待，让控制循环继续运行
+        static uint32_t recovery_start_ms = 0;
+        recovery_start_ms = (uint32_t)(esp_log_timestamp());
+        
+        // 只做一次短等待 (1ms)，大多数情况下 Bus-Off 恢复很快
+        vTaskDelay(pdMS_TO_TICKS(1));
+        if (twai_read_alerts(&alerts, 0) == ESP_OK && (alerts & TWAI_ALERT_BUS_RECOVERED)) {
+            g_can_recovery_count++;
+            ESP_LOGI(TAG, "CAN bus recovered quickly (recovery #%lu)", g_can_recovery_count);
+            ret = twai_start();
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "CAN bus restarted successfully");
+                return ESP_OK;
+            }
+        }
+        
+        // 如果 1ms 内没恢复，等待稍长一些 (最多 20ms，不再等 500ms)
+        for (int i = 0; i < 4; i++) {
+            vTaskDelay(pdMS_TO_TICKS(5));
             if (twai_read_alerts(&alerts, 0) == ESP_OK) {
                 if (alerts & TWAI_ALERT_BUS_RECOVERED) {
                     g_can_recovery_count++;
-                    ESP_LOGI(TAG, "CAN bus recovered after %d ms (recovery #%lu)", 
-                             (i + 1) * 10, g_can_recovery_count);
+                    uint32_t elapsed = (uint32_t)(esp_log_timestamp()) - recovery_start_ms;
+                    ESP_LOGI(TAG, "CAN bus recovered after %lu ms (recovery #%lu)", 
+                             elapsed, g_can_recovery_count);
                     ret = twai_start();
                     if (ret == ESP_OK) {
                         ESP_LOGI(TAG, "CAN bus restarted successfully");
@@ -408,7 +438,7 @@ esp_err_t can_bus_check_and_recover(void) {
             }
         }
         
-        ESP_LOGE(TAG, "CAN recovery timeout (500ms), forcing re-init...");
+        ESP_LOGE(TAG, "CAN recovery timeout (20ms), forcing re-init...");
         
         // 恢复超时，强制卸载再重装 TWAI 驱动 (硬重启 CAN 控制器)
         twai_stop();           // 可能失败，忽略

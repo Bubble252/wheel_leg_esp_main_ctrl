@@ -17,44 +17,44 @@ static const char *TAG = "LQR_BALANCE";
 // ============== 默认参数 ==============
 static const lqr_params_t default_params = {
     // 角度环 PID
-    .angle_kp = 3.0f,
-    .angle_ki = 0.5f,
-    .angle_kd = 1.0f,
+    .angle_kp = 0.022f,
+    .angle_ki = 0.001f,
+    .angle_kd = 0.0004f,
     .angle_limit = 30.0f,
     
     // 角速度环 PID
-    .gyro_kp = 3.00f,
+    .gyro_kp = 0.0003f,
     .gyro_ki = 0.0f,
     .gyro_kd = 0.0f,
     .gyro_limit = 16.0f,
     
     // 位移环 PID
-    .distance_kp = 0.9f,
+    .distance_kp = 0.8f,
     .distance_ki = 0.0f,
     .distance_kd = 0.0f,
     .distance_limit = 16.0f,
     
     // 速度环 PID
-    .speed_kp = 0.5f,
+    .speed_kp = 0.6f,
     .speed_ki = 0.0f,
-    .speed_kd = 0.01f,
+    .speed_kd = 0.001f,
     .speed_limit = 16.0f,
     .speed_kp_min = 0.951f,
     .speed_kp_max = 0.951f,
     
     // LQR 输出 PID
     .lqr_u_kp = 1.0f,
-    .lqr_u_ki = 0.3f,
-    .lqr_u_kd = 0.0f,
+    .lqr_u_ki = 0.5f,
+    .lqr_u_kd = 0.01f,
     .lqr_u_limit = 20.0f,
     
     // 偏航控制 PID
-    .yaw_angle_kp = 0.1f,
+    .yaw_angle_kp = 0.0025f,
     .yaw_angle_ki = 0.0f,
-    .yaw_angle_kd = 0.0f,
+    .yaw_angle_kd = 0.0001f,
     .yaw_angle_limit = 10.0f,
     
-    .yaw_gyro_kp = 0.50f,
+    .yaw_gyro_kp = 0.0001f,
     .yaw_gyro_ki = 0.0f,
     .yaw_gyro_kd = 0.0f,
     .yaw_gyro_limit = 7.0f,

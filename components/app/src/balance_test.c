@@ -58,16 +58,16 @@ static const char *TAG = "BAL_TEST";
 #undef IMU_READ_PERIOD_MS
 #undef BALANCE_CTRL_PERIOD_MS
 #undef MOTOR_COMM_PERIOD_MS
-#define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (≈300Hz)
-#define BALANCE_CTRL_PERIOD_MS      5       // 200Hz 平衡控制
-#define MOTOR_COMM_PERIOD_MS        5       // 200Hz 电机通信 (与控制同步)
-#define LEG_MOTOR_DIVIDER           1       // 腿电机分频 (200Hz / 1 = 200Hz)
+#define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (仅分离模式使用)
+#define BALANCE_CTRL_PERIOD_MS      2       // 500Hz 平衡控制
+#define MOTOR_COMM_PERIOD_MS        2       // 500Hz 电机通信 (与控制同步)
+#define LEG_MOTOR_DIVIDER           5       // 腿电机分频 (500Hz / 5 = 100Hz, 大幅减轻CAN负担)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 
 // ===== 合并任务配置 =====
 // 将 IMU读取 + 控制算法 + 电机通信 合并到一个任务中运行
 // 默认使用分离任务架构，可通过 CLI 切换
-#define UNIFIED_TASK_PERIOD_MS      5       // 合并任务基础周期 (200Hz)
+#define UNIFIED_TASK_PERIOD_MS      2       // 合并任务基础周期 (500Hz)
 #define UNIFIED_TASK_STACK          12288   // 合并任务栈大小 (需要更大)
 #define UNIFIED_TASK_PRIO           24      // 合并任务优先级 (最高)
 
@@ -247,6 +247,11 @@ static float g_right_wheel_accel = 0.0f;        // 右轮加速度 (rad/s²)
 static float g_prev_left_wheel_speed = 0.0f;    // 上次左轮速度
 static float g_prev_right_wheel_speed = 0.0f;   // 上次右轮速度
 static bool g_wheel_off_ground = false;          // 轮子离地标志
+static int g_off_ground_counter = 0;             // 离地检测去抖计数器
+
+// 离地检测去抖参数
+#define OFF_GROUND_ENTER_COUNT  8   // 连续 8 帧判定离地 (16ms@500Hz)
+#define OFF_GROUND_EXIT_COUNT   13  // 连续 13 帧判定着地 (26ms@500Hz)
 
 // YAW 轴控制 (带过零处理)
 static float g_yaw_angle_last = 0.0f;       // 上一次 YAW 角度 (用于过零处理)
@@ -274,6 +279,7 @@ static uint8_t g_pid_debug_counter = 0;     // 分频计数器
 // 环路使能控制 (用于单环调试)
 static uint8_t g_loop_enable_mask = LOOP_FULL;  // 默认全部启用
 static bool g_yaw_control_enabled = true;       // YAW 控制独立开关
+static bool g_yaw_force_enable = false;         // YAW 强制使能 (无需遥控器 go, 通过 CLI 控制)
 static bool g_loop_manual_mode = false;         // 手动模式 (禁止自动切换 simple/full)
 
 // ============================================================================
@@ -997,9 +1003,10 @@ void balance_test_print_loop_status(void) {
     printf("  [%c] H - LQR_U (integral)   : %.2f\n", 
            (g_loop_enable_mask & LOOP_LQR_U) ? 'X' : ' ',
            g_initialized ? g_lqr_ctrl.params.lqr_u_enable : 0.0f);
-    printf("  [%c] Y - YAW (turning)      : %s\n", 
+    printf("  [%c] Y - YAW (turning)      : %s%s\n", 
            (g_loop_enable_mask & LOOP_YAW) ? 'X' : ' ',
-           g_yaw_control_enabled ? "ON" : "OFF");
+           g_yaw_control_enabled ? "ON" : "OFF",
+           g_yaw_force_enable ? " [FORCE]" : "");
     printf("==========================\n");
     printf("Mask: 0x%02X\n", g_loop_enable_mask);
     printf("Presets: simple=0x03, full=0x3F\n");
@@ -2107,12 +2114,20 @@ static void task_motor_comm(void *arg) {
 }
 
 /**
- * @brief 合并任务: IMU读取 + 控制算法 + 电机通信 (Core 1, 5ms 周期)
+ * @brief 合并任务: IMU读取 + 控制算法 + 电机通信 (Core 1, 2ms 周期)
  * 
  * 将三个任务合并到一个任务中执行，减少任务切换开销和同步延迟。
  * 执行顺序: 1.发送电机命令 → 2.读IMU → 3.处理CAN接收 → 4.计算控制
- * 先发命令让电机有时间回复，IMU读取期间(~0.3-1ms)电机回复到达，
+ * 先发命令让电机有时间回复，IMU读取期间(~0.15-0.3ms@400kHz)电机回复到达，
  * 然后 process_rx 获取最新数据，控制计算用的是最新电机状态。
+ * 
+ * @note 500Hz 时序预算 (2ms):
+ *   - CAN TX 轮电机 2帧: ~0.26ms
+ *   - CAN TX 腿电机 4帧 (分频): 平均 ~0.13ms/cycle
+ *   - I2C IMU 读取 (400kHz): ~0.6ms
+ *   - CAN RX 处理: ~0.1ms
+ *   - 控制计算: ~0.3ms
+ *   - 总计: ~1.4ms < 2ms ✓
  */
 static void task_unified_control(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
@@ -2377,16 +2392,41 @@ static void compute_balance_output(float dt) {
     
     // ======== 轮子离地检测 (参考 shibo_wheel_leg) ========
     // 任一轮: 速度 > 阈值 且 加速度 > 阈值 → 判定离地
+    // 使用计数器去抖: 连续 N 帧满足才判定，避免瞬间误触发
     {
         float speed_th = g_lqr_ctrl.params.wheel_off_ground_speed_threshold;
         float accel_th = g_lqr_ctrl.params.wheel_off_ground_accel_threshold;
-        bool left_off = (fabsf(left_vel_rad) > speed_th) || (fabsf(g_left_wheel_accel) > accel_th);
-        bool right_off = (fabsf(right_vel_rad) > speed_th) || (fabsf(g_right_wheel_accel) > accel_th);
-        bool off_ground_now = left_off || right_off;
+        // 速度 AND 加速度都超阈值才算单轮离地 (避免正常行驶误触发)
+        bool left_off = (fabsf(left_vel_rad) > speed_th) && (fabsf(g_left_wheel_accel) > accel_th);
+        bool right_off = (fabsf(right_vel_rad) > speed_th) && (fabsf(g_right_wheel_accel) > accel_th);
+        bool off_ground_raw = left_off || right_off;
+        
+        // 计数器去抖: 进入离地需连续 N 帧，退出离地需连续 M 帧
+        if (off_ground_raw) {
+            if (g_off_ground_counter < OFF_GROUND_ENTER_COUNT) {
+                g_off_ground_counter++;
+            }
+        } else {
+            if (g_off_ground_counter > -OFF_GROUND_EXIT_COUNT) {
+                g_off_ground_counter--;
+            }
+        }
+        
+        // 状态切换
+        bool off_ground_now;
+        if (!g_wheel_off_ground) {
+            // 当前在地面 → 需要连续 ENTER_COUNT 帧才进入离地
+            off_ground_now = (g_off_ground_counter >= OFF_GROUND_ENTER_COUNT);
+        } else {
+            // 当前离地 → 需要连续 EXIT_COUNT 帧才恢复着地
+            off_ground_now = (g_off_ground_counter > -OFF_GROUND_EXIT_COUNT);
+        }
         
         if (off_ground_now && !g_wheel_off_ground) {
             ESP_LOGW(TAG, "WHEEL OFF GROUND! L: spd=%.1f acc=%.1f  R: spd=%.1f acc=%.1f",
                      left_vel_rad, g_left_wheel_accel, right_vel_rad, g_right_wheel_accel);
+        } else if (!off_ground_now && g_wheel_off_ground) {
+            ESP_LOGI(TAG, "Wheel back on ground (counter=%d)", g_off_ground_counter);
         }
         g_wheel_off_ground = off_ground_now;
     }
@@ -2463,8 +2503,8 @@ static void compute_balance_output(float dt) {
         .lqr_distance = g_lqr_distance,         // 累积位移 (已考虑电机方向)
         .lqr_speed = g_lqr_speed,               // 当前速度 (已考虑电机方向)
         .yaw_total = g_yaw_angle_total,         // YAW 累积角度 (用于方向保持)
-        .target_speed = remote.joy_y * 0.1f,    // joy_y (-100~100) -> target speed
-        .target_yaw_rate = -remote.joy_x * 0.01f,  // joy_x -> target yaw rate
+        .target_speed = remote.joy_y * 0.003f,   // joy_y (-100~100) -> target speed (max ±0.1 m/s)
+        .target_yaw_rate = -remote.joy_x * 0.03f,  // joy_x -> target yaw rate
         .dt = dt,
     };
     
@@ -2530,8 +2570,8 @@ static void compute_balance_output(float dt) {
             float torque = g_dual_pid_output.torque;
             output.lqr_u = torque;  // 用于波形显示兼容
             
-            // YAW 控制 (可选，仅在 go=true 时)
-            if (remote.go && g_yaw_control_enabled) {
+            // YAW 控制 (go=true 或 CLI 强制使能)
+            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
                 lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
                 g_yaw_output = output.yaw_control;
                 output.left_wheel_torque = torque + g_yaw_output;
@@ -2577,9 +2617,9 @@ static void compute_balance_output(float dt) {
             // 存入 output 结构 (注意这里是速度不是扭矩，需要后续特殊处理)
             output.lqr_u = target_speed;  // 用于波形显示兼容
             
-            // YAW 控制 (可选，仅在 go=true 时)
+            // YAW 控制 (go=true 或 CLI 强制使能)
             // 单环模式下 YAW 也是速度差速
-            if (remote.go && g_yaw_control_enabled) {
+            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
                 lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
                 g_yaw_output = output.yaw_control;
                 output.left_wheel_torque = target_speed + g_yaw_output;
@@ -2645,9 +2685,9 @@ static void compute_balance_output(float dt) {
             pid_reset(&g_lqr_ctrl.pid_lqr_u);
         }
         
-        // ======== YAW 轴转向控制 (仅在 go=true 且 YAW 环使能时生效) ========
-        // 修改: go 只控制 YAW 环路是否加入
-        if (remote.go && g_uncontrolable == 0 && g_yaw_control_enabled) {
+        // ======== YAW 轴转向控制 ========
+        // go=true 或 CLI 强制使能时生效 (无需遥控器也可方向保持)
+        if ((remote.go || g_yaw_force_enable) && g_uncontrolable == 0 && g_yaw_control_enabled) {
             // 使用 lqr_yaw_loop 计算 YAW 控制量
             // input.target_yaw_rate 已经在前面设置为 remote.joy_x * 0.02f
             lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
@@ -4073,6 +4113,25 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else {
             printf("Unknown safety command: %s\n", token);
             printf("Usage: balance safety [on|off]\n");
+        }
+    }
+    // ===== YAW 强制使能命令 =====
+    else if (strcmp(token, "yaw") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("YAW force enable: %s\n", g_yaw_force_enable ? "ON" : "OFF");
+            printf("YAW loop enabled: %s\n", g_yaw_control_enabled ? "YES" : "NO");
+            printf("  When FORCE ON, YAW works without remote.go\n");
+            printf("Usage: balance yaw [on|off]\n");
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0 || strcmp(token, "enable") == 0) {
+            g_yaw_force_enable = true;
+            printf("YAW force enable ON - YAW active without remote\n");
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0 || strcmp(token, "disable") == 0) {
+            g_yaw_force_enable = false;
+            printf("YAW force enable OFF - YAW requires remote.go\n");
+        } else {
+            printf("Unknown yaw command: %s\n", token);
+            printf("Usage: balance yaw [on|off]\n");
         }
     }
     // ===== 离地检测命令 =====
