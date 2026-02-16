@@ -9,6 +9,8 @@
 #ifndef LOWPASS_FILTER_H
 #define LOWPASS_FILTER_H
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -21,6 +23,16 @@ typedef struct {
     float y_prev;       // 上一次输出值
     unsigned long timestamp_prev;  // 上一次时间戳 (微秒)
 } lowpass_filter_t;
+
+/**
+ * @brief 限幅滤波器结构体 (slew-rate limiter)
+ * @note 限制信号每秒最大变化量，超过阈值则钳位，否则直通 (零延迟)
+ */
+typedef struct {
+    float max_rate;     // 最大变化率 (单位/秒)
+    float y_prev;       // 上一次输出值
+    bool first_run;     // 首次运行标志
+} slewrate_filter_t;
 
 /**
  * @brief 初始化低通滤波器
@@ -58,6 +70,37 @@ float lpf_compute(lowpass_filter_t *lpf, float x);
  * @return 滤波后的输出值
  */
 float lpf_compute_dt(lowpass_filter_t *lpf, float x, float dt);
+
+/**
+ * @brief 初始化限幅滤波器
+ * @param sf 滤波器实例
+ * @param max_rate 最大变化率 (单位/秒)，0 表示不限制 (直通)
+ */
+void slewrate_init(slewrate_filter_t *sf, float max_rate);
+
+/**
+ * @brief 重置限幅滤波器
+ * @param sf 滤波器实例
+ */
+void slewrate_reset(slewrate_filter_t *sf);
+
+/**
+ * @brief 设置最大变化率
+ * @param sf 滤波器实例
+ * @param max_rate 新的最大变化率 (单位/秒)
+ */
+void slewrate_set_max_rate(slewrate_filter_t *sf, float max_rate);
+
+/**
+ * @brief 限幅滤波计算
+ * @param sf 滤波器实例
+ * @param x 输入值
+ * @param dt 时间步长 (秒)
+ * @return 滤波后的输出值
+ * @note 若 |x - y_prev| <= max_rate * dt，则直通 (零延迟)
+ *       否则钳位到 y_prev ± max_rate * dt
+ */
+float slewrate_compute_dt(slewrate_filter_t *sf, float x, float dt);
 
 #ifdef __cplusplus
 }

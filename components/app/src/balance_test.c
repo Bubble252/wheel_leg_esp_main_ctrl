@@ -270,6 +270,14 @@ static bool g_plot_enabled = false;         // 波形输出使能
 static uint8_t g_plot_divider = 10;         // 输出分频 (每N次控制循环输出一次)
 static uint8_t g_plot_counter = 0;          // 分频计数器
 static float g_last_lqr_u = 0.0f;           // 保存 LQR 输出用于波形显示
+static uint32_t g_plot_channel_mask = 0xFFFFFFFF;  // 通道使能掩码 (默认全开)
+
+// 通道ID到bit位的映射: A=0, B=1, ..., Y=24, W=22
+static inline uint32_t plot_ch_bit(char ch) {
+    if (ch >= 'A' && ch <= 'Z') return 1U << (ch - 'A');
+    return 0;
+}
+#define PLOT_CH_ENABLED(ch) (g_plot_channel_mask & plot_ch_bit(ch))
 
 // PID 调试输出 (用于实时 debug)
 static bool g_pid_debug_enabled = false;    // PID 调试输出使能
@@ -486,6 +494,22 @@ static void commander_param_callback(char controller_id, char param_char, float 
                 case 'H': params.speed_kp_max = value; updated = true; break;  // Kp_Max
             }
             break;
+            
+        case CTRL_ID_GYRO_LPF:  // N - 角速度滤波
+            switch (param_char) {
+                case 'T': params.lpf_gyro_tf = value; updated = true; break;     // LPF Tf
+                case 'M': params.gyro_filter_mode = (uint8_t)value; updated = true; break;  // 模式: 0=LPF, 1=限幅
+                case 'R': params.gyro_slew_rate = value; updated = true; break;   // 限幅最大变化率
+            }
+            break;
+            
+        case CTRL_ID_SPEED_LPF:  // W - 轮速滤波
+            switch (param_char) {
+                case 'T': params.lpf_speed_tf = value; updated = true; break;     // LPF Tf
+                case 'M': params.speed_filter_mode = (uint8_t)value; updated = true; break;  // 模式: 0=LPF, 1=限幅
+                case 'R': params.speed_slew_rate = value; updated = true; break;   // 限幅最大变化率
+            }
+            break;
     }
     
     if (updated) {
@@ -597,6 +621,20 @@ static bool commander_query_callback(char controller_id, commander_pid_params_t 
             params->i = p->speed_kp_max;
             return true;
             
+        case CTRL_ID_GYRO_LPF:  // N - 角速度滤波
+            params->lpf_tf = p->lpf_gyro_tf;
+            // 复用 p 和 i 字段存储 mode 和 slew_rate
+            params->p = (float)p->gyro_filter_mode;
+            params->i = p->gyro_slew_rate;
+            return true;
+            
+        case CTRL_ID_SPEED_LPF:  // W - 轮速滤波
+            params->lpf_tf = p->lpf_speed_tf;
+            // 复用 p 和 i 字段存储 mode 和 slew_rate
+            params->p = (float)p->speed_filter_mode;
+            params->i = p->speed_slew_rate;
+            return true;
+            
         default:
             return false;
     }
@@ -695,81 +733,40 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     if (g_plot_counter < g_plot_divider) return;
     g_plot_counter = 0;
     
-    // 输出各通道数据
-    // A - 角度: target=0(平衡点), control=当前角度
-    printf("#DATA,A,0.0,%.2f\n", input->pitch);
-    
-    // B - 角速度: target=0, control=当前角速度  
-    printf("#DATA,B,0.0,%.2f\n", input->pitch_rate);
-    
-    // C - 位移: target=目标位移, control=当前位移
-    printf("#DATA,C,%.2f,%.2f\n", g_distance_zeropoint, g_lqr_distance);
-    
-    // D - 速度: target=目标速度(原始), control=当前速度
-    // 注: 蓝色=原始目标速度, 红色=当前速度
-    printf("#DATA,D,%.2f,%.2f\n", input->target_speed, input->lqr_speed);
-    
-    // E - YAW 角度: target=目标角度, control=当前累积角度
-    printf("#DATA,E,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
-    
-    // F - YAW 角速度: target=目标角速度, control=当前角速度
-    printf("#DATA,F,%.2f,%.2f\n", input->target_yaw_rate, input->yaw_rate);
-    
-    // G - 摇杆滤波: target=滤波前(原始), control=滤波后
-    printf("#DATA,G,%.2f,%.2f\n", input->target_speed, output->filtered_target_speed);
-    
-    // H - LQR 输出: target=0, control=LQR_u
-    printf("#DATA,H,0.0,%.2f\n", g_last_lqr_u);
-    
-    // I - 零点调整: target=0, control=当前零点偏移
-    printf("#DATA,I,0.0,%.3f\n", g_lqr_ctrl.distance_zeropoint);
-    
-    // J - 零点滤波: target=滤波前(原始), control=滤波后
-    printf("#DATA,J,%.4f,%.4f\n", output->zeropoint_adjust_raw, output->zeropoint_adjust_filtered);
-    
-    // K - Roll 角度: target=0, control=当前 Roll
-    printf("#DATA,K,0.0,%.2f\n", input->roll);
-    
-    // L - Roll 滤波: target=滤波前(原始 Roll), control=滤波后
-    // 使用控制器内的 lpf_roll 滤波器，但不影响主控制（仅用于显示）
-    float roll_filtered_display = lpf_compute_dt(&g_lqr_ctrl.lpf_roll, input->roll, input->dt);
-    printf("#DATA,L,%.2f,%.2f\n", input->roll, roll_filtered_display);
-    
-    // O - 左轮: target=速度(rad/s), control=加速度(rad/s²)
-    // 用于调试轮子离地检测阈值
-    printf("#DATA,O,%.2f,%.2f\n", g_left_wheel_speed_rad, g_left_wheel_accel);
-    
-    // P - 右轮: target=速度(rad/s), control=加速度(rad/s²)
-    printf("#DATA,P,%.2f,%.2f\n", g_right_wheel_speed_rad, g_right_wheel_accel);
-    
-    // ===== 各环路控制输出量 (用于观察每个环路的贡献) =====
-    // Q - 角度环输出: target=0, control=angle_control
-    printf("#DATA,Q,0.0,%.4f\n", output->angle_control);
-    
-    // R - 角速度环输出: target=0, control=gyro_control
-    printf("#DATA,R,0.0,%.4f\n", output->gyro_control);
-    
-    // S - 位移环输出: target=0, control=distance_control
-    printf("#DATA,S,0.0,%.4f\n", output->distance_control);
-    
-    // T - 速度环输出: target=0, control=speed_control
-    printf("#DATA,T,0.0,%.4f\n", output->speed_control);
-    
-    // U - YAW 控制输出: target=0, control=yaw_control
-    printf("#DATA,U,0.0,%.4f\n", g_yaw_output);
-    
-    // V - LQR 输出 PID 处理前后对比: target=处理前(raw), control=处理后(final)
-    printf("#DATA,V,%.4f,%.4f\n", output->lqr_u_raw, output->lqr_u);
-    
-    // Y - YAW 调试输出 (专用通道，用于 YAW 面板)
-    printf("#DATA,Y,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
-    
-    // YAW 输出和状态 (详细调试)
-    printf("#YAW_DBG,out=%.3f,err=%.2f,hold=%d,rate=%.2f\n", 
-           g_yaw_output, 
-           g_yaw_angle_total - g_lqr_ctrl.yaw_angle_target,
-           g_lqr_ctrl.yaw_holding ? 1 : 0,
-           input->yaw_rate);
+    // 仅输出掩码中使能的通道
+    if (PLOT_CH_ENABLED('A')) printf("#DATA,A,0.0,%.2f\n", input->pitch);
+    if (PLOT_CH_ENABLED('B')) printf("#DATA,B,0.0,%.2f\n", input->pitch_rate);
+    if (PLOT_CH_ENABLED('C')) printf("#DATA,C,%.2f,%.2f\n", g_distance_zeropoint, g_lqr_distance);
+    if (PLOT_CH_ENABLED('D')) printf("#DATA,D,%.2f,%.2f\n", input->target_speed, input->lqr_speed);
+    if (PLOT_CH_ENABLED('E')) printf("#DATA,E,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
+    if (PLOT_CH_ENABLED('F')) printf("#DATA,F,%.2f,%.2f\n", input->target_yaw_rate, input->yaw_rate);
+    if (PLOT_CH_ENABLED('G')) printf("#DATA,G,%.2f,%.2f\n", input->target_speed, output->filtered_target_speed);
+    if (PLOT_CH_ENABLED('H')) printf("#DATA,H,0.0,%.2f\n", g_last_lqr_u);
+    if (PLOT_CH_ENABLED('I')) printf("#DATA,I,0.0,%.3f\n", g_lqr_ctrl.distance_zeropoint);
+    if (PLOT_CH_ENABLED('J')) printf("#DATA,J,%.4f,%.4f\n", output->zeropoint_adjust_raw, output->zeropoint_adjust_filtered);
+    if (PLOT_CH_ENABLED('K')) printf("#DATA,K,0.0,%.2f\n", input->roll);
+    if (PLOT_CH_ENABLED('L')) {
+        float roll_filtered_display = lpf_compute_dt(&g_lqr_ctrl.lpf_roll, input->roll, input->dt);
+        printf("#DATA,L,%.2f,%.2f\n", input->roll, roll_filtered_display);
+    }
+    if (PLOT_CH_ENABLED('N')) printf("#DATA,N,%.2f,%.2f\n", input->pitch_rate, output->filtered_gyro);
+    if (PLOT_CH_ENABLED('W')) printf("#DATA,W,%.3f,%.3f\n", input->lqr_speed, output->filtered_speed);
+    if (PLOT_CH_ENABLED('O')) printf("#DATA,O,%.2f,%.2f\n", g_left_wheel_speed_rad, g_left_wheel_accel);
+    if (PLOT_CH_ENABLED('P')) printf("#DATA,P,%.2f,%.2f\n", g_right_wheel_speed_rad, g_right_wheel_accel);
+    if (PLOT_CH_ENABLED('Q')) printf("#DATA,Q,0.0,%.4f\n", output->angle_control);
+    if (PLOT_CH_ENABLED('R')) printf("#DATA,R,0.0,%.4f\n", output->gyro_control);
+    if (PLOT_CH_ENABLED('S')) printf("#DATA,S,0.0,%.4f\n", output->distance_control);
+    if (PLOT_CH_ENABLED('T')) printf("#DATA,T,0.0,%.4f\n", output->speed_control);
+    if (PLOT_CH_ENABLED('U')) printf("#DATA,U,0.0,%.4f\n", g_yaw_output);
+    if (PLOT_CH_ENABLED('V')) printf("#DATA,V,%.4f,%.4f\n", output->lqr_u_raw, output->lqr_u);
+    if (PLOT_CH_ENABLED('Y')) printf("#DATA,Y,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
+    if (PLOT_CH_ENABLED('Y')) {
+        printf("#YAW_DBG,out=%.3f,err=%.2f,hold=%d,rate=%.2f\n", 
+               g_yaw_output, 
+               g_yaw_angle_total - g_lqr_ctrl.yaw_angle_target,
+               g_lqr_ctrl.yaw_holding ? 1 : 0,
+               input->yaw_rate);
+    }
 }
 
 /**
@@ -918,9 +915,9 @@ void balance_test_set_loop_gain(loop_enable_mask_t loop, float enable) {
     // 进入手动模式 (禁止自动切换 simple/full)
     g_loop_manual_mode = true;
     
-    // Clamp to 0.0~1.0
+    // Clamp to 0.0~5.0
     if (enable < 0.0f) enable = 0.0f;
-    if (enable > 1.0f) enable = 1.0f;
+    if (enable > 5.0f) enable = 5.0f;
     
     // 直接设置到 LQR 参数 (支持渐变)
     switch (loop) {
@@ -3169,8 +3166,16 @@ void balance_test_process_cmd(const char *cmd_str) {
         token = strtok(NULL, " \t\n\r");
         if (token == NULL) {
             printf("Plot output: %s\n", g_plot_enabled ? "enabled" : "disabled");
-            printf("Plot divider: %d (%.1f Hz)\n", g_plot_divider, 200.0f / g_plot_divider);
-            printf("Usage: balance plot [on|off|div <N>]\n");
+            printf("Plot divider: %d (%.1f Hz)\n", g_plot_divider, 500.0f / g_plot_divider);
+            printf("Channel mask: 0x%08lX\n", (unsigned long)g_plot_channel_mask);
+            // 打印已启用的通道列表
+            printf("Enabled channels: ");
+            const char all_ch[] = "ABCDEFGHIJKLMNOPQRSTUVWY";
+            for (int i = 0; all_ch[i]; i++) {
+                if (PLOT_CH_ENABLED(all_ch[i])) printf("%c", all_ch[i]);
+            }
+            printf("\n");
+            printf("Usage: balance plot [on|off|div <N>|ch <ABCD...>|ch none|ch all]\n");
         } else if (strcmp(token, "on") == 0) {
             balance_test_set_plot(true);
         } else if (strcmp(token, "off") == 0) {
@@ -3188,9 +3193,39 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Current divider: %d\n", g_plot_divider);
                 printf("Usage: balance plot div <1-255>\n");
             }
+        } else if (strcmp(token, "ch") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Channel mask: 0x%08lX\n", (unsigned long)g_plot_channel_mask);
+                printf("Usage: balance plot ch <ABCD...>  (e.g. 'ABDH' for angle+gyro+speed+output)\n");
+                printf("       balance plot ch all        (enable all channels)\n");
+                printf("       balance plot ch none       (disable all channels)\n");
+            } else if (strcmp(token, "all") == 0) {
+                g_plot_channel_mask = 0xFFFFFFFF;
+                printf("All plot channels enabled\n");
+            } else if (strcmp(token, "none") == 0) {
+                g_plot_channel_mask = 0;
+                printf("All plot channels disabled\n");
+            } else {
+                // 解析通道字母列表: "ABDH" -> 只开 A,B,D,H
+                uint32_t mask = 0;
+                for (int i = 0; token[i]; i++) {
+                    char ch = token[i];
+                    if (ch >= 'a' && ch <= 'z') ch -= 32;  // 转大写
+                    if (ch >= 'A' && ch <= 'Z') {
+                        mask |= plot_ch_bit(ch);
+                    }
+                }
+                g_plot_channel_mask = mask;
+                printf("Plot channels set to: ");
+                for (int i = 0; i < 26; i++) {
+                    if (mask & (1U << i)) printf("%c", 'A' + i);
+                }
+                printf(" (mask=0x%08lX)\n", (unsigned long)mask);
+            }
         } else {
             printf("Unknown plot command: %s\n", token);
-            printf("Usage: balance plot [on|off|div <N>]\n");
+            printf("Usage: balance plot [on|off|div <N>|ch <ABCD...>]\n");
         }
     }
     // ===== PID 调试输出命令 =====
@@ -4288,14 +4323,14 @@ void balance_test_process_cmd(const char *cmd_str) {
             // 输出 Qt 可解析格式
             printf("DPID:SPEED,%.4f,%.4f,%.4f\n", kp, ki, kd);
         } else if (strcmp(token, "zero") == 0) {
-            // 设置角度零点
+            // 设置角度零点 (同步到所有控制器)
             token = strtok(NULL, " \t\n\r");
             if (token) {
                 float zero = atof(token);
-                dual_pid_set_angle_zeropoint(&g_dual_pid_ctrl, zero);
-                printf("Dual PID angle zeropoint set to %.2f\n", zero);
+                balance_test_set_angle_zeropoint(zero);
+                printf("Angle zeropoint set to %.2f (synced to all controllers)\n", zero);
             } else {
-                printf("Current angle zeropoint: %.2f\n", g_dual_pid_ctrl.params.angle_zeropoint);
+                printf("Current angle zeropoint: %.2f\n", g_angle_zeropoint);
             }
         } else if (strcmp(token, "reset") == 0) {
             dual_pid_reset(&g_dual_pid_ctrl);
@@ -4399,14 +4434,14 @@ void balance_test_process_cmd(const char *cmd_str) {
                        g_single_pid_ctrl.params.angle_limit * 9.5493f);
             }
         } else if (strcmp(token, "zero") == 0) {
-            // 设置角度零点
+            // 设置角度零点 (同步到所有控制器)
             token = strtok(NULL, " \t\n\r");
             if (token) {
                 float zero = atof(token);
-                single_pid_set_angle_zeropoint(&g_single_pid_ctrl, zero);
-                printf("Single PID angle zeropoint set to %.2f\n", zero);
+                balance_test_set_angle_zeropoint(zero);
+                printf("Angle zeropoint set to %.2f (synced to all controllers)\n", zero);
             } else {
-                printf("Current angle zeropoint: %.2f\n", g_single_pid_ctrl.params.angle_zeropoint);
+                printf("Current angle zeropoint: %.2f\n", g_angle_zeropoint);
             }
         } else if (strcmp(token, "reset") == 0) {
             single_pid_reset(&g_single_pid_ctrl);

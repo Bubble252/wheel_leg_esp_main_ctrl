@@ -56,6 +56,10 @@ extern "C" {
 // 速度自适应
 #define CTRL_ID_SPEED_ADAPT 'M'     // 速度自适应参数
 
+// 反馈信号滤波
+#define CTRL_ID_GYRO_LPF    'N'     // 角速度滤波
+#define CTRL_ID_SPEED_LPF   'W'     // 轮速滤波
+
 /* ==================== 参数字符定义 ==================== */
 
 // PID参数 (用于A,B,C,D,E,F,H,I,K控制器)

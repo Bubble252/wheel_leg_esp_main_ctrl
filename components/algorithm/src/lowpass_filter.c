@@ -8,6 +8,7 @@
 #include "lowpass_filter.h"
 #include "esp_timer.h"
 #include <stddef.h>
+#include <math.h>
 
 void lpf_init(lowpass_filter_t *lpf, float tf) {
     if (lpf == NULL) return;
@@ -69,4 +70,57 @@ float lpf_compute_dt(lowpass_filter_t *lpf, float x, float dt) {
     
     lpf->y_prev = y;
     return y;
+}
+
+// ============================================================================
+// 限幅滤波器 (Slew-Rate Limiter)
+// ============================================================================
+
+void slewrate_init(slewrate_filter_t *sf, float max_rate) {
+    if (sf == NULL) return;
+    sf->max_rate = max_rate;
+    sf->y_prev = 0.0f;
+    sf->first_run = true;
+}
+
+void slewrate_reset(slewrate_filter_t *sf) {
+    if (sf == NULL) return;
+    sf->y_prev = 0.0f;
+    sf->first_run = true;
+}
+
+void slewrate_set_max_rate(slewrate_filter_t *sf, float max_rate) {
+    if (sf == NULL) return;
+    sf->max_rate = max_rate;
+}
+
+float slewrate_compute_dt(slewrate_filter_t *sf, float x, float dt) {
+    if (sf == NULL) return x;
+
+    // 首次运行直接输出
+    if (sf->first_run) {
+        sf->y_prev = x;
+        sf->first_run = false;
+        return x;
+    }
+
+    // max_rate <= 0 表示不限制 (直通)
+    if (sf->max_rate <= 0.0f || dt <= 0.0f) {
+        sf->y_prev = x;
+        return x;
+    }
+
+    float delta = x - sf->y_prev;
+    float max_delta = sf->max_rate * dt;
+
+    if (fabsf(delta) <= max_delta) {
+        // 变化量在阈值内，直通 (零延迟)
+        sf->y_prev = x;
+        return x;
+    } else {
+        // 超过阈值，钳位
+        float y = sf->y_prev + ((delta > 0.0f) ? max_delta : -max_delta);
+        sf->y_prev = y;
+        return y;
+    }
 }

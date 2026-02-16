@@ -304,8 +304,8 @@ class PIDControlPanel(QWidget):
         param_layout.addWidget(QLabel("P (比例):"), 0, 0)
         self.p_input = QDoubleSpinBox()
         self.p_input.setRange(-1000, 1000)
-        self.p_input.setDecimals(4)
-        self.p_input.setSingleStep(0.1)
+        self.p_input.setDecimals(6)
+        self.p_input.setSingleStep(0.0001)
         self.p_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.p_input, 0, 1)
         
@@ -317,8 +317,8 @@ class PIDControlPanel(QWidget):
         param_layout.addWidget(QLabel("I (积分):"), 1, 0)
         self.i_input = QDoubleSpinBox()
         self.i_input.setRange(-1000, 1000)
-        self.i_input.setDecimals(4)
-        self.i_input.setSingleStep(0.1)
+        self.i_input.setDecimals(6)
+        self.i_input.setSingleStep(0.0001)
         self.i_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.i_input, 1, 1)
         
@@ -330,8 +330,8 @@ class PIDControlPanel(QWidget):
         param_layout.addWidget(QLabel("D (微分):"), 2, 0)
         self.d_input = QDoubleSpinBox()
         self.d_input.setRange(-1000, 1000)
-        self.d_input.setDecimals(4)
-        self.d_input.setSingleStep(0.1)
+        self.d_input.setDecimals(6)
+        self.d_input.setSingleStep(0.0001)
         self.d_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.d_input, 2, 1)
         
@@ -344,7 +344,7 @@ class PIDControlPanel(QWidget):
         self.limit_input = QDoubleSpinBox()
         self.limit_input.setRange(0, 1000)
         self.limit_input.setDecimals(4)
-        self.limit_input.setSingleStep(0.5)
+        self.limit_input.setSingleStep(0.1)
         self.limit_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.limit_input, 3, 1)
         
@@ -673,7 +673,7 @@ class LPFControlPanel(QWidget):
         self.tf_input = QDoubleSpinBox()
         self.tf_input.setRange(0, 10)
         self.tf_input.setDecimals(4)
-        self.tf_input.setSingleStep(0.01)
+        self.tf_input.setSingleStep(0.001)
         self.tf_input.setValue(0.01)
         self.tf_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         param_layout.addWidget(self.tf_input, 0, 1)
@@ -751,6 +751,497 @@ class LPFControlPanel(QWidget):
     
     def update_display(self, tf):
         self.tf_display.setText(f"{tf:.4f}")
+    
+    def update_plot(self, raw_value, filtered_value=None):
+        """更新波形 (支持滤波前后对比)"""
+        self.data_counter += 1
+        self.time_data.append(self.data_counter)
+        self.raw_data.append(raw_value)
+        
+        if filtered_value is not None:
+            self.filtered_data.append(filtered_value)
+        else:
+            self.filtered_data.append(raw_value)
+        
+        self.raw_curve.setData(list(self.time_data), list(self.raw_data))
+        self.filtered_curve.setData(list(self.time_data), list(self.filtered_data))
+    
+    def clear_plot(self):
+        self.time_data.clear()
+        self.raw_data.clear()
+        self.filtered_data.clear()
+        self.data_counter = 0
+        self.raw_curve.setData([], [])
+        self.filtered_curve.setData([], [])
+
+
+# ============================================================================
+# 轮速滤波面板 (双模式: LPF / 限幅滤波)
+# ============================================================================
+class SpeedFilterPanel(QWidget):
+    """轮速滤波面板 - 支持 LPF 和 限幅滤波(Slew-Rate) 两种模式切换"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.commander_id = "W"
+        self.parent_window = parent
+        
+        self.max_points = 500
+        self.time_data = deque(maxlen=self.max_points)
+        self.raw_data = deque(maxlen=self.max_points)
+        self.filtered_data = deque(maxlen=self.max_points)
+        self.data_counter = 0
+        
+        self.current_mode = 0  # 0=LPF, 1=SlewRate
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # ========== 模式选择 ==========
+        mode_group = QGroupBox("滤波模式选择")
+        mode_layout = QHBoxLayout()
+        
+        self.mode_lpf_btn = QPushButton("📉 低通滤波 (LPF)")
+        self.mode_lpf_btn.setCheckable(True)
+        self.mode_lpf_btn.setChecked(True)
+        self.mode_lpf_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 14px; padding: 8px 16px; border: 2px solid #555; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #2196F3; color: white; border-color: #1976D2; }"
+        ))
+        self.mode_lpf_btn.clicked.connect(lambda: self._set_mode(0))
+        mode_layout.addWidget(self.mode_lpf_btn)
+        
+        self.mode_sr_btn = QPushButton("📊 限幅滤波 (Slew-Rate)")
+        self.mode_sr_btn.setCheckable(True)
+        self.mode_sr_btn.setChecked(False)
+        self.mode_sr_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 14px; padding: 8px 16px; border: 2px solid #555; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #FF9800; color: white; border-color: #F57C00; }"
+        ))
+        self.mode_sr_btn.clicked.connect(lambda: self._set_mode(1))
+        mode_layout.addWidget(self.mode_sr_btn)
+        
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+        
+        # ========== LPF 参数 ==========
+        self.lpf_group = QGroupBox("低通滤波参数 (LPF)")
+        lpf_layout = QGridLayout()
+        
+        lpf_layout.addWidget(QLabel("Tf (时间常数):"), 0, 0)
+        self.tf_input = QDoubleSpinBox()
+        self.tf_input.setRange(0, 10)
+        self.tf_input.setDecimals(4)
+        self.tf_input.setSingleStep(0.001)
+        self.tf_input.setValue(0.01)
+        self.tf_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        lpf_layout.addWidget(self.tf_input, 0, 1)
+        
+        self.tf_set_btn = QPushButton("设置 Tf")
+        self.tf_set_btn.clicked.connect(self._set_tf)
+        lpf_layout.addWidget(self.tf_set_btn, 0, 2)
+        
+        lpf_layout.addWidget(QLabel("💡 Tf 越大滤波越强，但延迟越大"), 1, 0, 1, 3)
+        
+        self.lpf_group.setLayout(lpf_layout)
+        layout.addWidget(self.lpf_group)
+        
+        # ========== 限幅滤波参数 ==========
+        self.sr_group = QGroupBox("限幅滤波参数 (Slew-Rate Limiter)")
+        sr_layout = QGridLayout()
+        
+        sr_layout.addWidget(QLabel("最大变化率 (单位/秒):"), 0, 0)
+        self.rate_input = QDoubleSpinBox()
+        self.rate_input.setRange(0.1, 10000)
+        self.rate_input.setDecimals(2)
+        self.rate_input.setSingleStep(1.0)
+        self.rate_input.setValue(50.0)
+        self.rate_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        sr_layout.addWidget(self.rate_input, 0, 1)
+        
+        self.rate_set_btn = QPushButton("设置 Rate")
+        self.rate_set_btn.clicked.connect(self._set_rate)
+        sr_layout.addWidget(self.rate_set_btn, 0, 2)
+        
+        sr_layout.addWidget(QLabel(
+            "💡 正常变化直通(零延迟)，超过阈值时钳位\n"
+            "   适合过滤编码器突跳毛刺，同时保持正常信号无延迟"
+        ), 1, 0, 1, 3)
+        
+        self.sr_group.setLayout(sr_layout)
+        self.sr_group.setVisible(False)  # 默认隐藏
+        layout.addWidget(self.sr_group)
+        
+        # ========== 快捷操作 ==========
+        action_layout = QHBoxLayout()
+        
+        self.query_btn = QPushButton("🔍 查询参数")
+        self.query_btn.clicked.connect(self._query)
+        action_layout.addWidget(self.query_btn)
+        
+        action_layout.addStretch()
+        layout.addLayout(action_layout)
+        
+        # ========== 当前值显示 ==========
+        display_group = QGroupBox("当前参数值")
+        display_layout = QGridLayout()
+        
+        display_layout.addWidget(QLabel("模式:"), 0, 0)
+        self.mode_display = QLabel("LPF")
+        self.mode_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #2196F3; "
+                                           "background-color: #2b2b2b; padding: 8px;"))
+        display_layout.addWidget(self.mode_display, 0, 1)
+        
+        display_layout.addWidget(QLabel("Tf:"), 1, 0)
+        self.tf_display = QLabel("--")
+        self.tf_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ff00; "
+                                         "background-color: #2b2b2b; padding: 8px;"))
+        display_layout.addWidget(self.tf_display, 1, 1)
+        
+        display_layout.addWidget(QLabel("Rate:"), 2, 0)
+        self.rate_display = QLabel("--")
+        self.rate_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #FF9800; "
+                                           "background-color: #2b2b2b; padding: 8px;"))
+        display_layout.addWidget(self.rate_display, 2, 1)
+        
+        display_layout.setColumnStretch(1, 1)
+        display_group.setLayout(display_layout)
+        layout.addWidget(display_group)
+        
+        # ========== 波形 (滤波前后对比) ==========
+        plot_group = QGroupBox("实时波形 (蓝色=滤波前, 红色=滤波后)")
+        plot_layout = QVBoxLayout()
+        
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground('k')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.raw_curve = self.plot_widget.plot(pen=pg.mkPen(color='b', width=2), name='滤波前')
+        self.filtered_curve = self.plot_widget.plot(pen=pg.mkPen(color='r', width=2), name='滤波后')
+        self.plot_widget.addLegend()
+        
+        plot_layout.addWidget(self.plot_widget)
+        
+        plot_btn_layout = QHBoxLayout()
+        self.clear_btn = QPushButton("清空")
+        self.clear_btn.clicked.connect(self.clear_plot)
+        plot_btn_layout.addWidget(self.clear_btn)
+        plot_btn_layout.addStretch()
+        plot_layout.addLayout(plot_btn_layout)
+        
+        plot_group.setLayout(plot_layout)
+        layout.addWidget(plot_group)
+    
+    def _set_mode(self, mode):
+        """切换滤波模式并发送到设备"""
+        self.current_mode = mode
+        self.mode_lpf_btn.setChecked(mode == 0)
+        self.mode_sr_btn.setChecked(mode == 1)
+        self.lpf_group.setVisible(mode == 0)
+        self.sr_group.setVisible(mode == 1)
+        
+        if self.parent_window and self.parent_window.is_connected():
+            cmd = f"WM{mode}"
+            self.parent_window.send_command(cmd)
+            mode_name = "LPF" if mode == 0 else "SlewRate"
+            self.parent_window.log(f"发送: {cmd} -> 轮速滤波模式={mode_name}")
+        
+        self._update_mode_display()
+    
+    def _set_tf(self):
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        tf = self.tf_input.value()
+        cmd = f"WT{tf}"
+        self.parent_window.send_command(cmd)
+        self.parent_window.log(f"发送: {cmd} -> 轮速LPF Tf={tf}")
+    
+    def _set_rate(self):
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        rate = self.rate_input.value()
+        cmd = f"WR{rate}"
+        self.parent_window.send_command(cmd)
+        self.parent_window.log(f"发送: {cmd} -> 限幅滤波 Rate={rate}")
+    
+    def _query(self):
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        cmd = "W?"
+        self.parent_window.send_command(cmd)
+        self.parent_window.log("查询轮速滤波参数...")
+    
+    def _update_mode_display(self):
+        if self.current_mode == 0:
+            self.mode_display.setText("LPF (低通滤波)")
+            self.mode_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #2196F3; "
+                                               "background-color: #2b2b2b; padding: 8px;"))
+        else:
+            self.mode_display.setText("SlewRate (限幅滤波)")
+            self.mode_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #FF9800; "
+                                               "background-color: #2b2b2b; padding: 8px;"))
+    
+    def update_display(self, mode, tf, rate):
+        """更新显示 (从查询响应调用)"""
+        self.current_mode = int(mode)
+        self.mode_lpf_btn.setChecked(self.current_mode == 0)
+        self.mode_sr_btn.setChecked(self.current_mode == 1)
+        self.lpf_group.setVisible(self.current_mode == 0)
+        self.sr_group.setVisible(self.current_mode == 1)
+        self._update_mode_display()
+        
+        self.tf_display.setText(f"{tf:.4f}")
+        self.rate_display.setText(f"{rate:.2f}")
+        self.tf_input.setValue(tf)
+        self.rate_input.setValue(rate)
+    
+    def update_plot(self, raw_value, filtered_value=None):
+        """更新波形 (支持滤波前后对比)"""
+        self.data_counter += 1
+        self.time_data.append(self.data_counter)
+        self.raw_data.append(raw_value)
+        
+        if filtered_value is not None:
+            self.filtered_data.append(filtered_value)
+        else:
+            self.filtered_data.append(raw_value)
+        
+        self.raw_curve.setData(list(self.time_data), list(self.raw_data))
+        self.filtered_curve.setData(list(self.time_data), list(self.filtered_data))
+    
+    def clear_plot(self):
+        self.time_data.clear()
+        self.raw_data.clear()
+        self.filtered_data.clear()
+        self.data_counter = 0
+        self.raw_curve.setData([], [])
+        self.filtered_curve.setData([], [])
+
+
+class GyroFilterPanel(QWidget):
+    """角速度滤波面板 - 支持 LPF 和 限幅滤波(Slew-Rate) 两种模式切换"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.commander_id = "N"
+        self.parent_window = parent
+        
+        self.max_points = 500
+        self.time_data = deque(maxlen=self.max_points)
+        self.raw_data = deque(maxlen=self.max_points)
+        self.filtered_data = deque(maxlen=self.max_points)
+        self.data_counter = 0
+        
+        self.current_mode = 1  # 默认限幅滤波
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # ========== 模式选择 ==========
+        mode_group = QGroupBox("滤波模式选择")
+        mode_layout = QHBoxLayout()
+        
+        self.mode_lpf_btn = QPushButton("📉 低通滤波 (LPF)")
+        self.mode_lpf_btn.setCheckable(True)
+        self.mode_lpf_btn.setChecked(False)
+        self.mode_lpf_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 14px; padding: 8px 16px; border: 2px solid #555; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #2196F3; color: white; border-color: #1976D2; }"
+        ))
+        self.mode_lpf_btn.clicked.connect(lambda: self._set_mode(0))
+        mode_layout.addWidget(self.mode_lpf_btn)
+        
+        self.mode_sr_btn = QPushButton("📊 限幅滤波 (Slew-Rate)")
+        self.mode_sr_btn.setCheckable(True)
+        self.mode_sr_btn.setChecked(True)
+        self.mode_sr_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 14px; padding: 8px 16px; border: 2px solid #555; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #FF9800; color: white; border-color: #F57C00; }"
+        ))
+        self.mode_sr_btn.clicked.connect(lambda: self._set_mode(1))
+        mode_layout.addWidget(self.mode_sr_btn)
+        
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+        
+        # ========== LPF 参数 ==========
+        self.lpf_group = QGroupBox("低通滤波参数 (LPF)")
+        lpf_layout = QGridLayout()
+        
+        lpf_layout.addWidget(QLabel("Tf (时间常数):"), 0, 0)
+        self.tf_input = QDoubleSpinBox()
+        self.tf_input.setRange(0, 10)
+        self.tf_input.setDecimals(4)
+        self.tf_input.setSingleStep(0.001)
+        self.tf_input.setValue(0.005)
+        self.tf_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        lpf_layout.addWidget(self.tf_input, 0, 1)
+        
+        self.tf_set_btn = QPushButton("设置 Tf")
+        self.tf_set_btn.clicked.connect(self._set_tf)
+        lpf_layout.addWidget(self.tf_set_btn, 0, 2)
+        
+        lpf_layout.addWidget(QLabel("💡 Tf 越大滤波越强，但延迟越大"), 1, 0, 1, 3)
+        
+        self.lpf_group.setLayout(lpf_layout)
+        self.lpf_group.setVisible(False)  # 默认隐藏 (默认限幅模式)
+        layout.addWidget(self.lpf_group)
+        
+        # ========== 限幅滤波参数 ==========
+        self.sr_group = QGroupBox("限幅滤波参数 (Slew-Rate Limiter)")
+        sr_layout = QGridLayout()
+        
+        sr_layout.addWidget(QLabel("最大变化率 (°/s²):"), 0, 0)
+        self.rate_input = QDoubleSpinBox()
+        self.rate_input.setRange(0.1, 100000)
+        self.rate_input.setDecimals(1)
+        self.rate_input.setSingleStep(10.0)
+        self.rate_input.setValue(500.0)
+        self.rate_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
+        sr_layout.addWidget(self.rate_input, 0, 1)
+        
+        self.rate_set_btn = QPushButton("设置 Rate")
+        self.rate_set_btn.clicked.connect(self._set_rate)
+        sr_layout.addWidget(self.rate_set_btn, 0, 2)
+        
+        sr_layout.addWidget(QLabel(
+            "💡 正常角速度变化直通(零延迟)，超过阈值时钳位\n"
+            "   适合过滤IMU角速度阶梯跳变，同时保持正常信号无延迟"
+        ), 1, 0, 1, 3)
+        
+        self.sr_group.setLayout(sr_layout)
+        layout.addWidget(self.sr_group)
+        
+        # ========== 快捷操作 ==========
+        action_layout = QHBoxLayout()
+        
+        self.query_btn = QPushButton("🔍 查询参数")
+        self.query_btn.clicked.connect(self._query)
+        action_layout.addWidget(self.query_btn)
+        
+        action_layout.addStretch()
+        layout.addLayout(action_layout)
+        
+        # ========== 当前值显示 ==========
+        display_group = QGroupBox("当前参数值")
+        display_layout = QGridLayout()
+        
+        display_layout.addWidget(QLabel("模式:"), 0, 0)
+        self.mode_display = QLabel("SlewRate (限幅滤波)")
+        self.mode_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #FF9800; "
+                                           "background-color: #2b2b2b; padding: 8px;"))
+        display_layout.addWidget(self.mode_display, 0, 1)
+        
+        display_layout.addWidget(QLabel("Tf:"), 1, 0)
+        self.tf_display = QLabel("--")
+        self.tf_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #00ff00; "
+                                         "background-color: #2b2b2b; padding: 8px;"))
+        display_layout.addWidget(self.tf_display, 1, 1)
+        
+        display_layout.addWidget(QLabel("Rate:"), 2, 0)
+        self.rate_display = QLabel("--")
+        self.rate_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #FF9800; "
+                                           "background-color: #2b2b2b; padding: 8px;"))
+        display_layout.addWidget(self.rate_display, 2, 1)
+        
+        display_layout.setColumnStretch(1, 1)
+        display_group.setLayout(display_layout)
+        layout.addWidget(display_group)
+        
+        # ========== 波形 (滤波前后对比) ==========
+        plot_group = QGroupBox("实时波形 (蓝色=滤波前, 红色=滤波后)")
+        plot_layout = QVBoxLayout()
+        
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground('k')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.raw_curve = self.plot_widget.plot(pen=pg.mkPen(color='b', width=2), name='滤波前')
+        self.filtered_curve = self.plot_widget.plot(pen=pg.mkPen(color='r', width=2), name='滤波后')
+        self.plot_widget.addLegend()
+        
+        plot_layout.addWidget(self.plot_widget)
+        
+        plot_btn_layout = QHBoxLayout()
+        self.clear_btn = QPushButton("清空")
+        self.clear_btn.clicked.connect(self.clear_plot)
+        plot_btn_layout.addWidget(self.clear_btn)
+        plot_btn_layout.addStretch()
+        plot_layout.addLayout(plot_btn_layout)
+        
+        plot_group.setLayout(plot_layout)
+        layout.addWidget(plot_group)
+    
+    def _set_mode(self, mode):
+        """切换滤波模式并发送到设备"""
+        self.current_mode = mode
+        self.mode_lpf_btn.setChecked(mode == 0)
+        self.mode_sr_btn.setChecked(mode == 1)
+        self.lpf_group.setVisible(mode == 0)
+        self.sr_group.setVisible(mode == 1)
+        
+        if self.parent_window and self.parent_window.is_connected():
+            cmd = f"NM{mode}"
+            self.parent_window.send_command(cmd)
+            mode_name = "LPF" if mode == 0 else "SlewRate"
+            self.parent_window.log(f"发送: {cmd} -> 角速度滤波模式={mode_name}")
+        
+        self._update_mode_display()
+    
+    def _set_tf(self):
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        tf = self.tf_input.value()
+        cmd = f"NT{tf}"
+        self.parent_window.send_command(cmd)
+        self.parent_window.log(f"发送: {cmd} -> 角速度LPF Tf={tf}")
+    
+    def _set_rate(self):
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        rate = self.rate_input.value()
+        cmd = f"NR{rate}"
+        self.parent_window.send_command(cmd)
+        self.parent_window.log(f"发送: {cmd} -> 角速度限幅滤波 Rate={rate}")
+    
+    def _query(self):
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        cmd = "N?"
+        self.parent_window.send_command(cmd)
+        self.parent_window.log("查询角速度滤波参数...")
+    
+    def _update_mode_display(self):
+        if self.current_mode == 0:
+            self.mode_display.setText("LPF (低通滤波)")
+            self.mode_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #2196F3; "
+                                               "background-color: #2b2b2b; padding: 8px;"))
+        else:
+            self.mode_display.setText("SlewRate (限幅滤波)")
+            self.mode_display.setStyleSheet(SS("font-size: 16px; font-weight: bold; color: #FF9800; "
+                                               "background-color: #2b2b2b; padding: 8px;"))
+    
+    def update_display(self, mode, tf, rate):
+        """更新显示 (从查询响应调用)"""
+        self.current_mode = int(mode)
+        self.mode_lpf_btn.setChecked(self.current_mode == 0)
+        self.mode_sr_btn.setChecked(self.current_mode == 1)
+        self.lpf_group.setVisible(self.current_mode == 0)
+        self.sr_group.setVisible(self.current_mode == 1)
+        self._update_mode_display()
+        
+        self.tf_display.setText(f"{tf:.4f}")
+        self.rate_display.setText(f"{rate:.1f}")
+        self.tf_input.setValue(tf)
+        self.rate_input.setValue(rate)
     
     def update_plot(self, raw_value, filtered_value=None):
         """更新波形 (支持滤波前后对比)"""
@@ -896,9 +1387,9 @@ class SpeedAdaptivePanel(QWidget):
         range_layout.addWidget(QLabel("Kp_Max (低姿态时):"), 0, 0)
         self.kp_max_input = QDoubleSpinBox()
         self.kp_max_input.setRange(0, 10)
-        self.kp_max_input.setDecimals(3)
+        self.kp_max_input.setDecimals(4)
         self.kp_max_input.setValue(1.0)  # 对应 default_params.speed_kp_max
-        self.kp_max_input.setSingleStep(0.1)
+        self.kp_max_input.setSingleStep(0.001)
         self.kp_max_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         range_layout.addWidget(self.kp_max_input, 0, 1)
         
@@ -913,9 +1404,9 @@ class SpeedAdaptivePanel(QWidget):
         range_layout.addWidget(QLabel("Kp_Min (高姿态时):"), 1, 0)
         self.kp_min_input = QDoubleSpinBox()
         self.kp_min_input.setRange(0, 10)
-        self.kp_min_input.setDecimals(3)
+        self.kp_min_input.setDecimals(4)
         self.kp_min_input.setValue(0.3)  # 对应 default_params.speed_kp_min
-        self.kp_min_input.setSingleStep(0.1)
+        self.kp_min_input.setSingleStep(0.001)
         self.kp_min_input.setStyleSheet(SS("font-size: 14px; padding: 5px;"))
         range_layout.addWidget(self.kp_min_input, 1, 1)
         
@@ -2054,8 +2545,8 @@ class MotorControlPanel(QWidget):
         motor_layout.addWidget(QLabel("力矩:"), 4, 0)
         self.torque_input = QDoubleSpinBox()
         self.torque_input.setRange(-5, 5)
-        self.torque_input.setSingleStep(0.1)
-        self.torque_input.setDecimals(2)
+        self.torque_input.setSingleStep(0.01)
+        self.torque_input.setDecimals(3)
         motor_layout.addWidget(self.torque_input, 4, 1)
         self.set_torque_btn = QPushButton("设置")
         self.set_torque_btn.clicked.connect(self.set_motor_torque)
@@ -2588,8 +3079,8 @@ class BalanceControlPanel(QWidget):
         zero_layout.addWidget(QLabel("零点角度 (°):"))
         self.zero_input = QDoubleSpinBox()
         self.zero_input.setRange(-30, 30)
-        self.zero_input.setSingleStep(0.1)
-        self.zero_input.setDecimals(2)
+        self.zero_input.setSingleStep(0.01)
+        self.zero_input.setDecimals(3)
         self.zero_input.setValue(7.4)
         zero_layout.addWidget(self.zero_input)
         
@@ -2605,28 +3096,142 @@ class BalanceControlPanel(QWidget):
         layout.addWidget(zero_group)
         
         # 波形输出控制
-        plot_group = QGroupBox("波形输出")
-        plot_layout = QHBoxLayout()
+        plot_group = QGroupBox("📊 波形输出控制")
+        plot_main_layout = QVBoxLayout()
         
-        self.plot_on_btn = QPushButton("开启波形")
-        self.plot_on_btn.clicked.connect(lambda: self.send_cmd("balance plot on"))
-        plot_layout.addWidget(self.plot_on_btn)
+        # 第一行: 开关 + 分频
+        plot_ctrl_layout = QHBoxLayout()
         
-        self.plot_off_btn = QPushButton("关闭波形")
+        self.plot_on_btn = QPushButton("▶ 开启波形")
+        self.plot_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 5px 12px;"))
+        self.plot_on_btn.clicked.connect(self.plot_start)
+        plot_ctrl_layout.addWidget(self.plot_on_btn)
+        
+        self.plot_off_btn = QPushButton("⏹ 关闭波形")
+        self.plot_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 5px 12px;"))
         self.plot_off_btn.clicked.connect(lambda: self.send_cmd("balance plot off"))
-        plot_layout.addWidget(self.plot_off_btn)
+        plot_ctrl_layout.addWidget(self.plot_off_btn)
         
-        plot_layout.addWidget(QLabel("分频:"))
+        plot_ctrl_layout.addWidget(QLabel("分频:"))
         self.plot_div_input = QSpinBox()
         self.plot_div_input.setRange(1, 255)
         self.plot_div_input.setValue(10)
-        plot_layout.addWidget(self.plot_div_input)
+        plot_ctrl_layout.addWidget(self.plot_div_input)
         
         self.set_div_btn = QPushButton("设置")
         self.set_div_btn.clicked.connect(lambda: self.send_cmd(f"balance plot div {self.plot_div_input.value()}"))
-        plot_layout.addWidget(self.set_div_btn)
+        plot_ctrl_layout.addWidget(self.set_div_btn)
         
-        plot_group.setLayout(plot_layout)
+        plot_ctrl_layout.addStretch()
+        plot_main_layout.addLayout(plot_ctrl_layout)
+        
+        # 第二行: 通道选择 (分组显示)
+        ch_group_label = QLabel("通道选择 (勾选需要的通道，减少数据量):")
+        ch_group_label.setStyleSheet(SS("color: #aaa; font-size: 11px; margin-top: 5px;"))
+        plot_main_layout.addWidget(ch_group_label)
+        
+        # 通道定义: (ID, 名称, 默认勾选)
+        self.plot_channels = {
+            # 基础状态量
+            'A': ('角度 Pitch', True),
+            'B': ('角速度', True),
+            'C': ('位移', False),
+            'D': ('速度', True),
+            # YAW
+            'E': ('YAW角度', False),
+            'F': ('YAW角速度', False),
+            # 滤波器
+            'G': ('摇杆LPF', False),
+            'N': ('角速度滤波', False),
+            'W': ('轮速滤波', False),
+            # 输出
+            'H': ('LQR输出', True),
+            'V': ('输出PID前后', False),
+            # 零点/Roll
+            'I': ('零点偏移', False),
+            'J': ('零点LPF', False),
+            'K': ('Roll角度', False),
+            'L': ('Roll LPF', False),
+            # 轮子
+            'O': ('左轮速/加速', False),
+            'P': ('右轮速/加速', False),
+            # 各环输出
+            'Q': ('角度环输出', False),
+            'R': ('角速度环输出', False),
+            'S': ('位移环输出', False),
+            'T': ('速度环输出', False),
+            'U': ('YAW输出', False),
+            # YAW调试
+            'Y': ('YAW调试', False),
+        }
+        
+        self.plot_ch_checkboxes = {}
+        
+        # 按组排列
+        ch_groups = [
+            ("基础", ['A', 'B', 'C', 'D']),
+            ("YAW", ['E', 'F', 'Y']),
+            ("滤波", ['G', 'N', 'W']),
+            ("输出", ['H', 'V']),
+            ("零点/Roll", ['I', 'J', 'K', 'L']),
+            ("轮子", ['O', 'P']),
+            ("环路分量", ['Q', 'R', 'S', 'T', 'U']),
+        ]
+        
+        ch_grid = QGridLayout()
+        ch_grid.setSpacing(2)
+        col = 0
+        for group_name, ch_ids in ch_groups:
+            # 组标签
+            glabel = QLabel(f"[{group_name}]")
+            glabel.setStyleSheet(SS("color: #888; font-size: 10px; font-weight: bold;"))
+            ch_grid.addWidget(glabel, 0, col, 1, len(ch_ids))
+            for i, ch_id in enumerate(ch_ids):
+                name, default = self.plot_channels[ch_id]
+                cb = QCheckBox(f"{ch_id}:{name}")
+                cb.setChecked(default)
+                cb.setStyleSheet(SS("font-size: 10px;"))
+                self.plot_ch_checkboxes[ch_id] = cb
+                ch_grid.addWidget(cb, 1, col + i)
+            col += len(ch_ids)
+        
+        plot_main_layout.addLayout(ch_grid)
+        
+        # 第三行: 快捷按钮
+        ch_quick_layout = QHBoxLayout()
+        
+        ch_all_btn = QPushButton("全选")
+        ch_all_btn.setFixedWidth(50)
+        ch_all_btn.clicked.connect(lambda: self.set_all_plot_channels(True))
+        ch_quick_layout.addWidget(ch_all_btn)
+        
+        ch_none_btn = QPushButton("全不选")
+        ch_none_btn.setFixedWidth(60)
+        ch_none_btn.clicked.connect(lambda: self.set_all_plot_channels(False))
+        ch_quick_layout.addWidget(ch_none_btn)
+        
+        ch_basic_btn = QPushButton("基础 (ABDH)")
+        ch_basic_btn.clicked.connect(lambda: self.set_plot_channel_preset("ABDH"))
+        ch_quick_layout.addWidget(ch_basic_btn)
+        
+        ch_filter_btn = QPushButton("滤波 (ABNW)")
+        ch_filter_btn.clicked.connect(lambda: self.set_plot_channel_preset("ABNW"))
+        ch_quick_layout.addWidget(ch_filter_btn)
+        
+        ch_loop_btn = QPushButton("环路分析 (QRSTUV)")
+        ch_loop_btn.clicked.connect(lambda: self.set_plot_channel_preset("QRSTUV"))
+        ch_quick_layout.addWidget(ch_loop_btn)
+        
+        ch_quick_layout.addStretch()
+        
+        self.ch_apply_btn = QPushButton("⬆ 应用通道设置")
+        self.ch_apply_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 5px 15px;"))
+        self.ch_apply_btn.clicked.connect(self.apply_plot_channels)
+        ch_quick_layout.addWidget(self.ch_apply_btn)
+        
+        plot_main_layout.addLayout(ch_quick_layout)
+        
+        plot_group.setLayout(plot_main_layout)
         layout.addWidget(plot_group)
         
         # ========== 环路调试控制 (新增) ==========
@@ -2726,7 +3331,7 @@ class BalanceControlPanel(QWidget):
         loop_layout.addWidget(line2)
         
         # 增益精调 (高级)
-        gain_label = QLabel("增益精调 (0.0-1.0):")
+        gain_label = QLabel("增益精调 (0.0-5.0):")
         gain_label.setStyleSheet(SS("font-size: 11px; color: #888;"))
         loop_layout.addWidget(gain_label)
         
@@ -2736,8 +3341,8 @@ class BalanceControlPanel(QWidget):
         gain_layout.addWidget(self.gain_loop_combo)
         
         self.gain_spin = QDoubleSpinBox()
-        self.gain_spin.setRange(0.0, 1.0)
-        self.gain_spin.setSingleStep(0.1)
+        self.gain_spin.setRange(0.0, 5.0)
+        self.gain_spin.setSingleStep(0.01)
         self.gain_spin.setValue(1.0)
         self.gain_spin.setDecimals(2)
         gain_layout.addWidget(self.gain_spin)
@@ -3078,6 +3683,35 @@ class BalanceControlPanel(QWidget):
         self.sys_status_label.setText("就绪")
         self.sys_status_label.setStyleSheet(SS("font-weight: bold; color: green;"))
     
+    def set_all_plot_channels(self, checked):
+        """全选/全不选所有波形通道"""
+        for cb in self.plot_ch_checkboxes.values():
+            cb.setChecked(checked)
+    
+    def set_plot_channel_preset(self, channels):
+        """设置通道预设 (先全不选, 再选指定通道)"""
+        for cb in self.plot_ch_checkboxes.values():
+            cb.setChecked(False)
+        for ch in channels.upper():
+            if ch in self.plot_ch_checkboxes:
+                self.plot_ch_checkboxes[ch].setChecked(True)
+    
+    def apply_plot_channels(self):
+        """将当前勾选的通道发送给 ESP32"""
+        selected = ""
+        for ch_id, cb in self.plot_ch_checkboxes.items():
+            if cb.isChecked():
+                selected += ch_id
+        if selected:
+            self.send_cmd(f"balance plot ch {selected}")
+        else:
+            self.send_cmd("balance plot ch none")
+    
+    def plot_start(self):
+        """开启波形: 先应用通道选择, 再开启"""
+        self.apply_plot_channels()
+        self.send_cmd("balance plot on")
+    
     def set_loop_preset(self, preset):
         """设置环路预设"""
         self.send_cmd(f"balance loop {preset}")
@@ -3353,8 +3987,8 @@ class DualPIDPanel(QWidget):
         angle_layout.addWidget(QLabel("Kd:"), 0, 4)
         self.angle_kd = QDoubleSpinBox()
         self.angle_kd.setRange(0, 10)
-        self.angle_kd.setSingleStep(0.1)
-        self.angle_kd.setDecimals(3)
+        self.angle_kd.setSingleStep(0.01)
+        self.angle_kd.setDecimals(4)
         self.angle_kd.setValue(0.5)
         angle_layout.addWidget(self.angle_kd, 0, 5)
         
@@ -3377,8 +4011,8 @@ class DualPIDPanel(QWidget):
         speed_layout.addWidget(QLabel("Kp:"), 0, 0)
         self.speed_kp = QDoubleSpinBox()
         self.speed_kp.setRange(0, 10)
-        self.speed_kp.setSingleStep(0.1)
-        self.speed_kp.setDecimals(3)
+        self.speed_kp.setSingleStep(0.01)
+        self.speed_kp.setDecimals(4)
         self.speed_kp.setValue(0.5)
         speed_layout.addWidget(self.speed_kp, 0, 1)
         
@@ -3417,8 +4051,8 @@ class DualPIDPanel(QWidget):
         zero_layout.addWidget(QLabel("零点 (°):"))
         self.zero_input = QDoubleSpinBox()
         self.zero_input.setRange(-30, 30)
-        self.zero_input.setSingleStep(0.1)
-        self.zero_input.setDecimals(2)
+        self.zero_input.setSingleStep(0.01)
+        self.zero_input.setDecimals(3)
         self.zero_input.setValue(0.0)
         zero_layout.addWidget(self.zero_input)
         
@@ -3638,8 +4272,8 @@ class DualPIDPanel(QWidget):
         spid_layout.addWidget(QLabel("Kd:"), 1, 4)
         self.spid_kd = QDoubleSpinBox()
         self.spid_kd.setRange(0, 10)
-        self.spid_kd.setSingleStep(0.1)
-        self.spid_kd.setDecimals(3)
+        self.spid_kd.setSingleStep(0.01)
+        self.spid_kd.setDecimals(4)
         self.spid_kd.setValue(0.5)
         spid_layout.addWidget(self.spid_kd, 1, 5)
         
@@ -4024,22 +4658,22 @@ class YawDebugPanel(QWidget):
         pid_layout.addWidget(QLabel("P:"), row, 1)
         self.yaw_angle_p = QDoubleSpinBox()
         self.yaw_angle_p.setRange(0, 100)
-        self.yaw_angle_p.setDecimals(3)
-        self.yaw_angle_p.setSingleStep(0.1)
+        self.yaw_angle_p.setDecimals(4)
+        self.yaw_angle_p.setSingleStep(0.001)
         pid_layout.addWidget(self.yaw_angle_p, row, 2)
         
         pid_layout.addWidget(QLabel("I:"), row, 3)
         self.yaw_angle_i = QDoubleSpinBox()
         self.yaw_angle_i.setRange(0, 100)
-        self.yaw_angle_i.setDecimals(3)
-        self.yaw_angle_i.setSingleStep(0.01)
+        self.yaw_angle_i.setDecimals(4)
+        self.yaw_angle_i.setSingleStep(0.001)
         pid_layout.addWidget(self.yaw_angle_i, row, 4)
         
         pid_layout.addWidget(QLabel("D:"), row, 5)
         self.yaw_angle_d = QDoubleSpinBox()
         self.yaw_angle_d.setRange(0, 100)
-        self.yaw_angle_d.setDecimals(3)
-        self.yaw_angle_d.setSingleStep(0.001)
+        self.yaw_angle_d.setDecimals(5)
+        self.yaw_angle_d.setSingleStep(0.0001)
         pid_layout.addWidget(self.yaw_angle_d, row, 6)
         
         self.yaw_angle_set_btn = QPushButton("设置")
@@ -4059,22 +4693,22 @@ class YawDebugPanel(QWidget):
         pid_layout.addWidget(QLabel("P:"), row, 1)
         self.yaw_gyro_p = QDoubleSpinBox()
         self.yaw_gyro_p.setRange(0, 100)
-        self.yaw_gyro_p.setDecimals(3)
-        self.yaw_gyro_p.setSingleStep(0.1)
+        self.yaw_gyro_p.setDecimals(4)
+        self.yaw_gyro_p.setSingleStep(0.0001)
         pid_layout.addWidget(self.yaw_gyro_p, row, 2)
         
         pid_layout.addWidget(QLabel("I:"), row, 3)
         self.yaw_gyro_i = QDoubleSpinBox()
         self.yaw_gyro_i.setRange(0, 100)
-        self.yaw_gyro_i.setDecimals(3)
-        self.yaw_gyro_i.setSingleStep(0.01)
+        self.yaw_gyro_i.setDecimals(4)
+        self.yaw_gyro_i.setSingleStep(0.001)
         pid_layout.addWidget(self.yaw_gyro_i, row, 4)
         
         pid_layout.addWidget(QLabel("D:"), row, 5)
         self.yaw_gyro_d = QDoubleSpinBox()
         self.yaw_gyro_d.setRange(0, 100)
-        self.yaw_gyro_d.setDecimals(3)
-        self.yaw_gyro_d.setSingleStep(0.001)
+        self.yaw_gyro_d.setDecimals(5)
+        self.yaw_gyro_d.setSingleStep(0.0001)
         pid_layout.addWidget(self.yaw_gyro_d, row, 6)
         
         self.yaw_gyro_set_btn = QPushButton("设置")
@@ -4284,8 +4918,8 @@ class VMCDebugPanel(QWidget):
         world_layout.addWidget(QLabel("K_vx (速度反馈):"), 0, 0)
         self.kvx_input = QDoubleSpinBox()
         self.kvx_input.setRange(-100, 100)
-        self.kvx_input.setDecimals(3)
-        self.kvx_input.setSingleStep(0.1)
+        self.kvx_input.setDecimals(4)
+        self.kvx_input.setSingleStep(0.01)
         self.kvx_input.setValue(0.0)
         world_layout.addWidget(self.kvx_input, 0, 1)
         self.kvx_set_btn = QPushButton("设置")
@@ -4394,8 +5028,8 @@ class VMCDebugPanel(QWidget):
         common_layout.addWidget(QLabel("机器人质量 (kg):"), 1, 0)
         self.mass_input = QDoubleSpinBox()
         self.mass_input.setRange(0.1, 50)
-        self.mass_input.setDecimals(2)
-        self.mass_input.setSingleStep(0.1)
+        self.mass_input.setDecimals(3)
+        self.mass_input.setSingleStep(0.01)
         self.mass_input.setValue(1.0)  # 默认 1.0 kg
         common_layout.addWidget(self.mass_input, 1, 1)
         self.mass_set_btn = QPushButton("设置")
@@ -4418,8 +5052,8 @@ class VMCDebugPanel(QWidget):
         common_layout.addWidget(QLabel("目标速度 (m/s):"), 3, 0)
         self.vx_input = QDoubleSpinBox()
         self.vx_input.setRange(-2, 2)
-        self.vx_input.setDecimals(2)
-        self.vx_input.setSingleStep(0.1)
+        self.vx_input.setDecimals(3)
+        self.vx_input.setSingleStep(0.01)
         self.vx_input.setValue(0.0)
         common_layout.addWidget(self.vx_input, 3, 1)
         self.vx_set_btn = QPushButton("设置")
@@ -4456,8 +5090,8 @@ class VMCDebugPanel(QWidget):
         pitch_param_layout.addWidget(QLabel("Pitch Kp:"), 0, 0)
         self.pitch_kp_input = QDoubleSpinBox()
         self.pitch_kp_input.setRange(0, 100)
-        self.pitch_kp_input.setDecimals(2)
-        self.pitch_kp_input.setSingleStep(0.5)
+        self.pitch_kp_input.setDecimals(3)
+        self.pitch_kp_input.setSingleStep(0.05)
         self.pitch_kp_input.setValue(0.0)  # 默认 0
         pitch_param_layout.addWidget(self.pitch_kp_input, 0, 1)
         self.pitch_kp_set_btn = QPushButton("设置")
@@ -4468,8 +5102,8 @@ class VMCDebugPanel(QWidget):
         pitch_param_layout.addWidget(QLabel("Pitch Kd:"), 1, 0)
         self.pitch_kd_input = QDoubleSpinBox()
         self.pitch_kd_input.setRange(0, 50)
-        self.pitch_kd_input.setDecimals(2)
-        self.pitch_kd_input.setSingleStep(0.1)
+        self.pitch_kd_input.setDecimals(3)
+        self.pitch_kd_input.setSingleStep(0.01)
         self.pitch_kd_input.setValue(0.0)  # 默认 0
         pitch_param_layout.addWidget(self.pitch_kd_input, 1, 1)
         self.pitch_kd_set_btn = QPushButton("设置")
@@ -4524,8 +5158,8 @@ class VMCDebugPanel(QWidget):
         sync_param_layout.addWidget(QLabel("K_sync (P增益 Nm/rad):"), 0, 0)
         self.sync_kp_input = QDoubleSpinBox()
         self.sync_kp_input.setRange(0, 50)
-        self.sync_kp_input.setDecimals(3)
-        self.sync_kp_input.setSingleStep(0.1)
+        self.sync_kp_input.setDecimals(4)
+        self.sync_kp_input.setSingleStep(0.01)
         self.sync_kp_input.setValue(0.0)  # 默认 0
         self.sync_kp_input.setToolTip("角度差比例增益：越大响应越快，但可能震荡")
         sync_param_layout.addWidget(self.sync_kp_input, 0, 1)
@@ -5012,6 +5646,12 @@ class PIDTunerUI(QMainWindow):
         self.lpf_panels['roll'] = LPFControlPanel("Roll角度滤波", "L", self)
         self.tab_widget.addTab(_make_scrollable(self.lpf_panels['roll']), "L - Roll滤波")
         
+        self.lpf_panels['gyro'] = GyroFilterPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.lpf_panels['gyro']), "N - 角速度滤波")
+        
+        self.lpf_panels['speed'] = SpeedFilterPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.lpf_panels['speed']), "W - 轮速滤波")
+        
         # 速度自适应面板
         self.speed_adaptive_panel = SpeedAdaptivePanel(self)
         self.tab_widget.addTab(_make_scrollable(self.speed_adaptive_panel), "M - 速度自适应P")
@@ -5185,7 +5825,9 @@ class PIDTunerUI(QMainWindow):
                     lpf_map = {
                         'G': 'joyy',      # 摇杆滤波
                         'J': 'zeropoint', # 零点滤波
-                        'L': 'roll'       # Roll滤波
+                        'L': 'roll',      # Roll滤波
+                        'N': 'gyro',      # 角速度滤波
+                        'W': 'speed',     # 轮速滤波
                     }
                     
                     # 轮速调试面板映射
@@ -5616,6 +6258,53 @@ class PIDTunerUI(QMainWindow):
             high = float(match.group(2))
             if self.speed_adaptive_panel:
                 self.speed_adaptive_panel.update_display(low, high)
+        
+        # 解析轮速滤波参数 (双模式)
+        # 格式: SpeedFilter: Mode=0 Tf=0.0100 Rate=50.0000
+        match = re.search(r'SpeedFilter:\s*Mode=(\d+)\s*Tf=([-\d.]+)\s*Rate=([-\d.]+)', line)
+        if match:
+            mode = int(match.group(1))
+            tf = float(match.group(2))
+            rate = float(match.group(3))
+            if 'speed' in self.lpf_panels and isinstance(self.lpf_panels['speed'], SpeedFilterPanel):
+                self.lpf_panels['speed'].update_display(mode, tf, rate)
+        
+        # 解析角速度滤波参数 (双模式)
+        # 格式: GyroFilter: Mode=1 Tf=0.0050 Rate=500.0000
+        match = re.search(r'GyroFilter:\s*Mode=(\d+)\s*Tf=([-\d.]+)\s*Rate=([-\d.]+)', line)
+        if match:
+            mode = int(match.group(1))
+            tf = float(match.group(2))
+            rate = float(match.group(3))
+            if 'gyro' in self.lpf_panels and isinstance(self.lpf_panels['gyro'], GyroFilterPanel):
+                self.lpf_panels['gyro'].update_display(mode, tf, rate)
+        
+        # 解析角度零点查询响应
+        # 格式: Current angle zeropoint: %.2f (所有控制器共用)
+        match = re.search(r'Current angle zeropoint:\s*([-\d.]+)', line)
+        if match:
+            zeropoint = float(match.group(1))
+            # 更新 LQR 面板的零点 spinbox
+            if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zero_input'):
+                self.balance_panel.zero_input.setValue(zeropoint)
+            # 更新 DualPID 面板的零点 spinbox
+            if hasattr(self, 'dual_pid_panel') and hasattr(self.dual_pid_panel, 'zero_input'):
+                self.dual_pid_panel.zero_input.setValue(zeropoint)
+            self.log(f"✓ 零点已同步: {zeropoint:.2f}°", is_receive=True)
+        
+        # 解析零点设置确认响应
+        # 格式: Angle zeropoint set to %.2f (LQR)
+        # 格式: Dual PID angle zeropoint set to %.2f
+        # 格式: Single PID angle zeropoint set to %.2f
+        match = re.search(r'(?:Dual PID |Single PID )?[Aa]ngle zeropoint set to\s*([-\d.]+)', line)
+        if match:
+            zeropoint = float(match.group(1))
+            # 设置后同步到所有面板 (固件已同步所有控制器)
+            if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zero_input'):
+                self.balance_panel.zero_input.setValue(zeropoint)
+            if hasattr(self, 'dual_pid_panel') and hasattr(self.dual_pid_panel, 'zero_input'):
+                self.dual_pid_panel.zero_input.setValue(zeropoint)
+            self.log(f"✓ 零点已设置: {zeropoint:.2f}°", is_receive=True)
         
         # ===== 新增: 设备控制面板数据解析 =====
         

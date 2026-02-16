@@ -17,13 +17,13 @@ static const char *TAG = "LQR_BALANCE";
 // ============== 默认参数 ==============
 static const lqr_params_t default_params = {
     // 角度环 PID
-    .angle_kp = 0.022f,
-    .angle_ki = 0.001f,
-    .angle_kd = 0.0004f,
+    .angle_kp = 0.036f,
+    .angle_ki = 0.000f,
+    .angle_kd = 0.000f,
     .angle_limit = 30.0f,
     
     // 角速度环 PID
-    .gyro_kp = 0.0003f,
+    .gyro_kp = 0.0005f,
     .gyro_ki = 0.0f,
     .gyro_kd = 0.0f,
     .gyro_limit = 16.0f,
@@ -45,7 +45,7 @@ static const lqr_params_t default_params = {
     // LQR 输出 PID
     .lqr_u_kp = 1.0f,
     .lqr_u_ki = 0.5f,
-    .lqr_u_kd = 0.01f,
+    .lqr_u_kd = 0.0f,
     .lqr_u_limit = 20.0f,
     
     // 偏航控制 PID
@@ -78,6 +78,16 @@ static const lqr_params_t default_params = {
     .lpf_joyy_tf = 0.2f,
     .lpf_zeropoint_tf = 0.08f,
     .lpf_roll_tf = 0.1f,
+    .lpf_gyro_tf = 0.005f,
+    .lpf_speed_tf = 0.01f,
+    
+    // 角速度滤波模式
+    .gyro_filter_mode = 1,       // 默认使用限幅滤波
+    .gyro_slew_rate = 1000.0f,    // 限幅滤波最大变化率 (度/秒 per second)
+    
+    // 轮速滤波模式
+    .speed_filter_mode = 1,      // 默认使用限幅滤波
+    .speed_slew_rate = 50.0f,    // 限幅滤波最大变化率 (m/s per second)
     
     // 安全阈值
     .emergency_angle = 45.0f,
@@ -156,6 +166,12 @@ esp_err_t lqr_init(lqr_controller_t *ctrl, const lqr_params_t *params) {
     lpf_init(&ctrl->lpf_joyy, p->lpf_joyy_tf);
     lpf_init(&ctrl->lpf_zeropoint, p->lpf_zeropoint_tf);
     lpf_init(&ctrl->lpf_roll, p->lpf_roll_tf);
+    lpf_init(&ctrl->lpf_gyro, p->lpf_gyro_tf);
+    lpf_init(&ctrl->lpf_speed, p->lpf_speed_tf);
+    
+    // 初始化限幅滤波器
+    slewrate_init(&ctrl->sr_gyro, p->gyro_slew_rate);
+    slewrate_init(&ctrl->sr_speed, p->speed_slew_rate);
     
     // 初始化状态
     ctrl->distance_zeropoint = 0.0f;
@@ -192,6 +208,12 @@ void lqr_reset(lqr_controller_t *ctrl) {
     lpf_reset(&ctrl->lpf_joyy);
     lpf_reset(&ctrl->lpf_zeropoint);
     lpf_reset(&ctrl->lpf_roll);
+    lpf_reset(&ctrl->lpf_gyro);
+    lpf_reset(&ctrl->lpf_speed);
+    
+    // 重置限幅滤波器
+    slewrate_reset(&ctrl->sr_gyro);
+    slewrate_reset(&ctrl->sr_speed);
     
     // 重置状态
     ctrl->distance_zeropoint = 0.0f;
@@ -242,6 +264,12 @@ void lqr_set_params(lqr_controller_t *ctrl, const lqr_params_t *params) {
     lpf_set_tf(&ctrl->lpf_joyy, p->lpf_joyy_tf);
     lpf_set_tf(&ctrl->lpf_zeropoint, p->lpf_zeropoint_tf);
     lpf_set_tf(&ctrl->lpf_roll, p->lpf_roll_tf);
+    lpf_set_tf(&ctrl->lpf_gyro, p->lpf_gyro_tf);
+    lpf_set_tf(&ctrl->lpf_speed, p->lpf_speed_tf);
+    
+    // 更新限幅滤波器
+    slewrate_set_max_rate(&ctrl->sr_gyro, p->gyro_slew_rate);
+    slewrate_set_max_rate(&ctrl->sr_speed, p->speed_slew_rate);
 }
 
 void lqr_set_angle_zeropoint(lqr_controller_t *ctrl, float zeropoint) {
@@ -293,9 +321,28 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     // ===== 使用外部传入的 LQR 状态量 =====
     // 位移和速度由外部 (balance_test.c) 计算，已经考虑了电机方向
     float lqr_angle = input->pitch;           // 俯仰角
-    float lqr_gyro = input->pitch_rate;       // 俯仰角速度
+    
+    // 角速度滤波: 根据模式选择 LPF 或 限幅滤波
+    float lqr_gyro;
+    if (ctrl->params.gyro_filter_mode == 1) {
+        // 限幅滤波 (slew-rate limiter): 小变化直通, 大变化钳位
+        lqr_gyro = slewrate_compute_dt(&ctrl->sr_gyro, input->pitch_rate, dt);
+    } else {
+        // 低通滤波 (LPF)
+        lqr_gyro = lpf_compute_dt(&ctrl->lpf_gyro, input->pitch_rate, dt);
+    }
+    
     float lqr_distance = input->lqr_distance; // 累积位移 (由外部计算)
-    float lqr_speed = input->lqr_speed;       // 平均速度 (由外部计算)
+    
+    // 轮速滤波: 根据模式选择 LPF 或 限幅滤波
+    float lqr_speed;
+    if (ctrl->params.speed_filter_mode == 1) {
+        // 限幅滤波 (slew-rate limiter): 小变化直通, 大变化钳位
+        lqr_speed = slewrate_compute_dt(&ctrl->sr_speed, input->lqr_speed, dt);
+    } else {
+        // 低通滤波 (默认)
+        lqr_speed = lpf_compute_dt(&ctrl->lpf_speed, input->lqr_speed, dt);
+    }
     
     // ===== 速度输入滤波 =====
     float filtered_target_speed = lpf_compute_dt(&ctrl->lpf_joyy, input->target_speed, dt);
@@ -366,6 +413,8 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     output->filtered_target_speed = filtered_target_speed;  // 滤波后的目标速度
     output->zeropoint_adjust_raw = zeropoint_adjust_raw;    // 零点调整原始值
     output->zeropoint_adjust_filtered = zeropoint_adjust_filtered; // 零点调整滤波后
+    output->filtered_gyro = lqr_gyro;                       // 滤波后的角速度
+    output->filtered_speed = lqr_speed;                     // 滤波后的轮速
     
     output->state = LQR_STATE_BALANCING;
     output->wheel_on_ground = true;
@@ -486,11 +535,11 @@ void lqr_set_loop_enable(lqr_controller_t *ctrl,
                          float lqr_u_en) {
     if (ctrl == NULL) return;
     
-    ctrl->params.angle_enable = clamp_f(angle_en, 0.0f, 1.0f);
-    ctrl->params.gyro_enable = clamp_f(gyro_en, 0.0f, 1.0f);
-    ctrl->params.distance_enable = clamp_f(distance_en, 0.0f, 1.0f);
-    ctrl->params.speed_enable = clamp_f(speed_en, 0.0f, 1.0f);
-    ctrl->params.lqr_u_enable = clamp_f(lqr_u_en, 0.0f, 1.0f);
+    ctrl->params.angle_enable = clamp_f(angle_en, 0.0f, 5.0f);
+    ctrl->params.gyro_enable = clamp_f(gyro_en, 0.0f, 5.0f);
+    ctrl->params.distance_enable = clamp_f(distance_en, 0.0f, 5.0f);
+    ctrl->params.speed_enable = clamp_f(speed_en, 0.0f, 5.0f);
+    ctrl->params.lqr_u_enable = clamp_f(lqr_u_en, 0.0f, 5.0f);
     // Note: Removed ESP_LOGI to avoid blocking in real-time control loop
 }
 

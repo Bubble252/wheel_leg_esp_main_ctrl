@@ -183,6 +183,100 @@ static void handle_speed_adaptive_command(char param, float value)
 }
 
 /**
+ * @brief 处理角速度滤波命令 (双模式: LPF / 限幅)
+ * 协议:
+ *   N? = 查询 → "GyroFilter: Mode=1 Tf=0.0050 Rate=500.0000"
+ *   NT<value> = 设置 LPF Tf
+ *   NM<value> = 设置模式 (0=LPF, 1=限幅)
+ *   NR<value> = 设置限幅最大变化率
+ */
+static void handle_gyro_filter_command(char param, float value)
+{
+    if (param == PARAM_QUERY) {
+        if (s_query_callback) {
+            commander_pid_params_t params;
+            if (s_query_callback(CTRL_ID_GYRO_LPF, &params)) {
+                // params.lpf_tf = Tf, params.p = mode, params.i = slew_rate
+                printf("GyroFilter: Mode=%d Tf=%.4f Rate=%.4f\n",
+                       (int)params.p, params.lpf_tf, params.i);
+            } else {
+                printf("[%s] Query callback failed for GyroFilter\n", TAG);
+            }
+        } else {
+            printf("[%s] No query callback registered for GyroFilter\n", TAG);
+        }
+        return;
+    }
+
+    switch (param) {
+        case 'T':
+            printf("[%s] GyroFilter.Tf = %.4f\n", TAG, value);
+            break;
+        case 'M':
+            printf("[%s] GyroFilter.Mode = %d (%s)\n", TAG, (int)value,
+                   (int)value == 0 ? "LPF" : "SlewRate");
+            break;
+        case 'R':
+            printf("[%s] GyroFilter.Rate = %.4f\n", TAG, value);
+            break;
+        default:
+            printf("[%s] Unknown GyroFilter param: %c\n", TAG, param);
+            return;
+    }
+
+    if (s_set_callback) {
+        s_set_callback(CTRL_ID_GYRO_LPF, param, value);
+    }
+}
+
+/**
+ * @brief 处理轮速滤波命令 (双模式: LPF / 限幅)
+ * 协议:
+ *   W? = 查询 → "SpeedFilter: Mode=0 Tf=0.0100 Rate=50.0000"
+ *   WT<value> = 设置 LPF Tf
+ *   WM<value> = 设置模式 (0=LPF, 1=限幅)
+ *   WR<value> = 设置限幅最大变化率
+ */
+static void handle_speed_filter_command(char param, float value)
+{
+    if (param == PARAM_QUERY) {
+        if (s_query_callback) {
+            commander_pid_params_t params;
+            if (s_query_callback(CTRL_ID_SPEED_LPF, &params)) {
+                // params.lpf_tf = Tf, params.p = mode, params.i = slew_rate
+                printf("SpeedFilter: Mode=%d Tf=%.4f Rate=%.4f\n",
+                       (int)params.p, params.lpf_tf, params.i);
+            } else {
+                printf("[%s] Query callback failed for SpeedFilter\n", TAG);
+            }
+        } else {
+            printf("[%s] No query callback registered for SpeedFilter\n", TAG);
+        }
+        return;
+    }
+
+    switch (param) {
+        case 'T':
+            printf("[%s] SpeedFilter.Tf = %.4f\n", TAG, value);
+            break;
+        case 'M':
+            printf("[%s] SpeedFilter.Mode = %d (%s)\n", TAG, (int)value,
+                   (int)value == 0 ? "LPF" : "SlewRate");
+            break;
+        case 'R':
+            printf("[%s] SpeedFilter.Rate = %.4f\n", TAG, value);
+            break;
+        default:
+            printf("[%s] Unknown SpeedFilter param: %c\n", TAG, param);
+            return;
+    }
+
+    if (s_set_callback) {
+        s_set_callback(CTRL_ID_SPEED_LPF, param, value);
+    }
+}
+
+/**
  * @brief 应用解析后的命令
  */
 static void apply_command(const commander_cmd_t *cmd)
@@ -209,6 +303,16 @@ static void apply_command(const commander_cmd_t *cmd)
             handle_lpf_command(cmd->controller_id, cmd->param_char, cmd->value);
             break;
             
+        // 角速度滤波 (双模式: LPF / 限幅)
+        case CTRL_ID_GYRO_LPF:
+            handle_gyro_filter_command(cmd->param_char, cmd->value);
+            break;
+            
+        // 轮速滤波 (双模式: LPF / 限幅)
+        case CTRL_ID_SPEED_LPF:
+            handle_speed_filter_command(cmd->param_char, cmd->value);
+            break;
+            
         // 速度自适应
         case CTRL_ID_SPEED_ADAPT:
             handle_speed_adaptive_command(cmd->param_char, cmd->value);
@@ -231,7 +335,7 @@ int commander_parser_init(commander_callback_t set_callback,
     memset(s_recv_buffer, 0, sizeof(s_recv_buffer));
     
     printf("[%s] Commander parser initialized\n", TAG);
-    printf("[%s] Supported controllers: A-F (PID), G/J/L (LPF), H/I/K (PID), M (SpeedAdapt)\n", TAG);
+    printf("[%s] Supported controllers: A-F (PID), G/J/L (LPF), H/I/K (PID), M (SpeedAdapt), N (GyroFilter), W (SpeedFilter)\n", TAG);
     return 0;
 }
 
@@ -402,6 +506,18 @@ void commander_print_params(void)
         }
         if (s_query_callback(CTRL_ID_ROLL_LPF, &params)) {
             printf("[L-RollLPF] Tf=%.4f\n", params.lpf_tf);
+        }
+        
+        printf("\n--- Gyro Filter ---\n");
+        if (s_query_callback(CTRL_ID_GYRO_LPF, &params)) {
+            printf("[N-GyroFilter] Mode=%d Tf=%.4f Rate=%.4f\n",
+                   (int)params.p, params.lpf_tf, params.i);
+        }
+        
+        printf("\n--- Speed Filter ---\n");
+        if (s_query_callback(CTRL_ID_SPEED_LPF, &params)) {
+            printf("[W-SpeedFilter] Mode=%d Tf=%.4f Rate=%.4f\n",
+                   (int)params.p, params.lpf_tf, params.i);
         }
         
         printf("\n--- Speed Adaptive ---\n");

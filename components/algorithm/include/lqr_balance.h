@@ -103,6 +103,16 @@ typedef struct {
     float lpf_joyy_tf;      // 摇杆输入滤波 (默认 0.2)
     float lpf_zeropoint_tf; // 零点滤波 (默认 0.08)
     float lpf_roll_tf;      // 横滚滤波 (默认 0.1)
+    float lpf_gyro_tf;      // 角速度滤波 (默认 0.005, 消除IMU阶梯跳变)
+    float lpf_speed_tf;     // 轮速滤波 (默认 0.01, 消除编码器噪声)
+    
+    // 角速度滤波模式
+    uint8_t gyro_filter_mode;   // 0=LPF, 1=限幅滤波 (slew-rate)
+    float gyro_slew_rate;       // 限幅滤波最大变化率 (度/秒²，默认 500.0)
+    
+    // 轮速滤波模式
+    uint8_t speed_filter_mode;  // 0=LPF, 1=限幅滤波 (slew-rate)
+    float speed_slew_rate;      // 限幅滤波最大变化率 (单位/秒, 默认 50.0)
     
     // 安全阈值
     float emergency_angle;  // 紧急停止角度 (默认 45 度)
@@ -192,6 +202,8 @@ typedef struct {
     float filtered_target_speed; // 滤波后的目标速度
     float zeropoint_adjust_raw;  // 零点调整原始值 (滤波前)
     float zeropoint_adjust_filtered; // 零点调整滤波后值
+    float filtered_gyro;         // 滤波后的角速度
+    float filtered_speed;        // 滤波后的轮速
     
     // 状态
     lqr_state_t state;          // 当前状态
@@ -227,6 +239,12 @@ typedef struct {
     lowpass_filter_t lpf_joyy;      // 速度输入滤波
     lowpass_filter_t lpf_zeropoint; // 零点滤波
     lowpass_filter_t lpf_roll;      // 横滚滤波
+    lowpass_filter_t lpf_gyro;      // 角速度滤波
+    lowpass_filter_t lpf_speed;     // 轮速滤波
+    
+    // 限幅滤波器 (slew-rate limiter)
+    slewrate_filter_t sr_gyro;      // 角速度限幅滤波
+    slewrate_filter_t sr_speed;     // 轮速限幅滤波
     
     // 参数
     lqr_params_t params;

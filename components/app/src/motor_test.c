@@ -832,7 +832,7 @@ static void process_command(char *cmd) {
     }
     // ========== Commander 协议直接解析 (用于PID调参面板) ==========
     else if (strlen(token) >= 2 && 
-             (token[0] >= 'A' && token[0] <= 'M') &&
+             ((token[0] >= 'A' && token[0] <= 'N') || token[0] == 'W') &&
              (token[1] == 'P' || token[1] == 'I' || token[1] == 'D' || 
               token[1] == 'L' || token[1] == 'R' || token[1] == 'T' ||
               token[1] == 'H' || token[1] == 'M' || token[1] == '?')) {
