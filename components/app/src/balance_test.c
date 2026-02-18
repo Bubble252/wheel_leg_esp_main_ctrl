@@ -239,6 +239,10 @@ static float g_angle_zeropoint = 0.0f;      // 角度零点 (需要根据实际�
 static int g_move_stop_flag = 0;            // 停止标志
 static int g_uncontrolable = 0;             // 失控标志
 
+// 遥杆映射比例 (可通过 UI/CLI 在线调节)
+static float g_joy_speed_scale = 0.003f;    // joy_y → target_speed 比例 (默认 0.003, max ±0.3)
+static float g_joy_yaw_scale = 0.03f;       // joy_x → target_yaw_rate 比例 (默认 0.03)
+
 // 轮速加速度计算 (用于离地检测)
 static float g_left_wheel_speed_rad = 0.0f;     // 左轮速度 (rad/s)
 static float g_right_wheel_speed_rad = 0.0f;    // 右轮速度 (rad/s)
@@ -444,6 +448,9 @@ static void commander_param_callback(char controller_id, char param_char, float 
             if (param_char == 'T') {
                 params.lpf_joyy_tf = value;
                 updated = true;
+                // 同步更新 Dual PID 的遥杆滤波器
+                g_dual_pid_ctrl.params.lpf_joyy_tf = value;
+                lpf_set_tf(&g_dual_pid_ctrl.lpf_joyy, value);
             }
             break;
             
@@ -510,6 +517,15 @@ static void commander_param_callback(char controller_id, char param_char, float 
                 case 'R': params.speed_slew_rate = value; updated = true; break;   // 限幅最大变化率
             }
             break;
+            
+        case CTRL_ID_JOY_SCALE:  // X - 遥杆映射比例
+            switch (param_char) {
+                case 'P': g_joy_speed_scale = value; break;  // joy_y → speed 比例
+                case 'I': g_joy_yaw_scale = value; break;    // joy_x → yaw 比例
+            }
+            // 不走 lqr_set_params, 直接生效
+            ESP_LOGI(TAG, "Joy scale updated: speed=%.6f, yaw=%.6f", g_joy_speed_scale, g_joy_yaw_scale);
+            return;  // 直接返回, 不调 lqr_set_params
     }
     
     if (updated) {
@@ -635,6 +651,11 @@ static bool commander_query_callback(char controller_id, commander_pid_params_t 
             params->i = p->speed_slew_rate;
             return true;
             
+        case CTRL_ID_JOY_SCALE:  // X - 遥杆映射比例
+            params->p = g_joy_speed_scale;
+            params->i = g_joy_yaw_scale;
+            return true;
+            
         default:
             return false;
     }
@@ -742,7 +763,7 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     if (PLOT_CH_ENABLED('F')) printf("#DATA,F,%.2f,%.2f\n", input->target_yaw_rate, input->yaw_rate);
     if (PLOT_CH_ENABLED('G')) printf("#DATA,G,%.2f,%.2f\n", input->target_speed, output->filtered_target_speed);
     if (PLOT_CH_ENABLED('H')) printf("#DATA,H,0.0,%.2f\n", g_last_lqr_u);
-    if (PLOT_CH_ENABLED('I')) printf("#DATA,I,0.0,%.3f\n", g_lqr_ctrl.distance_zeropoint);
+    if (PLOT_CH_ENABLED('I')) printf("#DATA,I,0.0,%.3f\n", g_angle_zeropoint);
     if (PLOT_CH_ENABLED('J')) printf("#DATA,J,%.4f,%.4f\n", output->zeropoint_adjust_raw, output->zeropoint_adjust_filtered);
     if (PLOT_CH_ENABLED('K')) printf("#DATA,K,0.0,%.2f\n", input->roll);
     if (PLOT_CH_ENABLED('L')) {
@@ -2500,8 +2521,8 @@ static void compute_balance_output(float dt) {
         .lqr_distance = g_lqr_distance,         // 累积位移 (已考虑电机方向)
         .lqr_speed = g_lqr_speed,               // 当前速度 (已考虑电机方向)
         .yaw_total = g_yaw_angle_total,         // YAW 累积角度 (用于方向保持)
-        .target_speed = remote.joy_y * 0.003f,   // joy_y (-100~100) -> target speed (max ±0.1 m/s)
-        .target_yaw_rate = -remote.joy_x * 0.03f,  // joy_x -> target yaw rate
+        .target_speed = remote.joy_y * g_joy_speed_scale,   // joy_y (-100~100) -> target speed
+        .target_yaw_rate = -remote.joy_x * g_joy_yaw_scale,  // joy_x -> target yaw rate
         .dt = dt,
     };
     
@@ -2554,7 +2575,8 @@ static void compute_balance_output(float dt) {
         
         esp_err_t ret = dual_pid_balance_loop(&g_dual_pid_ctrl, 
                                                pitch_for_control, imu.pitch_rate,
-                                               wheel_speed_avg, dt,
+                                               wheel_speed_avg, input.target_speed,
+                                               dt,
                                                &g_dual_pid_output);
         
         if (ret != ESP_OK || g_dual_pid_output.emergency) {
@@ -2839,6 +2861,36 @@ static void compute_balance_output(float dt) {
         }
         }  // end of LQR balance_loop success
     }  // end of LQR mode
+    
+    // ======== 角度零点自动调整 (重心补偿, 所有模式通用) ========
+    // 原理: 静止时如果角度持续偏离零点, 说明重心不在正上方,
+    //       缓慢修正 angle_zeropoint 使平均角度误差趋向零.
+    // 参数通过 Commander ID='I' (zeropoint_kp/ki/kd) 可调.
+    {
+        // 计算当前角度误差 (所有模式统一使用 pitch_for_control)
+        float angle_err_for_auto = pitch_for_control - g_angle_zeropoint;
+        
+        float zp_raw = 0.0f, zp_filtered = 0.0f;
+        float zp_delta = lqr_zeropoint_auto_adjust(&g_lqr_ctrl, angle_err_for_auto,
+                                                     g_lqr_speed, dt,
+                                                     &zp_raw, &zp_filtered);
+        
+        if (fabsf(zp_delta) > 0.0f) {
+            // 累加到全局角度零点, 并同步到所有控制器
+            g_angle_zeropoint += zp_delta;
+            lqr_set_angle_zeropoint(&g_lqr_ctrl, g_angle_zeropoint);
+            if (g_dual_pid_initialized) {
+                dual_pid_set_angle_zeropoint(&g_dual_pid_ctrl, g_angle_zeropoint);
+            }
+            if (g_single_pid_initialized) {
+                single_pid_set_angle_zeropoint(&g_single_pid_ctrl, g_angle_zeropoint);
+            }
+        }
+        
+        // 保存到 output 用于波形显示 (I/J 通道)
+        output.zeropoint_adjust_raw = zp_raw;
+        output.zeropoint_adjust_filtered = zp_filtered;
+    }
     
     // ======== X-Offset 计算 (非 LQR 模式: Dual PID / Single PID) ========
     // LQR 模式的 x_offset 已在上面计算, 这里处理 Dual PID 和 Single PID 模式
@@ -4281,9 +4333,11 @@ void balance_test_process_cmd(const char *cmd_str) {
                        g_dual_pid_ctrl.params.speed_kd, g_dual_pid_ctrl.params.speed_limit);
             }
             printf("Angle zeropoint: %.2f deg\n", g_dual_pid_ctrl.params.angle_zeropoint);
+            printf("Speed cmd gain: %.1f (SPEED_FIRST 外环指令增益)\n", g_dual_pid_ctrl.params.speed_cmd_gain);
             printf("Max torque: %.1f Nm\n", g_dual_pid_ctrl.params.max_torque);
             printf("\nUsage: balance dpid angle <kp> <ki> <kd>\n");
             printf("       balance dpid speed <kp> <ki> <kd>\n");
+            printf("       balance dpid gain <value>  (speed_cmd_gain for SPEED_FIRST)\n");
             printf("       balance dpid zero <degrees>\n");
             printf("       balance dpid order <0|1>  (0=ANGLE_FIRST, 1=SPEED_FIRST)\n");
             printf("       balance dpid reset\n");
@@ -4322,6 +4376,19 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Speed PID set: kp=%.2f ki=%.2f kd=%.3f\n", kp, ki, kd);
             // 输出 Qt 可解析格式
             printf("DPID:SPEED,%.4f,%.4f,%.4f\n", kp, ki, kd);
+        } else if (strcmp(token, "gain") == 0) {
+            // 设置 speed_cmd_gain (SPEED_FIRST 外环指令增益)
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float gain = atof(token);
+                g_dual_pid_ctrl.params.speed_cmd_gain = gain;
+                printf("Speed cmd gain set to %.1f\n", gain);
+                printf("DPID:GAIN,%.4f\n", gain);
+            } else {
+                printf("Current speed_cmd_gain: %.1f\n", g_dual_pid_ctrl.params.speed_cmd_gain);
+                printf("Usage: balance dpid gain <value>\n");
+                printf("  在 SPEED_FIRST 模式中, target_speed 会乘以此增益再送入速度外环\n");
+            }
         } else if (strcmp(token, "zero") == 0) {
             // 设置角度零点 (同步到所有控制器)
             token = strtok(NULL, " \t\n\r");
@@ -4384,7 +4451,7 @@ void balance_test_process_cmd(const char *cmd_str) {
                    g_dual_pid_ctrl.params.loop_order);
         } else {
             printf("Unknown dpid command: %s\n", token);
-            printf("Usage: balance dpid [angle|speed|zero|order|reset|status]\n");
+            printf("Usage: balance dpid [angle|speed|gain|zero|order|reset|status]\n");
         }
     }
     // ===== 单环 PID 调参命令 =====
@@ -4464,9 +4531,44 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance spid [angle|limit|zero|reset|status]\n");
         }
     }
+    // ===== 遥杆映射比例调节 =====
+    else if (strcmp(token, "joy") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("=== Joystick Scale ===\n");
+            printf("Speed scale: %.6f (joy_y * scale → target_speed, max ±%.3f)\n",
+                   g_joy_speed_scale, 100.0f * g_joy_speed_scale);
+            printf("Yaw scale:   %.6f (joy_x * scale → target_yaw_rate, max ±%.3f)\n",
+                   g_joy_yaw_scale, 100.0f * g_joy_yaw_scale);
+            printf("Usage: balance joy [speed <scale>|yaw <scale>]\n");
+        } else if (strcmp(token, "speed") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_joy_speed_scale = atof(token);
+                printf("Joy speed scale = %.6f (max speed ±%.3f)\n",
+                       g_joy_speed_scale, 100.0f * g_joy_speed_scale);
+            } else {
+                printf("Current speed scale = %.6f (max speed ±%.3f)\n",
+                       g_joy_speed_scale, 100.0f * g_joy_speed_scale);
+            }
+        } else if (strcmp(token, "yaw") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_joy_yaw_scale = atof(token);
+                printf("Joy yaw scale = %.6f (max yaw rate ±%.3f)\n",
+                       g_joy_yaw_scale, 100.0f * g_joy_yaw_scale);
+            } else {
+                printf("Current yaw scale = %.6f (max yaw rate ±%.3f)\n",
+                       g_joy_yaw_scale, 100.0f * g_joy_yaw_scale);
+            }
+        } else {
+            printf("Unknown joy command: %s\n", token);
+            printf("Usage: balance joy [speed <scale>|yaw <scale>]\n");
+        }
+    }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|joy]\n");
     }
 }
 

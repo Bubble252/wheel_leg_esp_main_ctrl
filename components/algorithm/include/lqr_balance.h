@@ -428,6 +428,26 @@ esp_err_t lqr_roll_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr_ro
 void lqr_roll_reset(lqr_controller_t *ctrl);
 
 /**
+ * @brief 角度零点自动调整 (重心补偿, 所有模式通用)
+ * @param ctrl 控制器实例 (使用其 pid_zeropoint 和 lpf_zeropoint)
+ * @param angle_error 当前角度误差 = pitch - angle_zeropoint (度)
+ * @param wheel_speed 当前轮速 (m/s 或 rad/s, 用于判断是否静止)
+ * @param dt 时间步长 (秒)
+ * @param out_raw [out] 零点调整原始值 (可为NULL)
+ * @param out_filtered [out] 零点调整滤波后值 (可为NULL)
+ * @return 本次角度零点增量 (度), 调用者应累加到 angle_zeropoint
+ * 
+ * @note 原理: 当机器人静止时, 如果角度持续偏离零点, 说明重心不在正上方.
+ *       通过缓慢调整 angle_zeropoint 使得平均角度误差趋向零.
+ *       使用 zeropoint_kp/ki/kd PID + lpf_zeropoint 低通滤波, 
+ *       通过 Commander ID='I' 或 CLI 可调参.
+ *       仅在轮速 < 1.0 时启用 (静止或低速), 避免运动中干扰.
+ */
+float lqr_zeropoint_auto_adjust(lqr_controller_t *ctrl, float angle_error,
+                                 float wheel_speed, float dt,
+                                 float *out_raw, float *out_filtered);
+
+/**
  * @brief 设置位移零点
  * @param ctrl 控制器实例
  * @param zeropoint 位移零点 (弧度)
@@ -512,6 +532,14 @@ typedef struct {
     // 输出限幅
     float max_torque;       // 最大输出扭矩 (默认 8.0)
     
+    // 速度指令增益 (仅 SPEED_FIRST 模式外环生效)
+    // target_speed_amplified = target_speed * speed_cmd_gain
+    // 用于将小量级的遥杆映射值放大到速度环可感知的量级
+    float speed_cmd_gain;   // 默认 33333.0 (补偿 speed_kp 极小值)
+    
+    // 遥杆目标速度低通滤波 (与 LQR 的 lpf_joyy 相同)
+    float lpf_joyy_tf;     // 滤波时间常数 (默认 0.2)
+    
     // 环路顺序
     uint8_t loop_order;     // DUAL_PID_ANGLE_FIRST(0) 或 DUAL_PID_SPEED_FIRST(1)
 } dual_pid_params_t;
@@ -542,6 +570,7 @@ typedef struct {
 typedef struct {
     pid_controller_t pid_angle;     // 直立环 (外环)
     pid_controller_t pid_speed;     // 速度环 (内环)
+    lowpass_filter_t lpf_joyy;      // 遥杆目标速度低通滤波
     
     dual_pid_params_t params;
     
@@ -613,6 +642,7 @@ void dual_pid_set_loop_order(dual_pid_controller_t *ctrl, uint8_t loop_order);
  * @param pitch 当前俯仰角 (度)
  * @param pitch_rate 当前俯仰角速度 (度/秒) - 可用于D项
  * @param wheel_speed 当前轮子速度 (rad/s)
+ * @param target_speed 目标速度 (rad/s), 来自遥杆 joy_y, 0 = 原地平衡
  * @param dt 时间步长 (秒)
  * @param output 控制输出
  * @return ESP_OK 成功
@@ -622,12 +652,13 @@ void dual_pid_set_loop_order(dual_pid_controller_t *ctrl, uint8_t loop_order);
  *     1. 角度环(外): pitch_error → target_speed
  *     2. 速度环(内): speed_error → torque
  *   SPEED_FIRST:
- *     1. 速度环(外): 0 - wheel_speed → pitch_target
+ *     1. 速度环(外): target_speed - wheel_speed → pitch_target
  *     2. 角度环(内): pitch_target - pitch → torque
  */
 esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl, 
                                  float pitch, float pitch_rate,
-                                 float wheel_speed, float dt,
+                                 float wheel_speed, float target_speed,
+                                 float dt,
                                  dual_pid_output_t *output);
 
 /**

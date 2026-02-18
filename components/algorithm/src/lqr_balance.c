@@ -19,7 +19,7 @@ static const lqr_params_t default_params = {
     // 角度环 PID
     .angle_kp = 0.036f,
     .angle_ki = 0.000f,
-    .angle_kd = 0.000f,
+    .angle_kd = 0.000001f,
     .angle_limit = 30.0f,
     
     // 角速度环 PID
@@ -29,16 +29,16 @@ static const lqr_params_t default_params = {
     .gyro_limit = 16.0f,
     
     // 位移环 PID
-    .distance_kp = 0.8f,
+    .distance_kp = 4.0f,
     .distance_ki = 0.0f,
     .distance_kd = 0.0f,
-    .distance_limit = 16.0f,
+    .distance_limit = 0.05f,
     
     // 速度环 PID
-    .speed_kp = 0.6f,
+    .speed_kp = 0.5f,
     .speed_ki = 0.0f,
-    .speed_kd = 0.001f,
-    .speed_limit = 16.0f,
+    .speed_kd = 0.0f,
+    .speed_limit = 3.0f,
     .speed_kp_min = 0.951f,
     .speed_kp_max = 0.951f,
     
@@ -72,7 +72,7 @@ static const lqr_params_t default_params = {
     .zeropoint_limit = 5.0f,
     
     // 角度零点
-    .angle_zeropoint = -0.0f,
+    .angle_zeropoint = -10.5f,
     
     // 低通滤波器
     .lpf_joyy_tf = 0.2f,
@@ -101,10 +101,10 @@ static const lqr_params_t default_params = {
     .max_leg_torque = 10.0f,
     
     // 环路使能系数 (默认全部启用)
-    .angle_enable = 1.0f,
+    .angle_enable = 1.4f,
     .gyro_enable = 1.0f,
     .distance_enable = 1.0f,
-    .speed_enable = 1.0f,
+    .speed_enable = 1.4f,
     .lqr_u_enable = 1.0f,
 };
 
@@ -130,7 +130,7 @@ static void init_pid(pid_controller_t *pid, float kp, float ki, float kd, float 
         .output_min = -limit,
         .output_max = limit,
         .integral_max = limit * 2.0f,
-        .d_filter_coef = 0.1f,
+        .d_filter_coef = 0.8f,
     };
     pid_init(pid, &params);
 }
@@ -390,15 +390,8 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     // ===== 输出限幅 =====
     lqr_u = clamp_f(lqr_u, -ctrl->params.max_wheel_torque, ctrl->params.max_wheel_torque);
     
-    // ===== 更新位移零点 (重心自动调整) =====
-    // 当速度接近目标时，调整位移零点以补偿重心偏移
-    float zeropoint_adjust_raw = 0.0f;
-    float zeropoint_adjust_filtered = 0.0f;
-    if (fabsf(speed_error) < 0.5f && fabsf(lqr_speed) < 1.0f) {
-        zeropoint_adjust_raw = pid_compute(&ctrl->pid_zeropoint, 0.0f, angle_error, dt);
-        zeropoint_adjust_filtered = lpf_compute_dt(&ctrl->lpf_zeropoint, zeropoint_adjust_raw, dt);
-        ctrl->distance_zeropoint += zeropoint_adjust_filtered;
-    }
+    // 注: 角度零点自动调整 (重心补偿) 已移至 balance_test.c 统一处理,
+    // 通过 lqr_zeropoint_auto_adjust() 函数实现, 所有模式 (LQR/DualPID/SinglePID) 共用.
     
     // ===== 保存输出 =====
     // output->left_wheel_torque = lqr_u;
@@ -411,8 +404,8 @@ esp_err_t lqr_balance_loop(lqr_controller_t *ctrl, const lqr_input_t *input, lqr
     output->lqr_u = lqr_u;
     output->lqr_u_raw = lqr_u_raw;
     output->filtered_target_speed = filtered_target_speed;  // 滤波后的目标速度
-    output->zeropoint_adjust_raw = zeropoint_adjust_raw;    // 零点调整原始值
-    output->zeropoint_adjust_filtered = zeropoint_adjust_filtered; // 零点调整滤波后
+    output->zeropoint_adjust_raw = 0.0f;    // 由 balance_test.c 统一填充
+    output->zeropoint_adjust_filtered = 0.0f; // 由 balance_test.c 统一填充
     output->filtered_gyro = lqr_gyro;                       // 滤波后的角速度
     output->filtered_speed = lqr_speed;                     // 滤波后的轮速
     
@@ -615,6 +608,40 @@ void lqr_roll_reset(lqr_controller_t *ctrl) {
     ESP_LOGI(TAG, "Roll controller reset");
 }
 
+// ============================================================================
+// 角度零点自动调整 (重心补偿, 所有模式通用)
+// ============================================================================
+
+float lqr_zeropoint_auto_adjust(lqr_controller_t *ctrl, float angle_error,
+                                 float wheel_speed, float dt,
+                                 float *out_raw, float *out_filtered) {
+    if (ctrl == NULL || !ctrl->initialized) {
+        if (out_raw) *out_raw = 0.0f;
+        if (out_filtered) *out_filtered = 0.0f;
+        return 0.0f;
+    }
+    
+    float adjust_raw = 0.0f;
+    float adjust_filtered = 0.0f;
+    float delta = 0.0f;
+    
+    // 仅在近乎静止时启用自动调整, 避免运动中干扰
+    if (fabsf(wheel_speed) < 0.1f) {
+        // 使用 zeropoint PID: 角度误差 → 零点调整量
+        // pid_compute(0, angle_error): error = 0 - angle_error = -angle_error
+        //   → output ∝ -angle_error → delta 与 angle_error 反号
+        adjust_raw = pid_compute(&ctrl->pid_zeropoint, 0.0f, angle_error, dt);
+        // 低通滤波: 确保调整非常平缓
+        adjust_filtered = lpf_compute_dt(&ctrl->lpf_zeropoint, adjust_raw, dt);
+        delta = adjust_filtered;
+    }
+    
+    if (out_raw) *out_raw = adjust_raw;
+    if (out_filtered) *out_filtered = adjust_filtered;
+    
+    return delta;
+}
+
 void lqr_set_distance_zeropoint(lqr_controller_t *ctrl, float zeropoint) {
     if (ctrl == NULL) return;
     ctrl->distance_zeropoint = zeropoint;
@@ -661,20 +688,20 @@ float lqr_yaw_angle_addup(float current_yaw, float last_yaw, float *yaw_total) {
 
 // 双环PID默认参数
 static const dual_pid_params_t dual_pid_default_params = {
-    // 直立环 (外环): pitch → target_speed
-    .angle_kp = 1.5f,
-    .angle_ki = 0.0f,
-    .angle_kd = 0.3f,
+    // 角度环 (内环): 倾角误差 → 扭矩
+    .angle_kp = 0.026f,
+    .angle_ki = 0.000003f,
+    .angle_kd = 0.00028f,
     .angle_limit = 50.0f,       // 最大目标速度 50 rad/s
 
-    // 速度环 (内环): speed_error → torque
-    .speed_kp = 0.4f,
-    .speed_ki = 0.05f,
-    .speed_kd = 0.0f,
+    // 速度环 (外环): 0 - 轮速 → 目标倾角
+    .speed_kp = 0.00015f,
+    .speed_ki = 0.000001f,
+    .speed_kd = 0.000009f,
     .speed_limit = 20.0f,        // 最大扭矩 20 Nm
 
     // 角度零点
-    .angle_zeropoint = 0.0f,
+    .angle_zeropoint = -7.0f,
     
     // 安全阈值
     .emergency_angle = 45.0f,
@@ -682,8 +709,14 @@ static const dual_pid_params_t dual_pid_default_params = {
     // 输出限幅
     .max_torque = 15.0f,
     
-    // 环路顺序: 角度优先 (默认)
-    .loop_order = DUAL_PID_ANGLE_FIRST,
+    // 速度指令增益 (SPEED_FIRST 模式外环)
+    .speed_cmd_gain = 33333.0f,
+    
+    // 遥杆目标速度低通滤波 (与 LQR 的 lpf_joyy 相同)
+    .lpf_joyy_tf = 0.2f,
+    
+    // 环路顺序: 速度优先 (默认)
+    .loop_order = DUAL_PID_SPEED_FIRST,
 };
 
 void dual_pid_get_default_params(dual_pid_params_t *params) {
@@ -716,7 +749,7 @@ esp_err_t dual_pid_init(dual_pid_controller_t *ctrl, const dual_pid_params_t *pa
         .output_min = -p->angle_limit,
         .output_max = p->angle_limit,
         .integral_max = p->angle_limit * 2.0f,
-        .d_filter_coef = 0.1f,
+        .d_filter_coef = 0.8f,
     };
     pid_init(&ctrl->pid_angle, &angle_pid_params);
     
@@ -728,9 +761,12 @@ esp_err_t dual_pid_init(dual_pid_controller_t *ctrl, const dual_pid_params_t *pa
         .output_min = -p->speed_limit,
         .output_max = p->speed_limit,
         .integral_max = p->speed_limit * 2.0f,
-        .d_filter_coef = 0.1f,
+        .d_filter_coef = 0.8f,
     };
     pid_init(&ctrl->pid_speed, &speed_pid_params);
+    
+    // 初始化遥杆目标速度低通滤波器
+    lpf_init(&ctrl->lpf_joyy, p->lpf_joyy_tf);
     
     ctrl->initialized = true;
     
@@ -749,6 +785,7 @@ void dual_pid_reset(dual_pid_controller_t *ctrl) {
     
     pid_reset(&ctrl->pid_angle);
     pid_reset(&ctrl->pid_speed);
+    lpf_reset(&ctrl->lpf_joyy);
     
     ESP_LOGI(TAG, "Dual PID controller reset");
 }
@@ -767,6 +804,9 @@ void dual_pid_set_params(dual_pid_controller_t *ctrl, const dual_pid_params_t *p
     // 更新速度环 PID
     pid_set_gains(&ctrl->pid_speed, p->speed_kp, p->speed_ki, p->speed_kd);
     pid_set_output_limits(&ctrl->pid_speed, -p->speed_limit, p->speed_limit);
+    
+    // 更新遥杆低通滤波器
+    lpf_set_tf(&ctrl->lpf_joyy, p->lpf_joyy_tf);
 }
 
 void dual_pid_set_angle_gains(dual_pid_controller_t *ctrl, float kp, float ki, float kd) {
@@ -809,7 +849,8 @@ bool dual_pid_check_emergency(dual_pid_controller_t *ctrl, float pitch) {
 
 esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl, 
                                  float pitch, float pitch_rate,
-                                 float wheel_speed, float dt,
+                                 float wheel_speed, float target_speed,
+                                 float dt,
                                  dual_pid_output_t *output) {
     if (ctrl == NULL || output == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -834,27 +875,38 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         return ESP_ERR_INVALID_STATE;
     }
     
+    // ===== 遥杆目标速度低通滤波 (与 LQR 的 lpf_joyy 相同) =====
+    float filtered_target_speed = lpf_compute_dt(&ctrl->lpf_joyy, target_speed, dt);
+    
     if (ctrl->params.loop_order == DUAL_PID_SPEED_FIRST) {
         // =============================================================
         // 速度优先模式 (经典串级PID):
-        //   外环: 速度环  0 - wheel_speed → pitch_target (目标倾角)
+        //   外环: 速度环  target_speed - wheel_speed → pitch_target (目标倾角)
         //   内环: 角度环  pitch_target - pitch → torque (输出扭矩)
         //
         // 物理直觉: 速度偏了 → 倾斜去纠正 → 扭矩维持倾斜
         // =============================================================
         
-        // ===== 速度环 (外环): 0 - wheel_speed → pitch_target =====
-        // 目标速度 = 0 (原地平衡)
-        // 当 wheel_speed > 0 (机器人向前走) → 需要后倾 (pitch_target < 0) 来减速
-        // 当 wheel_speed < 0 (机器人向后走) → 需要前倾 (pitch_target > 0) 来减速
-        // pid_compute(0, wheel_speed): error = 0 - wheel_speed
-        //   wheel_speed > 0 → error < 0 → output < 0 (负倾角=后倾) ✓
-        float pitch_target = pid_compute(&ctrl->pid_speed, 0.0f, wheel_speed, dt);
+        // ===== 速度环 (外环): target_speed - wheel_speed → pitch_target =====
+        // 当 wheel_speed > target_speed → 需要后倾 (pitch_target < 0) 来减速
+        // 当 wheel_speed < target_speed → 需要前倾 (pitch_target > 0) 来加速
+        // 
+        // target_speed 经过 speed_cmd_gain 放大后再送入速度环:
+        //   原始 target_speed 量级很小 (如 0.3 rad/s), speed_kp 也很小 (如 0.00015),
+        //   直接相乘得到的 pitch_target 几乎为零.
+        //   speed_cmd_gain 将 target_speed 放大到速度环能有效响应的量级.
+        //
+        // pid_compute(0, wheel_speed - amplified_target): error = 0 - (wheel_speed - amplified_target)
+        //   = amplified_target - wheel_speed
+        //   wheel_speed > amplified_target → error < 0 → output < 0 (负倾角=后倾) ✓
+        float amplified_target = filtered_target_speed * ctrl->params.speed_cmd_gain;
+        float speed_measurement = wheel_speed - amplified_target;
+        float pitch_target = pid_compute(&ctrl->pid_speed, 0.0f, speed_measurement, dt);
         
         // 保存速度环调试信息 (复用 output 字段)
-        output->speed_error = 0.0f - wheel_speed;
+        output->speed_error = amplified_target - wheel_speed;
         output->target_speed = pitch_target;  // 在此模式下含义 = pitch_target
-        output->speed_p_out = ctrl->params.speed_kp * (-wheel_speed);
+        output->speed_p_out = ctrl->params.speed_kp * (amplified_target - wheel_speed);
         output->speed_i_out = ctrl->pid_speed.integral;
         output->speed_d_out = ctrl->pid_speed.prev_d_term;
         
@@ -893,7 +945,17 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         // 目标: 让 pitch 趋近于 angle_zeropoint (通常是 0)
         // 当机器人前倾 (pitch > 0) 时，需要向前加速 (正速度)
         // 当机器人后倾 (pitch < 0) 时，需要向后加速 (负速度)
-        float angle_error = pitch - ctrl->params.angle_zeropoint;
+        // 
+        // 遥杆前进后退: target_speed 产生角度偏移
+        // 倒立摆物理: 要前进必须先前倾, 前倾=pitch更正(更不负)
+        // 但 ANGLE_FIRST 的信号链经过两次取反(pid_compute的measurement取负 + output取负),
+        // 最终: zeropoint 减小 → angle_error 增大(正) → torque 变负 → 轮子后转 → 机体前倾 → 前进
+        // 所以: target_speed > 0(前进) → zeropoint 减小(负偏移)
+        //        target_speed < 0(后退) → zeropoint 增大(正偏移)
+        // 系数含义: target_speed (rad/s) → 角度偏移 (度), 需要合适的增益
+        float speed_to_angle_gain = 2.0f;  // 1 rad/s 目标速度 → 2度倾角偏移
+        float adjusted_zeropoint = ctrl->params.angle_zeropoint - filtered_target_speed * speed_to_angle_gain;
+        float angle_error = pitch - adjusted_zeropoint;
         
         // 直立环 PID 计算
         // 注意: 误差取负号，因为我们希望 pitch 减小时输出正速度

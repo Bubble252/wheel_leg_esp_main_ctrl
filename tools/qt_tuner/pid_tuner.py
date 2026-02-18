@@ -3095,6 +3095,65 @@ class BalanceControlPanel(QWidget):
         zero_group.setLayout(zero_layout)
         layout.addWidget(zero_group)
         
+        # ========== 遥杆映射比例调节 ==========
+        joy_group = QGroupBox("🕹️ 遥杆映射比例 (Joystick Scale)")
+        joy_layout = QVBoxLayout()
+        
+        joy_desc = QLabel("控制遥杆值到目标速度/转向速率的映射比例\n"
+                          "target_speed = joy_y × speed_scale | target_yaw = joy_x × yaw_scale\n"
+                          "joy 范围 -100~100, 最大值 = 100 × scale")
+        joy_desc.setStyleSheet(SS("color: #888; font-size: 10px;"))
+        joy_layout.addWidget(joy_desc)
+        
+        joy_param_layout = QGridLayout()
+        joy_param_layout.setSpacing(6)
+        
+        # Speed scale
+        joy_param_layout.addWidget(QLabel("Speed Scale:"), 0, 0)
+        self.joy_speed_scale = QDoubleSpinBox()
+        self.joy_speed_scale.setRange(0.0, 1.0)
+        self.joy_speed_scale.setSingleStep(0.0001)
+        self.joy_speed_scale.setDecimals(6)
+        self.joy_speed_scale.setValue(0.003)
+        joy_param_layout.addWidget(self.joy_speed_scale, 0, 1)
+        
+        self.joy_speed_max_label = QLabel("max ±0.300")
+        self.joy_speed_max_label.setStyleSheet(SS("color: #aaa; font-size: 10px;"))
+        joy_param_layout.addWidget(self.joy_speed_max_label, 0, 2)
+        self.joy_speed_scale.valueChanged.connect(
+            lambda v: self.joy_speed_max_label.setText(f"max ±{100*v:.3f}"))
+        
+        # Yaw scale
+        joy_param_layout.addWidget(QLabel("Yaw Scale:"), 1, 0)
+        self.joy_yaw_scale = QDoubleSpinBox()
+        self.joy_yaw_scale.setRange(0.0, 1.0)
+        self.joy_yaw_scale.setSingleStep(0.001)
+        self.joy_yaw_scale.setDecimals(6)
+        self.joy_yaw_scale.setValue(0.03)
+        joy_param_layout.addWidget(self.joy_yaw_scale, 1, 1)
+        
+        self.joy_yaw_max_label = QLabel("max ±3.000")
+        self.joy_yaw_max_label.setStyleSheet(SS("color: #aaa; font-size: 10px;"))
+        joy_param_layout.addWidget(self.joy_yaw_max_label, 1, 2)
+        self.joy_yaw_scale.valueChanged.connect(
+            lambda v: self.joy_yaw_max_label.setText(f"max ±{100*v:.3f}"))
+        
+        # 应用按钮
+        self.joy_apply_btn = QPushButton("📤 应用")
+        self.joy_apply_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 6px 16px;"))
+        self.joy_apply_btn.clicked.connect(self.apply_joy_scale)
+        joy_param_layout.addWidget(self.joy_apply_btn, 0, 3, 2, 1)
+        
+        # 查询按钮
+        self.joy_query_btn = QPushButton("📊 查询")
+        self.joy_query_btn.clicked.connect(lambda: self.send_cmd("balance joy"))
+        joy_param_layout.addWidget(self.joy_query_btn, 0, 4)
+        
+        joy_layout.addLayout(joy_param_layout)
+        
+        joy_group.setLayout(joy_layout)
+        layout.addWidget(joy_group)
+        
         # 波形输出控制
         plot_group = QGroupBox("📊 波形输出控制")
         plot_main_layout = QVBoxLayout()
@@ -3642,6 +3701,18 @@ class BalanceControlPanel(QWidget):
         self.parent_window.send_command(f"balance xoffset limit {limit:.3f}")
         self.parent_window.log(f"X-Offset: Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f} Limit={limit:.3f}m")
     
+    def apply_joy_scale(self):
+        """应用遥杆映射比例"""
+        if not self.parent_window or not self.parent_window.is_connected():
+            QMessageBox.warning(self, "警告", "请先连接串口!")
+            return
+        speed_scale = self.joy_speed_scale.value()
+        yaw_scale = self.joy_yaw_scale.value()
+        self.parent_window.send_command(f"balance joy speed {speed_scale:.6f}")
+        self.parent_window.send_command(f"balance joy yaw {yaw_scale:.6f}")
+        self.parent_window.log(f"Joy Scale: speed={speed_scale:.6f} (max ±{100*speed_scale:.3f}), "
+                               f"yaw={yaw_scale:.6f} (max ±{100*yaw_scale:.3f})")
+    
     def send_leg_sync_cmd(self, state):
         """发送 Leg Sync 控制命令"""
         if not self.parent_window or not self.parent_window.is_connected():
@@ -3971,24 +4042,24 @@ class DualPIDPanel(QWidget):
         angle_layout.addWidget(QLabel("Kp:"), 0, 0)
         self.angle_kp = QDoubleSpinBox()
         self.angle_kp.setRange(0, 100)
-        self.angle_kp.setSingleStep(0.5)
-        self.angle_kp.setDecimals(2)
+        self.angle_kp.setSingleStep(0.1)
+        self.angle_kp.setDecimals(6)
         self.angle_kp.setValue(15.0)
         angle_layout.addWidget(self.angle_kp, 0, 1)
         
         angle_layout.addWidget(QLabel("Ki:"), 0, 2)
         self.angle_ki = QDoubleSpinBox()
         self.angle_ki.setRange(0, 10)
-        self.angle_ki.setSingleStep(0.01)
-        self.angle_ki.setDecimals(3)
+        self.angle_ki.setSingleStep(0.001)
+        self.angle_ki.setDecimals(6)
         self.angle_ki.setValue(0.0)
         angle_layout.addWidget(self.angle_ki, 0, 3)
         
         angle_layout.addWidget(QLabel("Kd:"), 0, 4)
         self.angle_kd = QDoubleSpinBox()
         self.angle_kd.setRange(0, 10)
-        self.angle_kd.setSingleStep(0.01)
-        self.angle_kd.setDecimals(4)
+        self.angle_kd.setSingleStep(0.001)
+        self.angle_kd.setDecimals(6)
         self.angle_kd.setValue(0.5)
         angle_layout.addWidget(self.angle_kd, 0, 5)
         
@@ -4011,24 +4082,24 @@ class DualPIDPanel(QWidget):
         speed_layout.addWidget(QLabel("Kp:"), 0, 0)
         self.speed_kp = QDoubleSpinBox()
         self.speed_kp.setRange(0, 10)
-        self.speed_kp.setSingleStep(0.01)
-        self.speed_kp.setDecimals(4)
+        self.speed_kp.setSingleStep(0.001)
+        self.speed_kp.setDecimals(6)
         self.speed_kp.setValue(0.5)
         speed_layout.addWidget(self.speed_kp, 0, 1)
         
         speed_layout.addWidget(QLabel("Ki:"), 0, 2)
         self.speed_ki = QDoubleSpinBox()
         self.speed_ki.setRange(0, 1)
-        self.speed_ki.setSingleStep(0.01)
-        self.speed_ki.setDecimals(3)
+        self.speed_ki.setSingleStep(0.001)
+        self.speed_ki.setDecimals(6)
         self.speed_ki.setValue(0.1)
         speed_layout.addWidget(self.speed_ki, 0, 3)
         
         speed_layout.addWidget(QLabel("Kd:"), 0, 4)
         self.speed_kd = QDoubleSpinBox()
         self.speed_kd.setRange(0, 1)
-        self.speed_kd.setSingleStep(0.01)
-        self.speed_kd.setDecimals(3)
+        self.speed_kd.setSingleStep(0.001)
+        self.speed_kd.setDecimals(6)
         self.speed_kd.setValue(0.01)
         speed_layout.addWidget(self.speed_kd, 0, 5)
         
@@ -4039,7 +4110,21 @@ class DualPIDPanel(QWidget):
         # 速度环说明
         speed_note = QLabel("tip: I项消除稳态误差, 过大会导致震荡")
         speed_note.setStyleSheet(SS("color: #666; font-size: 10px;"))
-        speed_layout.addWidget(speed_note, 1, 0, 1, 7)
+        speed_layout.addWidget(speed_note, 1, 0, 1, 4)
+        
+        # 速度指令增益 (SPEED_FIRST 外环)
+        speed_layout.addWidget(QLabel("指令增益:"), 1, 4)
+        self.speed_cmd_gain = QDoubleSpinBox()
+        self.speed_cmd_gain.setRange(0, 999999)
+        self.speed_cmd_gain.setSingleStep(1000)
+        self.speed_cmd_gain.setDecimals(1)
+        self.speed_cmd_gain.setValue(33333.0)
+        self.speed_cmd_gain.setToolTip("SPEED_FIRST 模式: target_speed × 此增益 → 速度外环输入")
+        speed_layout.addWidget(self.speed_cmd_gain, 1, 5)
+        
+        self.gain_send_btn = QPushButton("发送")
+        self.gain_send_btn.clicked.connect(self.send_speed_cmd_gain)
+        speed_layout.addWidget(self.gain_send_btn, 1, 6)
         
         self.speed_group.setLayout(speed_layout)
         layout.addWidget(self.speed_group)
@@ -4405,6 +4490,10 @@ class DualPIDPanel(QWidget):
         ki = self.speed_ki.value()
         kd = self.speed_kd.value()
         self.send_cmd(f"balance dpid speed {kp} {ki} {kd}")
+    
+    def send_speed_cmd_gain(self):
+        gain = self.speed_cmd_gain.value()
+        self.send_cmd(f"balance dpid gain {gain}")
     
     def send_spid_params(self):
         """发送单环 PID 参数"""

@@ -60,6 +60,9 @@ extern "C" {
 #define CTRL_ID_GYRO_LPF    'N'     // 角速度滤波
 #define CTRL_ID_SPEED_LPF   'W'     // 轮速滤波
 
+// 遥杆映射比例
+#define CTRL_ID_JOY_SCALE   'X'     // 遥杆映射比例 (P=speed_scale, I=yaw_scale)
+
 /* ==================== 参数字符定义 ==================== */
 
 // PID参数 (用于A,B,C,D,E,F,H,I,K控制器)
