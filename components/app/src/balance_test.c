@@ -2278,7 +2278,13 @@ static void task_remote_watchdog(void *arg) {
             // 超时，禁用遥控输入
             xSemaphoreTake(g_remote_mutex, portMAX_DELAY);
             if (g_remote_data.go) {
-                ESP_LOGW(TAG, "Remote timeout, disabling go");
+                // 限流打印: 每秒最多一次
+                static uint32_t last_timeout_log_ms = 0;
+                uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                if (now_ms - last_timeout_log_ms >= 1000) {
+                    ESP_LOGW(TAG, "Remote timeout, disabling go");
+                    last_timeout_log_ms = now_ms;
+                }
                 g_remote_data.go = false;
             }
             xSemaphoreGive(g_remote_mutex);

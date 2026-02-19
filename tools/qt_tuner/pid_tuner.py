@@ -4044,7 +4044,7 @@ class DualPIDPanel(QWidget):
         self.angle_kp.setRange(0, 100)
         self.angle_kp.setSingleStep(0.1)
         self.angle_kp.setDecimals(6)
-        self.angle_kp.setValue(15.0)
+        self.angle_kp.setValue(0.025)
         angle_layout.addWidget(self.angle_kp, 0, 1)
         
         angle_layout.addWidget(QLabel("Ki:"), 0, 2)
@@ -4052,7 +4052,7 @@ class DualPIDPanel(QWidget):
         self.angle_ki.setRange(0, 10)
         self.angle_ki.setSingleStep(0.001)
         self.angle_ki.setDecimals(6)
-        self.angle_ki.setValue(0.0)
+        self.angle_ki.setValue(0.000003)
         angle_layout.addWidget(self.angle_ki, 0, 3)
         
         angle_layout.addWidget(QLabel("Kd:"), 0, 4)
@@ -4060,7 +4060,7 @@ class DualPIDPanel(QWidget):
         self.angle_kd.setRange(0, 10)
         self.angle_kd.setSingleStep(0.001)
         self.angle_kd.setDecimals(6)
-        self.angle_kd.setValue(0.5)
+        self.angle_kd.setValue(0.003)
         angle_layout.addWidget(self.angle_kd, 0, 5)
         
         self.angle_send_btn = QPushButton("发送")
@@ -4084,7 +4084,7 @@ class DualPIDPanel(QWidget):
         self.speed_kp.setRange(0, 10)
         self.speed_kp.setSingleStep(0.001)
         self.speed_kp.setDecimals(6)
-        self.speed_kp.setValue(0.5)
+        self.speed_kp.setValue(0.0005)
         speed_layout.addWidget(self.speed_kp, 0, 1)
         
         speed_layout.addWidget(QLabel("Ki:"), 0, 2)
@@ -4092,7 +4092,7 @@ class DualPIDPanel(QWidget):
         self.speed_ki.setRange(0, 1)
         self.speed_ki.setSingleStep(0.001)
         self.speed_ki.setDecimals(6)
-        self.speed_ki.setValue(0.1)
+        self.speed_ki.setValue(0.000001)
         speed_layout.addWidget(self.speed_ki, 0, 3)
         
         speed_layout.addWidget(QLabel("Kd:"), 0, 4)
@@ -4100,7 +4100,7 @@ class DualPIDPanel(QWidget):
         self.speed_kd.setRange(0, 1)
         self.speed_kd.setSingleStep(0.001)
         self.speed_kd.setDecimals(6)
-        self.speed_kd.setValue(0.01)
+        self.speed_kd.setValue(0.000015)
         speed_layout.addWidget(self.speed_kd, 0, 5)
         
         self.speed_send_btn = QPushButton("发送")

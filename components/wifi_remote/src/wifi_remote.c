@@ -150,13 +150,18 @@ static void parse_json_command(const char *json_str) {
     g_remote_data.receive_time_us = esp_timer_get_time();  // 精确微秒时间戳
     g_remote_data.msg_count++;
     
-    // 打印接收到的命令
-    ESP_LOGI(TAG, "[%lu] RX: dir=%s joy=(%d,%d) height=%d roll=%d go=%d",
-             g_remote_data.msg_count,
-             wifi_remote_dir_to_str(g_remote_data.dir),
-             g_remote_data.joy_x, g_remote_data.joy_y,
-             g_remote_data.height, g_remote_data.roll,
-             g_remote_data.go);
+    // 打印接收到的命令 (限流: 每秒最多打印一次)
+    static uint32_t last_rx_log_ms = 0;
+    uint32_t now_ms = g_remote_data.last_update_ms;
+    if (now_ms - last_rx_log_ms >= 1000) {
+        ESP_LOGI(TAG, "[%lu] RX: dir=%s joy=(%d,%d) height=%d roll=%d go=%d",
+                 g_remote_data.msg_count,
+                 wifi_remote_dir_to_str(g_remote_data.dir),
+                 g_remote_data.joy_x, g_remote_data.joy_y,
+                 g_remote_data.height, g_remote_data.roll,
+                 g_remote_data.go);
+        last_rx_log_ms = now_ms;
+    }
     
     cJSON_Delete(json);
 }

@@ -689,15 +689,15 @@ float lqr_yaw_angle_addup(float current_yaw, float last_yaw, float *yaw_total) {
 // 双环PID默认参数
 static const dual_pid_params_t dual_pid_default_params = {
     // 角度环 (内环): 倾角误差 → 扭矩
-    .angle_kp = 0.026f,
+    .angle_kp = 0.025f,
     .angle_ki = 0.000003f,
-    .angle_kd = 0.00028f,
+    .angle_kd = 0.003f,
     .angle_limit = 50.0f,       // 最大目标速度 50 rad/s
 
     // 速度环 (外环): 0 - 轮速 → 目标倾角
-    .speed_kp = 0.00015f,
+    .speed_kp = 0.0005f,
     .speed_ki = 0.000001f,
-    .speed_kd = 0.000009f,
+    .speed_kd = 0.000015f,
     .speed_limit = 20.0f,        // 最大扭矩 20 Nm
 
     // 角度零点
