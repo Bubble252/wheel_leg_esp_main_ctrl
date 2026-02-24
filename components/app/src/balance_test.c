@@ -117,6 +117,7 @@ typedef struct {
     int16_t joy_x_last;     // 上一次摇杆 X
     int16_t joy_y_last;     // 上一次摇杆 Y
     bool go;                // 使能开关
+    bool car_mode;          // 小车模式开关 (来自 Web UI)
     uint32_t last_update;   // 最后更新时间 (ms)
     uint64_t receive_time_us; // 精确接收时间 (us) - 用于延迟测量
 } shared_remote_data_t;
@@ -181,8 +182,18 @@ typedef enum {
     CTRL_MODE_LQR = 0,      // LQR 多环控制 (默认)
     CTRL_MODE_DUAL_PID,     // 双环 PID 控制 (直立环+速度环) - 扭矩模式
     CTRL_MODE_SINGLE_PID,   // 单环 PID 控制 (直立环→速度) - 速度模式
+    CTRL_MODE_CAR,          // 普通小车模式 (无直立环, 趴下跑)
 } control_mode_t;
 static control_mode_t g_control_mode = CTRL_MODE_LQR;  // 默认 LQR 模式
+
+// 普通小车模式参数
+#define CAR_MODE_BODY_ANGLE     (-134.0f)   // 小车模式身体夹角 (度), 趴下
+#define CAR_MODE_LEG_LENGTH     (0.074f)    // 小车模式腿长 (米)
+#define CAR_MODE_MAX_SPEED      (200.0f)    // 小车模式最大速度 (rpm)
+#define CAR_MODE_YAW_GAIN       (80.0f)     // 小车模式转向增益 (rpm per joy_x unit)
+static control_mode_t g_car_mode_prev_mode = CTRL_MODE_LQR;  // 进入小车模式前的模式 (用于退出时恢复)
+static float g_car_mode_prev_base_angle = -90.0f;            // 进入小车模式前的身体夹角
+static float g_car_mode_prev_base_length = 0.09f;            // 进入小车模式前的腿长
 
 // 双环 PID 控制器
 static dual_pid_controller_t g_dual_pid_ctrl;
@@ -1455,6 +1466,7 @@ static void update_remote_from_wifi(void);
 static void compute_balance_output(float dt);
 static void apply_motor_commands(void);
 static esp_err_t leg_ctrl_get_state_cached(bool is_left, leg_state_t *state);
+esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle);
 
 // ============================================================================
 // 初始化
@@ -1887,14 +1899,15 @@ float balance_test_get_angle_zeropoint(void) {
 
 void balance_test_print_status(void) {
     const char *state_names[] = {"IDLE", "READY", "RUNNING", "EMERGENCY", "ERROR"};
-    const char *mode_names[] = {"LQR", "DUAL_PID", "SINGLE_PID"};
+    const char *mode_names[] = {"LQR", "DUAL_PID", "SINGLE_PID", "CAR"};
     
     ESP_LOGI(TAG, "=== Balance Test Status ===");
     ESP_LOGI(TAG, "State: %s", state_names[g_state]);
     ESP_LOGI(TAG, "Task mode: %s", g_use_unified_task ? "UNIFIED" : "SEPARATE");
     ESP_LOGI(TAG, "Control mode: %s (%s)", 
              mode_names[g_control_mode],
-             g_control_mode == CTRL_MODE_SINGLE_PID ? "speed output" : "torque output");
+             g_control_mode == CTRL_MODE_SINGLE_PID ? "speed output" : 
+             g_control_mode == CTRL_MODE_CAR ? "car speed mode" : "torque output");
     ESP_LOGI(TAG, "Safety check: %s (uncontrolable=%d)", 
              g_uncontrolable_check_enabled ? "ENABLED" : "DISABLED", g_uncontrolable);
     ESP_LOGI(TAG, "Wheel off-ground: %s (spd_th=%.1f acc_th=%.1f)",
@@ -2322,6 +2335,7 @@ static void update_remote_from_wifi(void) {
     g_remote_data.joy_x = wifi_data->joy_x;
     g_remote_data.joy_y = wifi_data->joy_y;
     g_remote_data.go = wifi_data->go;
+    g_remote_data.car_mode = wifi_data->car_mode;
     g_remote_data.last_update = wifi_data->last_update_ms;
     g_remote_data.receive_time_us = wifi_data->receive_time_us;  // 复制精确时间戳
     
@@ -2337,6 +2351,57 @@ static void update_remote_from_wifi(void) {
         balance_test_disable();
     }
     last_go = wifi_data->go;
+    
+    // 根据 car_mode 状态切换小车模式
+    static bool last_car_mode = false;
+    if (wifi_data->car_mode && !last_car_mode) {
+        // car_mode 从 false 变为 true → 进入小车模式
+        if (g_control_mode != CTRL_MODE_CAR) {
+            g_car_mode_prev_mode = g_control_mode;
+            g_car_mode_prev_base_angle = g_leg_base_angle;
+            g_car_mode_prev_base_length = g_leg_base_length;
+            g_control_mode = CTRL_MODE_CAR;
+            
+            if (g_state == BALANCE_TEST_RUNNING) {
+                can_motor_set_mode(g_motor_left, MODE_SPEED);
+                can_motor_set_mode(g_motor_right, MODE_SPEED);
+            }
+            if (g_leg_control_enabled) {
+                leg_ctrl_set_target(true, CAR_MODE_LEG_LENGTH, CAR_MODE_BODY_ANGLE);
+                leg_ctrl_set_target(false, CAR_MODE_LEG_LENGTH, CAR_MODE_BODY_ANGLE);
+            }
+            ESP_LOGI(TAG, "WiFi: Entered CAR mode (body=%.0f°, leg=%.0fmm)",
+                     CAR_MODE_BODY_ANGLE, CAR_MODE_LEG_LENGTH * 1000.0f);
+            printf("CTRL_MODE:CAR\n");
+        }
+    } else if (!wifi_data->car_mode && last_car_mode) {
+        // car_mode 从 true 变为 false → 退出小车模式
+        if (g_control_mode == CTRL_MODE_CAR) {
+            if (g_state == BALANCE_TEST_RUNNING) {
+                can_motor_set_speed(g_motor_left, 0);
+                can_motor_set_speed(g_motor_right, 0);
+            }
+            if (g_leg_control_enabled) {
+                leg_ctrl_set_target(true, g_car_mode_prev_base_length, g_car_mode_prev_base_angle);
+                leg_ctrl_set_target(false, g_car_mode_prev_base_length, g_car_mode_prev_base_angle);
+            }
+            g_control_mode = g_car_mode_prev_mode;
+            if (g_state == BALANCE_TEST_RUNNING) {
+                if (g_control_mode == CTRL_MODE_SINGLE_PID) {
+                    can_motor_set_mode(g_motor_left, MODE_SPEED);
+                    can_motor_set_mode(g_motor_right, MODE_SPEED);
+                } else {
+                    can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                    can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                }
+            }
+            const char *restored_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
+                                       (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : "SINGLE_PID";
+            ESP_LOGI(TAG, "WiFi: Exited CAR mode, restored to %s", restored_str);
+            printf("CTRL_MODE:%s\n", restored_str);
+        }
+    }
+    last_car_mode = wifi_data->car_mode;
 }
 
 /**
@@ -2669,6 +2734,44 @@ static void compute_balance_output(float dt) {
         output.speed_control = 0;  // 单环无速度环
         output.filtered_target_speed = g_single_pid_output.target_speed;
         
+    } else if (g_control_mode == CTRL_MODE_CAR) {
+        // ======== 普通小车模式 (无直立环, 趴下跑) ========
+        // 直接把遥杆映射为左右轮速度, 差速转向
+        // joy_y: 前进/后退速度  joy_x: 左右转向
+        
+        float speed_cmd = remote.joy_y / 100.0f * CAR_MODE_MAX_SPEED;  // -MAX ~ +MAX rpm
+        float yaw_cmd = -remote.joy_x / 100.0f * CAR_MODE_YAW_GAIN;   // 差速转向 rpm
+        
+        float left_speed_rpm = speed_cmd + yaw_cmd;
+        float right_speed_rpm = speed_cmd - yaw_cmd;
+        
+        // 限幅
+        if (left_speed_rpm > CAR_MODE_MAX_SPEED) left_speed_rpm = CAR_MODE_MAX_SPEED;
+        if (left_speed_rpm < -CAR_MODE_MAX_SPEED) left_speed_rpm = -CAR_MODE_MAX_SPEED;
+        if (right_speed_rpm > CAR_MODE_MAX_SPEED) right_speed_rpm = CAR_MODE_MAX_SPEED;
+        if (right_speed_rpm < -CAR_MODE_MAX_SPEED) right_speed_rpm = -CAR_MODE_MAX_SPEED;
+        
+        // go 开关: 只有 go=true 时才输出速度
+        if (!remote.go) {
+            left_speed_rpm = 0;
+            right_speed_rpm = 0;
+        }
+        
+        // 存入 output (此模式是速度模式, 类似 SINGLE_PID)
+        // left/right_wheel_torque 复用存储速度值 (rpm → rad/s, 后续 apply_motor_commands 会转换)
+        float left_speed_rads = left_speed_rpm * 0.10472f;   // rpm → rad/s
+        float right_speed_rads = right_speed_rpm * 0.10472f;
+        output.left_wheel_torque = left_speed_rads;
+        output.right_wheel_torque = right_speed_rads;
+        output.lqr_u = (left_speed_rads + right_speed_rads) / 2.0f;
+        g_last_lqr_u = output.lqr_u;
+        
+        // 填充兼容字段用于波形显示
+        output.angle_control = 0;
+        output.gyro_control = 0;
+        output.speed_control = speed_cmd;
+        output.filtered_target_speed = speed_cmd;
+        
     } else {
         // ======== LQR 多环控制模式 (默认) ========
         
@@ -2913,7 +3016,7 @@ static void compute_balance_output(float dt) {
     
     // ======== Roll 控制 + X-Offset (非 LQR 模式通用: Dual PID / Single PID) ========
     // 注: 双环PID和单环PID模式下也可以使用 Roll 控制和 X-Offset
-    bool is_non_lqr = (g_control_mode == CTRL_MODE_DUAL_PID || g_control_mode == CTRL_MODE_SINGLE_PID);
+    bool is_non_lqr = (g_control_mode == CTRL_MODE_DUAL_PID || g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR);
     if (is_non_lqr && g_leg_control_enabled && g_roll_control_enabled) {
         lqr_roll_output_t roll_output;
         esp_err_t roll_ret = lqr_roll_loop(&g_lqr_ctrl, &input, &roll_output);
@@ -3030,8 +3133,8 @@ static void compute_balance_output(float dt) {
         g_wheel_cmd.left_torque = output.left_wheel_torque;
         g_wheel_cmd.right_torque = output.right_wheel_torque;
     }
-    // 单环 PID 模式使用速度模式，其他模式使用扭矩模式
-    g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID);
+    // 单环 PID 模式和小车模式使用速度模式，其他模式使用扭矩模式
+    g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR);
     // enabled 状态由 balance_test_enable/disable 控制
     xSemaphoreGive(g_wheel_cmd_mutex);
 }
@@ -3294,7 +3397,8 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Debug divider: %d (%.1f Hz @ 200Hz ctrl)\n", g_pid_debug_divider, 200.0f / g_pid_debug_divider);
             printf("Control mode: %s\n", 
                    g_control_mode == CTRL_MODE_LQR ? "LQR" :
-                   g_control_mode == CTRL_MODE_DUAL_PID ? "DUAL_PID" : "SINGLE_PID");
+                   g_control_mode == CTRL_MODE_DUAL_PID ? "DUAL_PID" : 
+                   g_control_mode == CTRL_MODE_CAR ? "CAR" : "SINGLE_PID");
             printf("Usage: balance debug [on|off|div <N>]\n");
         } else if (strcmp(token, "on") == 0) {
             g_pid_debug_enabled = true;
@@ -4263,13 +4367,15 @@ void balance_test_process_cmd(const char *cmd_str) {
         token = strtok(NULL, " \t\n\r");
         if (token == NULL) {
             const char *mode_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
-                                   (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : "SINGLE_PID";
+                                   (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : 
+                                   (g_control_mode == CTRL_MODE_CAR) ? "CAR" : "SINGLE_PID";
             printf("Control mode: %s\n", mode_str);
             printf("CTRL_MODE:%s\n", mode_str);
             printf("  LQR:        Multi-loop LQR control (angle+gyro+dist+speed) → torque\n");
             printf("  DUAL_PID:   Dual-loop PID (angle→speed→torque) → torque mode\n");
             printf("  SINGLE_PID: Single-loop PID (angle→speed) → speed mode\n");
-            printf("Usage: balance mode [lqr|pid|spid]\n");
+            printf("  CAR:        Car mode (no balance, direct speed control)\n");
+            printf("Usage: balance mode [lqr|pid|spid|car]\n");
         } else if (strcmp(token, "lqr") == 0 || strcmp(token, "0") == 0) {
             g_control_mode = CTRL_MODE_LQR;
             // 如果正在运行，切换电机到扭矩模式
@@ -4309,9 +4415,67 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Control mode set to SINGLE_PID (speed mode)\n");
                 printf("CTRL_MODE:SINGLE_PID\n");
             }
+        } else if (strcmp(token, "car") == 0 || strcmp(token, "3") == 0) {
+            // 进入小车模式: 保存当前状态, 设置腿部角度, 切电机速度模式
+            g_car_mode_prev_mode = g_control_mode;
+            g_car_mode_prev_base_angle = g_leg_base_angle;
+            g_car_mode_prev_base_length = g_leg_base_length;
+            g_control_mode = CTRL_MODE_CAR;
+            
+            // 切换电机到速度模式
+            if (g_state == BALANCE_TEST_RUNNING) {
+                can_motor_set_mode(g_motor_left, MODE_SPEED);
+                can_motor_set_mode(g_motor_right, MODE_SPEED);
+            }
+            
+            // 设置腿部趴下姿态
+            if (g_leg_control_enabled) {
+                leg_ctrl_set_target(true, CAR_MODE_LEG_LENGTH, CAR_MODE_BODY_ANGLE);
+                leg_ctrl_set_target(false, CAR_MODE_LEG_LENGTH, CAR_MODE_BODY_ANGLE);
+            }
+            
+            printf("Control mode set to CAR (speed mode, body_angle=%.0f°, leg=%.0fmm)\n",
+                   CAR_MODE_BODY_ANGLE, CAR_MODE_LEG_LENGTH * 1000.0f);
+            printf("CTRL_MODE:CAR\n");
+        } else if (strcmp(token, "exit_car") == 0) {
+            // 退出小车模式: 恢复之前的模式和腿部姿态
+            if (g_control_mode != CTRL_MODE_CAR) {
+                printf("Not in car mode\n");
+            } else {
+                // 先停止轮子
+                if (g_state == BALANCE_TEST_RUNNING) {
+                    can_motor_set_speed(g_motor_left, 0);
+                    can_motor_set_speed(g_motor_right, 0);
+                }
+                
+                // 恢复腿部姿态
+                if (g_leg_control_enabled) {
+                    leg_ctrl_set_target(true, g_car_mode_prev_base_length, g_car_mode_prev_base_angle);
+                    leg_ctrl_set_target(false, g_car_mode_prev_base_length, g_car_mode_prev_base_angle);
+                }
+                
+                // 恢复控制模式
+                g_control_mode = g_car_mode_prev_mode;
+                
+                // 恢复电机模式
+                if (g_state == BALANCE_TEST_RUNNING) {
+                    if (g_control_mode == CTRL_MODE_SINGLE_PID) {
+                        can_motor_set_mode(g_motor_left, MODE_SPEED);
+                        can_motor_set_mode(g_motor_right, MODE_SPEED);
+                    } else {
+                        can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                        can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                    }
+                }
+                
+                const char *restored_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
+                                           (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : "SINGLE_PID";
+                printf("Exited car mode, restored to %s\n", restored_str);
+                printf("CTRL_MODE:%s\n", restored_str);
+            }
         } else {
             printf("Unknown mode: %s\n", token);
-            printf("Usage: balance mode [lqr|pid|spid]\n");
+            printf("Usage: balance mode [lqr|pid|spid|car|exit_car]\n");
         }
     }
     // ===== 双环 PID 调参命令 =====

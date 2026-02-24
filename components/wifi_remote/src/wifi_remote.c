@@ -145,6 +145,12 @@ static void parse_json_command(const char *json_str) {
         g_remote_data.go = (stable->valueint == 1);
     }
     
+    // 解析小车模式开关
+    cJSON *car_mode = cJSON_GetObjectItem(json, "car_mode");
+    if (car_mode && cJSON_IsNumber(car_mode)) {
+        g_remote_data.car_mode = (car_mode->valueint == 1);
+    }
+    
     // 更新时间戳和计数
     g_remote_data.last_update_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     g_remote_data.receive_time_us = esp_timer_get_time();  // 精确微秒时间戳

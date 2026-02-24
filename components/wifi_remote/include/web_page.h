@@ -80,6 +80,9 @@ static const char web_page_html[] = R"rawliteral(
     input[type='checkbox'].switch:checked {
         background: #4CAF50;
     }
+    input[type='checkbox'].switch.car-switch:checked {
+        background: #FF9800;
+    }
     input[type='checkbox'].switch:checked::after {
         left: 26px;
     }
@@ -164,6 +167,11 @@ static const char web_page_html[] = R"rawliteral(
             <label for="goSwitch" style="font-size:18px; font-weight:bold;"> Robot Go!</label>
         </div>
         
+        <div class="switch-container">
+            <input type="checkbox" id="carSwitch" class="switch car-switch" onclick="toggleCarMode()">
+            <label for="carSwitch" style="font-size:16px; font-weight:bold;"> 🚗 Car Mode</label>
+        </div>
+        
         <div class="joystick-container" id="joystickDiv"></div>
         
         <div class="sliders">
@@ -200,6 +208,7 @@ static const char web_page_html[] = R"rawliteral(
 <script>
     var socket;
     var g_go = 0;
+    var g_carMode = 0;
     var g_height = 38;
     var g_roll = 0;
     var g_joyX = 0;
@@ -253,6 +262,7 @@ static const char web_page_html[] = R"rawliteral(
                 height: g_height,
                 roll: g_roll,
                 stable: g_go,
+                car_mode: g_carMode,
                 linear: 0,
                 angular: 0
             };
@@ -265,6 +275,12 @@ static const char web_page_html[] = R"rawliteral(
     function toggleGo() {
         g_go = document.getElementById('goSwitch').checked ? 1 : 0;
         sendData();
+    }
+    
+    function toggleCarMode() {
+        g_carMode = document.getElementById('carSwitch').checked ? 1 : 0;
+        sendData();
+        log('Car mode: ' + (g_carMode ? 'ON' : 'OFF'));
     }
     
     function updateHeight() {

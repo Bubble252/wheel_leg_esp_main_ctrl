@@ -40,6 +40,7 @@ typedef struct {
     
     // 控制开关
     bool go;                    // 使能开关 (Robot Go!)
+    bool car_mode;              // 小车模式开关 (从网页切换)
     
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)

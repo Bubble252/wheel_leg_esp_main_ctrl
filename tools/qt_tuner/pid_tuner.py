@@ -6150,7 +6150,7 @@ class PIDTunerUI(QMainWindow):
         
         # 控制模式切换
         if line.startswith("CTRL_MODE:"):
-            ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID|SINGLE_PID)', line)
+            ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID|SINGLE_PID|CAR)', line)
             if ctrl_mode_match:
                 try:
                     mode = ctrl_mode_match.group(1)
