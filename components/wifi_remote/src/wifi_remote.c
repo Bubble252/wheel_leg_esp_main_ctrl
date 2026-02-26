@@ -357,12 +357,17 @@ esp_err_t wifi_remote_start(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     
-    // 降低 WiFi 发射功率，防止 USB 供电时欠压重启
+    // 设置 WiFi 发射功率
     // 注意：必须在 esp_wifi_start() 之后调用
+    // 参数单位: 0.25 dBm，即 value=78 → 78×0.25=19.5dBm
     // 可选值: 8(2dBm), 20(5dBm), 28(7dBm), 34(8.5dBm), 44(11dBm), 52(13dBm), 60(15dBm), 68(17dBm), 76(19dBm), 78(19.5dBm), 84(21dBm)
-    // 原项目使用默认值(约78)，但ESP32-S3可能需要降低以避免欠压
-    // 如果WiFi能正常启动，可以逐步提高此值以增强信号强度
-    esp_wifi_set_max_tx_power(20);  // 19.5dBm，接近最大功率，增强信号覆盖
+    // 
+    // 功率与 CAN 总线稳定性的权衡:
+    //   20 (5dBm/3mW)   → CAN稳定但WiFi信号太弱，电机运行时手机丢失AP
+    //   52 (13dBm/20mW) → 信号比5dBm强4倍，PA电流~200mA，CAN可接受
+    //   78 (19.5dBm/89mW) → PA峰值~350mA，3.3V跌落导致CAN bus-off
+    // 如果仍有CAN错误，降至 44(11dBm) 或 34(8.5dBm)
+    esp_wifi_set_max_tx_power(20);  // 5dBm (~3mW)，优先保证CAN总线稳定
     
     int8_t power;
     esp_wifi_get_max_tx_power(&power);
