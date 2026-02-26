@@ -26,6 +26,7 @@
 #include "wit_reg.h"      // RRATE_200HZ 定义
 #include "wifi_remote.h"
 #include "lqr_balance.h"
+#include "lowpass_filter.h"
 #include "leg_kinematics.h"
 #include "power_detect.h"
 #include "commander_parser.h"
@@ -183,6 +184,7 @@ typedef enum {
     CTRL_MODE_DUAL_PID,     // 双环 PID 控制 (直立环+速度环) - 扭矩模式
     CTRL_MODE_SINGLE_PID,   // 单环 PID 控制 (直立环→速度) - 速度模式
     CTRL_MODE_CAR,          // 普通小车模式 (无直立环, 趴下跑)
+    CTRL_MODE_TRIPLE_PID,   // 三环 PID 控制 (速度环→角度环→轮速环)
 } control_mode_t;
 static control_mode_t g_control_mode = CTRL_MODE_LQR;  // 默认 LQR 模式
 
@@ -199,6 +201,15 @@ static float g_car_mode_prev_base_length = 0.09f;            // 进入小车模�
 static dual_pid_controller_t g_dual_pid_ctrl;
 static bool g_dual_pid_initialized = false;
 static dual_pid_output_t g_dual_pid_output;       // 保存输出用于调试
+
+// 三环 PID 控制器 (速度环→角度环→轮速环)
+static triple_pid_controller_t g_triple_pid_ctrl;
+static bool g_triple_pid_initialized = false;
+static triple_pid_output_t g_triple_pid_output;   // 保存输出用于调试
+
+// 轮速加权滑动平均滤波器 (用于双环/三环 PID 模式)
+static weighted_ma_filter_t g_wheel_speed_wma;
+static bool g_wma_enabled = false;   // 默认关闭, 由 CLI / UI 开启
 
 // 单环 PID 控制器 (输出速度，适合电机速度模式)
 static single_pid_controller_t g_single_pid_ctrl;
@@ -865,6 +876,21 @@ static void output_pid_debug(const lqr_input_t *input) {
                g_single_pid_output.angle_d_out,
                g_single_pid_output.target_speed,
                speed_rpm);
+               
+    } else if (g_control_mode == CTRL_MODE_TRIPLE_PID) {
+        // 三环 PID 调试输出
+        printf("[TPID] pitch=%.2f° spd=%.2f | "
+               "Speed(外): err=%.2f → pitch_tgt=%.2f° | "
+               "Angle(中): err=%.2f → whl_tgt=%.2f | "
+               "Wheel(内): err=%.2f → out=%.3f [%s]\n",
+               pitch, wheel_speed,
+               g_triple_pid_output.speed_error,
+               g_triple_pid_output.pitch_target,
+               g_triple_pid_output.angle_error,
+               g_triple_pid_output.wheel_speed_target,
+               g_triple_pid_output.wheel_speed_error,
+               g_triple_pid_output.torque,
+               g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "spd" : "trq");
                
     } else {
         // LQR 模式调试输出
@@ -1593,6 +1619,21 @@ esp_err_t balance_test_init(void) {
         ESP_LOGI(TAG, "Single PID controller initialized (speed output mode)");
     }
     
+    // 初始化三环 PID 控制器 (速度环→角度环→轮速环)
+    ret = triple_pid_init(&g_triple_pid_ctrl, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Triple PID init failed");
+    } else {
+        g_triple_pid_initialized = true;
+        triple_pid_set_angle_zeropoint(&g_triple_pid_ctrl, g_angle_zeropoint);
+        ESP_LOGI(TAG, "Triple PID controller initialized");
+    }
+    
+    // 初始化轮速加权滑动平均滤波器
+    wma_init(&g_wheel_speed_wma);
+    ESP_LOGI(TAG, "Wheel speed WMA filter initialized (12-point, %s)",
+             g_wma_enabled ? "ENABLED" : "DISABLED");
+    
     // 初始化 Commander 解析器
     // - set_callback: 收到设置命令时更新 LQR 参数
     // - query_callback: 收到查询命令时返回 LQR 实际参数
@@ -1799,16 +1840,17 @@ void balance_test_enable(void) {
     g_uncontrolable = 0;
     
     // 电机进入闭环 (根据控制模式选择电机模式)
-    if (g_control_mode == CTRL_MODE_SINGLE_PID) {
-        // 单环 PID 使用速度模式
+    if (g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR ||
+        (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
+        // 单环 PID / 小车 / 三环SPEED模式 使用速度模式
         can_motor_set_mode(g_motor_left, MODE_SPEED);
         can_motor_set_mode(g_motor_right, MODE_SPEED);
-        ESP_LOGI(TAG, "Motor mode: SPEED (single PID)");
+        ESP_LOGI(TAG, "Motor mode: SPEED");
     } else {
-        // LQR / 双环 PID 使用扭矩模式
+        // LQR / 双环 PID / 三环TORQUE模式 使用扭矩模式
         can_motor_set_mode(g_motor_left, MODE_TORQUE);
         can_motor_set_mode(g_motor_right, MODE_TORQUE);
-        ESP_LOGI(TAG, "Motor mode: TORQUE (LQR/dual PID)");
+        ESP_LOGI(TAG, "Motor mode: TORQUE");
     }
     can_motor_enter_closed_loop(g_motor_left);
     can_motor_enter_closed_loop(g_motor_right);
@@ -1890,6 +1932,9 @@ void balance_test_set_angle_zeropoint(float zeropoint) {
     if (g_single_pid_initialized) {
         single_pid_set_angle_zeropoint(&g_single_pid_ctrl, zeropoint);
     }
+    if (g_triple_pid_initialized) {
+        triple_pid_set_angle_zeropoint(&g_triple_pid_ctrl, zeropoint);
+    }
     ESP_LOGI(TAG, "Angle zeropoint set to %.2f (synced to all controllers)", zeropoint);
 }
 
@@ -1899,7 +1944,7 @@ float balance_test_get_angle_zeropoint(void) {
 
 void balance_test_print_status(void) {
     const char *state_names[] = {"IDLE", "READY", "RUNNING", "EMERGENCY", "ERROR"};
-    const char *mode_names[] = {"LQR", "DUAL_PID", "SINGLE_PID", "CAR"};
+    const char *mode_names[] = {"LQR", "DUAL_PID", "SINGLE_PID", "CAR", "TRIPLE_PID"};
     
     ESP_LOGI(TAG, "=== Balance Test Status ===");
     ESP_LOGI(TAG, "State: %s", state_names[g_state]);
@@ -1907,7 +1952,8 @@ void balance_test_print_status(void) {
     ESP_LOGI(TAG, "Control mode: %s (%s)", 
              mode_names[g_control_mode],
              g_control_mode == CTRL_MODE_SINGLE_PID ? "speed output" : 
-             g_control_mode == CTRL_MODE_CAR ? "car speed mode" : "torque output");
+             g_control_mode == CTRL_MODE_CAR ? "car speed mode" :
+             (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED) ? "triple pid speed" : "torque output");
     ESP_LOGI(TAG, "Safety check: %s (uncontrolable=%d)", 
              g_uncontrolable_check_enabled ? "ENABLED" : "DISABLED", g_uncontrolable);
     ESP_LOGI(TAG, "Wheel off-ground: %s (spd_th=%.1f acc_th=%.1f)",
@@ -2387,7 +2433,8 @@ static void update_remote_from_wifi(void) {
             }
             g_control_mode = g_car_mode_prev_mode;
             if (g_state == BALANCE_TEST_RUNNING) {
-                if (g_control_mode == CTRL_MODE_SINGLE_PID) {
+                if (g_control_mode == CTRL_MODE_SINGLE_PID ||
+                    (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
                     can_motor_set_mode(g_motor_left, MODE_SPEED);
                     can_motor_set_mode(g_motor_right, MODE_SPEED);
                 } else {
@@ -2396,7 +2443,8 @@ static void update_remote_from_wifi(void) {
                 }
             }
             const char *restored_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
-                                       (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : "SINGLE_PID";
+                                       (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" :
+                                       (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" : "SINGLE_PID";
             ESP_LOGI(TAG, "WiFi: Exited CAR mode, restored to %s", restored_str);
             printf("CTRL_MODE:%s\n", restored_str);
         }
@@ -2643,6 +2691,9 @@ static void compute_balance_output(float dt) {
         // 注意: 电机安装方向导致正转时机器人向后移动，需要取负号
         // 与 LQR 模式的 g_lqr_speed 计算保持一致
         float wheel_speed_avg = -(left_vel_rad + right_vel_rad) / 2.0f;  // 平均轮速 (rad/s)
+        if (g_wma_enabled) {
+            wheel_speed_avg = wma_compute(&g_wheel_speed_wma, wheel_speed_avg);
+        }
         
         esp_err_t ret = dual_pid_balance_loop(&g_dual_pid_ctrl, 
                                                pitch_for_control, imu.pitch_rate,
@@ -2771,6 +2822,58 @@ static void compute_balance_output(float dt) {
         output.gyro_control = 0;
         output.speed_control = speed_cmd;
         output.filtered_target_speed = speed_cmd;
+        
+    } else if (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_initialized) {
+        // ======== 三环 PID 控制模式 ========
+        // 速度环(外): target_speed - wheel_speed → pitch_target
+        // 角度环(中): pitch_target - pitch → wheel_speed_target
+        // 轮速环(内): wheel_speed_target → torque(软件PID) 或 speed_cmd(电机速度模式)
+        
+        float wheel_speed_avg = -(left_vel_rad + right_vel_rad) / 2.0f;
+        if (g_wma_enabled) {
+            wheel_speed_avg = wma_compute(&g_wheel_speed_wma, wheel_speed_avg);
+        }
+        
+        esp_err_t ret = triple_pid_balance_loop(&g_triple_pid_ctrl,
+                                                 pitch_for_control, imu.pitch_rate,
+                                                 wheel_speed_avg, input.target_speed,
+                                                 dt,
+                                                 &g_triple_pid_output);
+        
+        if (ret != ESP_OK || g_triple_pid_output.emergency) {
+            output.left_wheel_torque = 0;
+            output.right_wheel_torque = 0;
+            g_last_lqr_u = 0;
+        } else {
+            // 三环 PID 输出 (torque 或 speed，取决于 wheel_mode)
+            float ctrl_output = g_triple_pid_output.torque;
+            output.lqr_u = ctrl_output;
+            
+            // YAW 控制 (go=true 或 CLI 强制使能)
+            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
+                lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
+                g_yaw_output = output.yaw_control;
+                output.left_wheel_torque = ctrl_output + g_yaw_output;
+                output.right_wheel_torque = ctrl_output - g_yaw_output;
+            } else {
+                output.left_wheel_torque = ctrl_output;
+                output.right_wheel_torque = ctrl_output;
+                g_yaw_output = 0.0f;
+            }
+            g_last_lqr_u = ctrl_output;
+        }
+        
+        // 轮子离地保护
+        if (g_wheel_off_ground) {
+            g_distance_zeropoint = g_lqr_distance;
+            lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        }
+        
+        // 填充兼容字段用于波形显示
+        output.angle_control = g_triple_pid_output.angle_p_out;
+        output.gyro_control = g_triple_pid_output.angle_d_out;
+        output.speed_control = g_triple_pid_output.speed_p_out;
+        output.filtered_target_speed = g_triple_pid_output.wheel_speed_target;
         
     } else {
         // ======== LQR 多环控制模式 (默认) ========
@@ -3016,7 +3119,7 @@ static void compute_balance_output(float dt) {
     
     // ======== Roll 控制 + X-Offset (非 LQR 模式通用: Dual PID / Single PID) ========
     // 注: 双环PID和单环PID模式下也可以使用 Roll 控制和 X-Offset
-    bool is_non_lqr = (g_control_mode == CTRL_MODE_DUAL_PID || g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR);
+    bool is_non_lqr = (g_control_mode == CTRL_MODE_DUAL_PID || g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR || g_control_mode == CTRL_MODE_TRIPLE_PID);
     if (is_non_lqr && g_leg_control_enabled && g_roll_control_enabled) {
         lqr_roll_output_t roll_output;
         esp_err_t roll_ret = lqr_roll_loop(&g_lqr_ctrl, &input, &roll_output);
@@ -3133,8 +3236,9 @@ static void compute_balance_output(float dt) {
         g_wheel_cmd.left_torque = output.left_wheel_torque;
         g_wheel_cmd.right_torque = output.right_wheel_torque;
     }
-    // 单环 PID 模式和小车模式使用速度模式，其他模式使用扭矩模式
-    g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR);
+    // 单环 PID 模式、小车模式使用速度模式；三环 PID 的 WHEEL_SPEED 模式也使用速度模式
+    g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR
+                                  || (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED));
     // enabled 状态由 balance_test_enable/disable 控制
     xSemaphoreGive(g_wheel_cmd_mutex);
 }
@@ -4368,14 +4472,16 @@ void balance_test_process_cmd(const char *cmd_str) {
         if (token == NULL) {
             const char *mode_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
                                    (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : 
-                                   (g_control_mode == CTRL_MODE_CAR) ? "CAR" : "SINGLE_PID";
+                                   (g_control_mode == CTRL_MODE_CAR) ? "CAR" :
+                                   (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" : "SINGLE_PID";
             printf("Control mode: %s\n", mode_str);
             printf("CTRL_MODE:%s\n", mode_str);
             printf("  LQR:        Multi-loop LQR control (angle+gyro+dist+speed) → torque\n");
             printf("  DUAL_PID:   Dual-loop PID (angle→speed→torque) → torque mode\n");
             printf("  SINGLE_PID: Single-loop PID (angle→speed) → speed mode\n");
             printf("  CAR:        Car mode (no balance, direct speed control)\n");
-            printf("Usage: balance mode [lqr|pid|spid|car]\n");
+            printf("  TRIPLE_PID: Triple-loop PID (speed→angle→wheel) → torque/speed mode\n");
+            printf("Usage: balance mode [lqr|pid|spid|car|tpid]\n");
         } else if (strcmp(token, "lqr") == 0 || strcmp(token, "0") == 0) {
             g_control_mode = CTRL_MODE_LQR;
             // 如果正在运行，切换电机到扭矩模式
@@ -4437,6 +4543,27 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Control mode set to CAR (speed mode, body_angle=%.0f°, leg=%.0fmm)\n",
                    CAR_MODE_BODY_ANGLE, CAR_MODE_LEG_LENGTH * 1000.0f);
             printf("CTRL_MODE:CAR\n");
+        } else if (strcmp(token, "tpid") == 0 || strcmp(token, "triple") == 0 || strcmp(token, "4") == 0) {
+            if (!g_triple_pid_initialized) {
+                printf("Error: Triple PID controller not initialized\n");
+            } else {
+                g_control_mode = CTRL_MODE_TRIPLE_PID;
+                triple_pid_reset(&g_triple_pid_ctrl);
+                // 根据轮速环模式设置电机模式
+                if (g_state == BALANCE_TEST_RUNNING) {
+                    if (g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED) {
+                        can_motor_set_mode(g_motor_left, MODE_SPEED);
+                        can_motor_set_mode(g_motor_right, MODE_SPEED);
+                    } else {
+                        can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                        can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                    }
+                }
+                printf("Control mode set to TRIPLE_PID (%s mode)\n",
+                       g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED 
+                           ? "speed" : "torque");
+                printf("CTRL_MODE:TRIPLE_PID\n");
+            }
         } else if (strcmp(token, "exit_car") == 0) {
             // 退出小车模式: 恢复之前的模式和腿部姿态
             if (g_control_mode != CTRL_MODE_CAR) {
@@ -4459,7 +4586,8 @@ void balance_test_process_cmd(const char *cmd_str) {
                 
                 // 恢复电机模式
                 if (g_state == BALANCE_TEST_RUNNING) {
-                    if (g_control_mode == CTRL_MODE_SINGLE_PID) {
+                    if (g_control_mode == CTRL_MODE_SINGLE_PID || 
+                        (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
                         can_motor_set_mode(g_motor_left, MODE_SPEED);
                         can_motor_set_mode(g_motor_right, MODE_SPEED);
                     } else {
@@ -4469,13 +4597,14 @@ void balance_test_process_cmd(const char *cmd_str) {
                 }
                 
                 const char *restored_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
-                                           (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : "SINGLE_PID";
+                                           (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" :
+                                           (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" : "SINGLE_PID";
                 printf("Exited car mode, restored to %s\n", restored_str);
                 printf("CTRL_MODE:%s\n", restored_str);
             }
         } else {
             printf("Unknown mode: %s\n", token);
-            printf("Usage: balance mode [lqr|pid|spid|car|exit_car]\n");
+            printf("Usage: balance mode [lqr|pid|spid|car|tpid|exit_car]\n");
         }
     }
     // ===== 双环 PID 调参命令 =====
@@ -4503,11 +4632,15 @@ void balance_test_process_cmd(const char *cmd_str) {
                        g_dual_pid_ctrl.params.speed_kd, g_dual_pid_ctrl.params.speed_limit);
             }
             printf("Angle zeropoint: %.2f deg\n", g_dual_pid_ctrl.params.angle_zeropoint);
+            printf("Gyro PID (damping): kp=%.4f ki=%.4f kd=%.6f limit=%.1f\n",
+                   g_dual_pid_ctrl.params.gyro_kp, g_dual_pid_ctrl.params.gyro_ki,
+                   g_dual_pid_ctrl.params.gyro_kd, g_dual_pid_ctrl.params.gyro_limit);
             printf("Speed cmd gain: %.1f (SPEED_FIRST 外环指令增益)\n", g_dual_pid_ctrl.params.speed_cmd_gain);
             printf("Max torque: %.1f Nm\n", g_dual_pid_ctrl.params.max_torque);
             printf("\nUsage: balance dpid angle <kp> <ki> <kd>\n");
             printf("       balance dpid speed <kp> <ki> <kd>\n");
             printf("       balance dpid gain <value>  (speed_cmd_gain for SPEED_FIRST)\n");
+            printf("       balance dpid gyro <kp> <ki> <kd>  (角速度阻尼PID)\n");
             printf("       balance dpid zero <degrees>\n");
             printf("       balance dpid order <0|1>  (0=ANGLE_FIRST, 1=SPEED_FIRST)\n");
             printf("       balance dpid reset\n");
@@ -4559,6 +4692,20 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Usage: balance dpid gain <value>\n");
                 printf("  在 SPEED_FIRST 模式中, target_speed 会乘以此增益再送入速度外环\n");
             }
+        } else if (strcmp(token, "gyro") == 0) {
+            // 设置角速度阻尼PID
+            float kp = g_dual_pid_ctrl.params.gyro_kp;
+            float ki = g_dual_pid_ctrl.params.gyro_ki;
+            float kd = g_dual_pid_ctrl.params.gyro_kd;
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            dual_pid_set_gyro_gains(&g_dual_pid_ctrl, kp, ki, kd);
+            printf("Gyro PID set: kp=%.4f ki=%.4f kd=%.6f\n", kp, ki, kd);
+            printf("DPID:GYRO,%.4f,%.4f,%.6f\n", kp, ki, kd);
         } else if (strcmp(token, "zero") == 0) {
             // 设置角度零点 (同步到所有控制器)
             token = strtok(NULL, " \t\n\r");
@@ -4614,6 +4761,9 @@ void balance_test_process_cmd(const char *cmd_str) {
                    g_dual_pid_output.angle_p_out, g_dual_pid_output.angle_i_out, g_dual_pid_output.angle_d_out);
             printf("Speed PID: P=%.2f I=%.2f D=%.3f\n",
                    g_dual_pid_output.speed_p_out, g_dual_pid_output.speed_i_out, g_dual_pid_output.speed_d_out);
+            printf("Gyro PID:  P=%.4f I=%.4f D=%.6f (kp=%.4f ki=%.4f kd=%.6f)\n",
+                   g_dual_pid_output.gyro_p_out, g_dual_pid_output.gyro_i_out, g_dual_pid_output.gyro_d_out,
+                   g_dual_pid_ctrl.params.gyro_kp, g_dual_pid_ctrl.params.gyro_ki, g_dual_pid_ctrl.params.gyro_kd);
             // 输出 Qt 可解析格式
             printf("DPID_STATUS:PITCH_ERR=%.2f,TGT_SPD=%.2f,SPD_ERR=%.2f,TORQUE=%.2f,ORDER=%d\n",
                    g_dual_pid_output.angle_error, g_dual_pid_output.target_speed,
@@ -4621,7 +4771,7 @@ void balance_test_process_cmd(const char *cmd_str) {
                    g_dual_pid_ctrl.params.loop_order);
         } else {
             printf("Unknown dpid command: %s\n", token);
-            printf("Usage: balance dpid [angle|speed|gain|zero|order|reset|status]\n");
+            printf("Usage: balance dpid [angle|speed|gain|gyro|zero|order|reset|status]\n");
         }
     }
     // ===== 单环 PID 调参命令 =====
@@ -4701,6 +4851,196 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance spid [angle|limit|zero|reset|status]\n");
         }
     }
+    // ===== 三环 PID 调参命令 =====
+    else if (strcmp(token, "tpid") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            const char *wm_str = g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED
+                ? "SPEED_CMD (电机速度模式)" : "TORQUE_PID (软件PID→扭矩)";
+            printf("=== Triple PID Parameters ===\n");
+            printf("Architecture: Speed(outer) → Angle(mid) → Wheel(inner)\n");
+            printf("Wheel mode: %s\n", wm_str);
+            printf("Speed PID (outer): kp=%.6f ki=%.6f kd=%.6f limit=%.1f\n",
+                   g_triple_pid_ctrl.params.speed_kp, g_triple_pid_ctrl.params.speed_ki,
+                   g_triple_pid_ctrl.params.speed_kd, g_triple_pid_ctrl.params.speed_limit);
+            printf("Angle PID (mid):   kp=%.6f ki=%.6f kd=%.6f limit=%.1f\n",
+                   g_triple_pid_ctrl.params.angle_kp, g_triple_pid_ctrl.params.angle_ki,
+                   g_triple_pid_ctrl.params.angle_kd, g_triple_pid_ctrl.params.angle_limit);
+            printf("Wheel PID (inner): kp=%.4f ki=%.4f kd=%.4f limit=%.1f\n",
+                   g_triple_pid_ctrl.params.wheel_kp, g_triple_pid_ctrl.params.wheel_ki,
+                   g_triple_pid_ctrl.params.wheel_kd, g_triple_pid_ctrl.params.wheel_limit);
+            printf("Gyro PID (damping): kp=%.4f ki=%.4f kd=%.6f limit=%.1f\n",
+                   g_triple_pid_ctrl.params.gyro_kp, g_triple_pid_ctrl.params.gyro_ki,
+                   g_triple_pid_ctrl.params.gyro_kd, g_triple_pid_ctrl.params.gyro_limit);
+            printf("Angle zeropoint: %.2f deg\n", g_triple_pid_ctrl.params.angle_zeropoint);
+            printf("Speed cmd gain: %.1f\n", g_triple_pid_ctrl.params.speed_cmd_gain);
+            printf("Max torque: %.1f Nm\n", g_triple_pid_ctrl.params.max_torque);
+            printf("\nUsage: balance tpid angle <kp> <ki> <kd>\n");
+            printf("       balance tpid speed <kp> <ki> <kd>\n");
+            printf("       balance tpid wheel <kp> <ki> <kd>\n");
+            printf("       balance tpid gyro <kp> <ki> <kd>  (角速度阻尼PID)\n");
+            printf("       balance tpid gain <value>  (speed_cmd_gain)\n");
+            printf("       balance tpid wmode <0|1>  (0=SPEED_CMD, 1=TORQUE_PID)\n");
+            printf("       balance tpid zero <degrees>\n");
+            printf("       balance tpid reset\n");
+            printf("       balance tpid status\n");
+        } else if (strcmp(token, "angle") == 0) {
+            float kp = g_triple_pid_ctrl.params.angle_kp;
+            float ki = g_triple_pid_ctrl.params.angle_ki;
+            float kd = g_triple_pid_ctrl.params.angle_kd;
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            triple_pid_set_angle_gains(&g_triple_pid_ctrl, kp, ki, kd);
+            printf("Triple PID Angle set: kp=%.6f ki=%.6f kd=%.6f\n", kp, ki, kd);
+            printf("TPID:ANGLE,%.6f,%.6f,%.6f\n", kp, ki, kd);
+        } else if (strcmp(token, "speed") == 0) {
+            float kp = g_triple_pid_ctrl.params.speed_kp;
+            float ki = g_triple_pid_ctrl.params.speed_ki;
+            float kd = g_triple_pid_ctrl.params.speed_kd;
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            triple_pid_set_speed_gains(&g_triple_pid_ctrl, kp, ki, kd);
+            printf("Triple PID Speed set: kp=%.6f ki=%.6f kd=%.6f\n", kp, ki, kd);
+            printf("TPID:SPEED,%.6f,%.6f,%.6f\n", kp, ki, kd);
+        } else if (strcmp(token, "wheel") == 0) {
+            float kp = g_triple_pid_ctrl.params.wheel_kp;
+            float ki = g_triple_pid_ctrl.params.wheel_ki;
+            float kd = g_triple_pid_ctrl.params.wheel_kd;
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            triple_pid_set_wheel_gains(&g_triple_pid_ctrl, kp, ki, kd);
+            printf("Triple PID Wheel set: kp=%.4f ki=%.4f kd=%.4f\n", kp, ki, kd);
+            printf("TPID:WHEEL,%.4f,%.4f,%.4f\n", kp, ki, kd);
+        } else if (strcmp(token, "gyro") == 0) {
+            // 设置角速度阻尼PID
+            float kp = g_triple_pid_ctrl.params.gyro_kp;
+            float ki = g_triple_pid_ctrl.params.gyro_ki;
+            float kd = g_triple_pid_ctrl.params.gyro_kd;
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            triple_pid_set_gyro_gains(&g_triple_pid_ctrl, kp, ki, kd);
+            printf("Triple PID Gyro set: kp=%.4f ki=%.4f kd=%.6f\n", kp, ki, kd);
+            printf("TPID:GYRO,%.4f,%.4f,%.6f\n", kp, ki, kd);
+        } else if (strcmp(token, "gain") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float gain = atof(token);
+                g_triple_pid_ctrl.params.speed_cmd_gain = gain;
+                printf("Triple PID speed cmd gain set to %.1f\n", gain);
+                printf("TPID:GAIN,%.4f\n", gain);
+            } else {
+                printf("Current speed_cmd_gain: %.1f\n", g_triple_pid_ctrl.params.speed_cmd_gain);
+            }
+        } else if (strcmp(token, "wmode") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                int mode = atoi(token);
+                if (mode == 0 || mode == 1) {
+                    triple_pid_set_wheel_mode(&g_triple_pid_ctrl, (uint8_t)mode);
+                    // 如果当前是三环PID模式且正在运行，实时切换电机模式
+                    if (g_control_mode == CTRL_MODE_TRIPLE_PID && g_state == BALANCE_TEST_RUNNING) {
+                        if (mode == TRIPLE_PID_WHEEL_SPEED) {
+                            can_motor_set_mode(g_motor_left, MODE_SPEED);
+                            can_motor_set_mode(g_motor_right, MODE_SPEED);
+                        } else {
+                            can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                            can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                        }
+                    }
+                    printf("Triple PID wheel mode set to %s (%d)\n",
+                           mode == TRIPLE_PID_WHEEL_SPEED ? "SPEED_CMD (电机速度模式)" 
+                                                          : "TORQUE_PID (软件PID→扭矩)", mode);
+                } else {
+                    printf("Invalid mode. Use 0=SPEED_CMD, 1=TORQUE_PID\n");
+                }
+            } else {
+                printf("Current wheel mode: %s (%d)\n",
+                       g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED 
+                           ? "SPEED_CMD (电机速度模式)" : "TORQUE_PID (软件PID→扭矩)",
+                       g_triple_pid_ctrl.params.wheel_mode);
+                printf("Usage: balance tpid wmode <0|1>  (0=SPEED_CMD, 1=TORQUE_PID)\n");
+            }
+        } else if (strcmp(token, "zero") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float zero = atof(token);
+                balance_test_set_angle_zeropoint(zero);
+                printf("Angle zeropoint set to %.2f (synced to all controllers)\n", zero);
+            } else {
+                printf("Current angle zeropoint: %.2f\n", g_angle_zeropoint);
+            }
+        } else if (strcmp(token, "reset") == 0) {
+            triple_pid_reset(&g_triple_pid_ctrl);
+            printf("Triple PID controller reset\n");
+        } else if (strcmp(token, "status") == 0) {
+            printf("=== Triple PID Status ===\n");
+            printf("Control mode: %s\n", g_control_mode == CTRL_MODE_TRIPLE_PID ? "ACTIVE" : "INACTIVE");
+            printf("Wheel mode: %s\n",
+                   g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED 
+                       ? "SPEED_CMD (电机速度模式)" : "TORQUE_PID (软件PID→扭矩)");
+            printf("Speed error: %.2f rad/s\n", g_triple_pid_output.speed_error);
+            printf("Pitch target: %.2f deg\n", g_triple_pid_output.pitch_target);
+            printf("Angle error: %.2f deg\n", g_triple_pid_output.angle_error);
+            printf("Wheel speed target: %.2f rad/s\n", g_triple_pid_output.wheel_speed_target);
+            printf("Wheel speed error: %.2f rad/s\n", g_triple_pid_output.wheel_speed_error);
+            printf("Output: %.2f %s\n", g_triple_pid_output.torque,
+                   g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "rad/s" : "Nm");
+            printf("Speed PID: P=%.4f I=%.4f D=%.6f\n",
+                   g_triple_pid_output.speed_p_out, g_triple_pid_output.speed_i_out, g_triple_pid_output.speed_d_out);
+            printf("Angle PID: P=%.4f I=%.4f D=%.6f\n",
+                   g_triple_pid_output.angle_p_out, g_triple_pid_output.angle_i_out, g_triple_pid_output.angle_d_out);
+            printf("Wheel PID: P=%.4f I=%.4f D=%.6f\n",
+                   g_triple_pid_output.wheel_p_out, g_triple_pid_output.wheel_i_out, g_triple_pid_output.wheel_d_out);
+            printf("Gyro PID:  P=%.4f I=%.4f D=%.6f (kp=%.4f ki=%.4f kd=%.6f)\n",
+                   g_triple_pid_output.gyro_p_out, g_triple_pid_output.gyro_i_out, g_triple_pid_output.gyro_d_out,
+                   g_triple_pid_ctrl.params.gyro_kp, g_triple_pid_ctrl.params.gyro_ki, g_triple_pid_ctrl.params.gyro_kd);
+            printf("TPID_STATUS:PITCH_TGT=%.2f,WHL_TGT=%.2f,TORQUE=%.2f,WMODE=%d\n",
+                   g_triple_pid_output.pitch_target, g_triple_pid_output.wheel_speed_target,
+                   g_triple_pid_output.torque, g_triple_pid_ctrl.params.wheel_mode);
+        } else {
+            printf("Unknown tpid command: %s\n", token);
+            printf("Usage: balance tpid [angle|speed|wheel|gyro|gain|wmode|zero|reset|status]\n");
+        }
+    }
+    // ===== 轮速加权滑动平均滤波器 =====
+    else if (strcmp(token, "wma") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("=== Wheel Speed WMA Filter ===\n");
+            printf("Status: %s\n", g_wma_enabled ? "ENABLED" : "DISABLED");
+            printf("Window: %d points\n", WMA_WINDOW_SIZE);
+            printf("Usage: balance wma [on|off]\n");
+            printf("WMA_STATUS:%d\n", g_wma_enabled ? 1 : 0);
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+            wma_reset(&g_wheel_speed_wma);
+            g_wma_enabled = true;
+            printf("WMA filter ENABLED (%d-point weighted moving average)\n", WMA_WINDOW_SIZE);
+            printf("WMA_STATUS:1\n");
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+            g_wma_enabled = false;
+            printf("WMA filter DISABLED (raw wheel speed)\n");
+            printf("WMA_STATUS:0\n");
+        } else {
+            printf("Unknown wma command: %s\n", token);
+            printf("Usage: balance wma [on|off]\n");
+        }
+    }
     // ===== 遥杆映射比例调节 =====
     else if (strcmp(token, "joy") == 0) {
         token = strtok(NULL, " \t\n\r");
@@ -4738,7 +5078,7 @@ void balance_test_process_cmd(const char *cmd_str) {
     }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|joy]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|wma|joy]\n");
     }
 }
 

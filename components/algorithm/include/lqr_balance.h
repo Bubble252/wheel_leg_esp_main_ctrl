@@ -540,6 +540,13 @@ typedef struct {
     // 遥杆目标速度低通滤波 (与 LQR 的 lpf_joyy 相同)
     float lpf_joyy_tf;     // 滤波时间常数 (默认 0.2)
     
+    // 角速度阻尼环 PID (叠加到角度环输出，参考 LQR 的 gyro_control)
+    // gyro_control = pid_gyro(0, pitch_rate) → 与角度环输出相加
+    float gyro_kp;          // 角速度P (默认 0.0, 即关闭)
+    float gyro_ki;          // 角速度I (默认 0.0)
+    float gyro_kd;          // 角速度D (默认 0.0)
+    float gyro_limit;       // 角速度环输出限幅 (默认 10.0)
+    
     // 环路顺序
     uint8_t loop_order;     // DUAL_PID_ANGLE_FIRST(0) 或 DUAL_PID_SPEED_FIRST(1)
 } dual_pid_params_t;
@@ -560,6 +567,10 @@ typedef struct {
     float speed_p_out;      // 速度环P输出
     float speed_i_out;      // 速度环I输出
     float speed_d_out;      // 速度环D输出
+    float gyro_p_out;       // 角速度阻尼P输出
+    float gyro_i_out;       // 角速度阻尼I输出
+    float gyro_d_out;       // 角速度阻尼D输出
+    float gyro_control;     // 角速度阻尼总输出
     
     bool emergency;         // 是否紧急停止
 } dual_pid_output_t;
@@ -570,6 +581,7 @@ typedef struct {
 typedef struct {
     pid_controller_t pid_angle;     // 直立环 (外环)
     pid_controller_t pid_speed;     // 速度环 (内环)
+    pid_controller_t pid_gyro;      // 角速度阻尼环 (叠加到角度环输出)
     lowpass_filter_t lpf_joyy;      // 遥杆目标速度低通滤波
     
     dual_pid_params_t params;
@@ -621,6 +633,15 @@ void dual_pid_set_angle_gains(dual_pid_controller_t *ctrl, float kp, float ki, f
  * @param kd D增益
  */
 void dual_pid_set_speed_gains(dual_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/**
+ * @brief 设置角速度阻尼环PID增益
+ * @param ctrl 控制器实例
+ * @param kp P增益
+ * @param ki I增益
+ * @param kd D增益
+ */
+void dual_pid_set_gyro_gains(dual_pid_controller_t *ctrl, float kp, float ki, float kd);
 
 /**
  * @brief 设置角度零点
@@ -791,6 +812,169 @@ esp_err_t single_pid_balance_loop(single_pid_controller_t *ctrl,
  * @return true 需要紧急停止
  */
 bool single_pid_check_emergency(single_pid_controller_t *ctrl, float pitch);
+
+// ============================================================================
+// 三环 PID 控制器 (速度环→角度环→轮速环)
+// ============================================================================
+
+/**
+ * @brief 三环PID轮速环输出方式
+ */
+#define TRIPLE_PID_WHEEL_SPEED  0   // 输出速度命令给电机 (MODE_SPEED, 默认)
+#define TRIPLE_PID_WHEEL_TORQUE 1   // 软件PID输出扭矩 (MODE_TORQUE)
+
+/**
+ * @brief 三环PID参数结构体
+ * 
+ * 控制架构 (固定 SPEED_FIRST):
+ *   速度环(外): target_speed - wheel_speed → pitch_target
+ *   角度环(中): pitch_target - pitch → wheel_speed_target
+ *   轮速环(内): wheel_speed_target → torque (软件PID) 或 speed_cmd (电机速度模式)
+ * 
+ * 前两环参数完全复用 dual_pid_params_t (SPEED_FIRST 模式)
+ * 第三环 (轮速环) 有两种工作方式:
+ *   TRIPLE_PID_WHEEL_SPEED:  角度环输出+yaw → 直接作为速度命令发给电机 (MODE_SPEED)
+ *   TRIPLE_PID_WHEEL_TORQUE: 角度环输出+yaw → 轮速PID → 扭矩命令 (MODE_TORQUE)
+ */
+typedef struct {
+    // ---- 前两环: 复用双环PID参数 (固定 SPEED_FIRST) ----
+    // 角度环 PID (中环): pitch_target - pitch → wheel_speed_target
+    float angle_kp;
+    float angle_ki;
+    float angle_kd;
+    float angle_limit;      // 角度环输出限幅 (max wheel_speed_target, rad/s)
+    
+    // 速度环 PID (外环): target_speed - wheel_speed → pitch_target
+    float speed_kp;
+    float speed_ki;
+    float speed_kd;
+    float speed_limit;      // 速度环输出限幅 (max pitch_target, deg)
+    
+    // ---- 第三环: 轮速环 (仅 WHEEL_TORQUE 模式使用) ----
+    float wheel_kp;         // 轮速P (默认 0.5)
+    float wheel_ki;         // 轮速I (默认 0.01)
+    float wheel_kd;         // 轮速D (默认 0.0)
+    float wheel_limit;      // 轮速环输出限幅 (max torque, Nm)
+    
+    // ---- 通用参数 ----
+    float angle_zeropoint;  // 角度零点偏移 (度)
+    float emergency_angle;  // 紧急停止角度 (默认 45.0)
+    float max_torque;       // 最大输出扭矩 (Nm, WHEEL_TORQUE 模式)
+    float speed_cmd_gain;   // 速度指令增益 (同 dual_pid)
+    float lpf_joyy_tf;     // 遥杆目标速度低通滤波时间常数
+    
+    // ---- 角速度阻尼环 PID (叠加到角度环输出) ----
+    float gyro_kp;          // 角速度P (默认 0.0, 即关闭)
+    float gyro_ki;          // 角速度I (默认 0.0)
+    float gyro_kd;          // 角速度D (默认 0.0)
+    float gyro_limit;       // 角速度环输出限幅 (默认 10.0)
+    
+    // ---- 轮速环工作模式 ----
+    uint8_t wheel_mode;     // TRIPLE_PID_WHEEL_SPEED(0) 或 TRIPLE_PID_WHEEL_TORQUE(1)
+} triple_pid_params_t;
+
+/**
+ * @brief 三环PID控制器输出结构体
+ */
+typedef struct {
+    // 速度环 (外环)
+    float speed_error;      // 速度误差
+    float pitch_target;     // 速度环输出: 目标倾角
+    float speed_p_out;
+    float speed_i_out;
+    float speed_d_out;
+    
+    // 角度环 (中环)
+    float angle_error;      // 角度误差
+    float wheel_speed_target; // 角度环输出: 目标轮速 (rad/s)
+    float angle_p_out;
+    float angle_i_out;
+    float angle_d_out;
+    
+    // 角速度阻尼环 (叠加到角度环输出)
+    float gyro_p_out;
+    float gyro_i_out;
+    float gyro_d_out;
+    float gyro_control;     // 角速度阻尼总输出
+    
+    // 轮速环 (内环, 仅 WHEEL_TORQUE 模式有意义)
+    float wheel_speed_error; // 轮速误差
+    float torque;           // 最终输出扭矩 (WHEEL_TORQUE) 或速度 (WHEEL_SPEED)
+    float wheel_p_out;
+    float wheel_i_out;
+    float wheel_d_out;
+    
+    bool emergency;
+} triple_pid_output_t;
+
+/**
+ * @brief 三环PID控制器结构体
+ */
+typedef struct {
+    pid_controller_t pid_angle;     // 角度环 (中环)
+    pid_controller_t pid_speed;     // 速度环 (外环)
+    pid_controller_t pid_wheel;     // 轮速环 (内环, 仅 WHEEL_TORQUE 模式)
+    pid_controller_t pid_gyro;      // 角速度阻尼环 (叠加到角度环输出)
+    lowpass_filter_t lpf_joyy;      // 遥杆目标速度低通滤波
+    
+    triple_pid_params_t params;
+    
+    bool initialized;
+} triple_pid_controller_t;
+
+/** @brief 获取三环PID默认参数 */
+void triple_pid_get_default_params(triple_pid_params_t *params);
+
+/** @brief 初始化三环PID控制器 */
+esp_err_t triple_pid_init(triple_pid_controller_t *ctrl, const triple_pid_params_t *params);
+
+/** @brief 重置三环PID控制器 */
+void triple_pid_reset(triple_pid_controller_t *ctrl);
+
+/** @brief 设置角度环PID增益 */
+void triple_pid_set_angle_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/** @brief 设置速度环PID增益 */
+void triple_pid_set_speed_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/** @brief 设置轮速环PID增益 */
+void triple_pid_set_wheel_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/** @brief 设置角速度阻尼环PID增益 */
+void triple_pid_set_gyro_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/** @brief 设置角度零点 */
+void triple_pid_set_angle_zeropoint(triple_pid_controller_t *ctrl, float zeropoint);
+
+/** @brief 设置轮速环工作模式 */
+void triple_pid_set_wheel_mode(triple_pid_controller_t *ctrl, uint8_t wheel_mode);
+
+/** @brief 检查是否触发紧急停止 */
+bool triple_pid_check_emergency(triple_pid_controller_t *ctrl, float pitch);
+
+/**
+ * @brief 三环PID平衡控制循环
+ * @param ctrl 控制器实例
+ * @param pitch 当前俯仰角 (度)
+ * @param pitch_rate 当前俯仰角速度 (度/秒)
+ * @param wheel_speed 当前轮子速度 (rad/s)
+ * @param target_speed 目标速度 (rad/s), 来自遥杆
+ * @param dt 时间步长 (秒)
+ * @param output 控制输出
+ * @return ESP_OK 成功
+ * 
+ * @note 控制流程 (固定 SPEED_FIRST):
+ *   1. 速度环(外): target_speed - wheel_speed → pitch_target
+ *   2. 角度环(中): pitch_target - pitch → wheel_speed_target
+ *   3. 轮速环(内): 
+ *      WHEEL_SPEED 模式: 直接输出 wheel_speed_target (送电机速度模式)
+ *      WHEEL_TORQUE 模式: wheel_speed_target - wheel_speed → torque (送电机扭矩模式)
+ */
+esp_err_t triple_pid_balance_loop(triple_pid_controller_t *ctrl,
+                                   float pitch, float pitch_rate,
+                                   float wheel_speed, float target_speed,
+                                   float dt,
+                                   triple_pid_output_t *output);
 
 #ifdef __cplusplus
 }

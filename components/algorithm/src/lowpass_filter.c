@@ -124,3 +124,52 @@ float slewrate_compute_dt(slewrate_filter_t *sf, float x, float dt) {
         return y;
     }
 }
+
+// ============================================================================
+// 加权滑动平均滤波器 (Weighted Moving Average, 12-point)
+// 权重: w[oldest]=1, w[oldest+1]=2, ..., w[newest]=12
+// Σw = 12*13/2 = 78
+// ============================================================================
+
+void wma_init(weighted_ma_filter_t *wma) {
+    if (wma == NULL) return;
+    for (int i = 0; i < WMA_WINDOW_SIZE; i++) {
+        wma->buf[i] = 0.0f;
+    }
+    wma->head = 0;
+    wma->count = 0;
+}
+
+void wma_reset(weighted_ma_filter_t *wma) {
+    wma_init(wma);
+}
+
+float wma_compute(weighted_ma_filter_t *wma, float x) {
+    if (wma == NULL) return x;
+    
+    // 写入环形缓冲区
+    wma->buf[wma->head] = x;
+    wma->head = (wma->head + 1) % WMA_WINDOW_SIZE;
+    if (wma->count < WMA_WINDOW_SIZE) {
+        wma->count++;
+    }
+    
+    // 窗口未填满时直通 (避免启动阶段失真)
+    if (wma->count < WMA_WINDOW_SIZE) {
+        return x;
+    }
+    
+    // 计算加权平均
+    // buf[head] 是最老的采样 (即将被覆盖的位置), 权重=1
+    // buf[head-1] 是最新的采样, 权重=12
+    float weighted_sum = 0.0f;
+    int idx = wma->head;  // 最老的采样
+    for (int w = 1; w <= WMA_WINDOW_SIZE; w++) {
+        weighted_sum += (float)w * wma->buf[idx];
+        idx = (idx + 1) % WMA_WINDOW_SIZE;
+    }
+    
+    // Σw = WMA_WINDOW_SIZE * (WMA_WINDOW_SIZE + 1) / 2 = 78
+    const float weight_sum = (float)(WMA_WINDOW_SIZE * (WMA_WINDOW_SIZE + 1)) / 2.0f;
+    return weighted_sum / weight_sum;
+}

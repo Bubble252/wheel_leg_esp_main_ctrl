@@ -4000,6 +4000,12 @@ class DualPIDPanel(QWidget):
         self.spid_btn.clicked.connect(lambda: self.set_mode("spid"))
         mode_layout.addWidget(self.spid_btn)
         
+        self.tpid_btn = QPushButton("🟣 三环PID")
+        self.tpid_btn.setToolTip("三环 PID 控制 (速度→角度→轮速)")
+        self.tpid_btn.setStyleSheet(SS("background-color: #9C27B0; color: white;"))
+        self.tpid_btn.clicked.connect(lambda: self.set_mode("tpid"))
+        mode_layout.addWidget(self.tpid_btn)
+        
         self.mode_status_btn = QPushButton("📊 状态")
         self.mode_status_btn.clicked.connect(lambda: self.send_cmd("balance mode"))
         mode_layout.addWidget(self.mode_status_btn)
@@ -4128,6 +4134,45 @@ class DualPIDPanel(QWidget):
         
         self.speed_group.setLayout(speed_layout)
         layout.addWidget(self.speed_group)
+        
+        # 角速度阻尼 PID (Gyro damping)
+        gyro_group = QGroupBox("🌀 角速度阻尼 PID (pitch_rate → 扭矩补偿)")
+        gyro_layout = QGridLayout()
+        
+        gyro_layout.addWidget(QLabel("Kp:"), 0, 0)
+        self.dpid_gyro_kp = QDoubleSpinBox()
+        self.dpid_gyro_kp.setRange(0, 10)
+        self.dpid_gyro_kp.setSingleStep(0.001)
+        self.dpid_gyro_kp.setDecimals(4)
+        self.dpid_gyro_kp.setValue(0.0)
+        gyro_layout.addWidget(self.dpid_gyro_kp, 0, 1)
+        
+        gyro_layout.addWidget(QLabel("Ki:"), 0, 2)
+        self.dpid_gyro_ki = QDoubleSpinBox()
+        self.dpid_gyro_ki.setRange(0, 1)
+        self.dpid_gyro_ki.setSingleStep(0.001)
+        self.dpid_gyro_ki.setDecimals(4)
+        self.dpid_gyro_ki.setValue(0.0)
+        gyro_layout.addWidget(self.dpid_gyro_ki, 0, 3)
+        
+        gyro_layout.addWidget(QLabel("Kd:"), 0, 4)
+        self.dpid_gyro_kd = QDoubleSpinBox()
+        self.dpid_gyro_kd.setRange(0, 1)
+        self.dpid_gyro_kd.setSingleStep(0.0001)
+        self.dpid_gyro_kd.setDecimals(6)
+        self.dpid_gyro_kd.setValue(0.0)
+        gyro_layout.addWidget(self.dpid_gyro_kd, 0, 5)
+        
+        self.dpid_gyro_send_btn = QPushButton("发送")
+        self.dpid_gyro_send_btn.clicked.connect(self.send_dpid_gyro)
+        gyro_layout.addWidget(self.dpid_gyro_send_btn, 0, 6)
+        
+        gyro_note = QLabel("tip: 参考LQR角速度阻尼, setpoint=0, 默认全0(关闭)")
+        gyro_note.setStyleSheet(SS("color: #666; font-size: 10px;"))
+        gyro_layout.addWidget(gyro_note, 1, 0, 1, 7)
+        
+        gyro_group.setLayout(gyro_layout)
+        layout.addWidget(gyro_group)
         
         # 角度零点
         zero_group = QGroupBox("角度零点")
@@ -4282,6 +4327,63 @@ class DualPIDPanel(QWidget):
         
         status_main_layout.addWidget(spid_frame)
         
+        # === 三环 PID 状态 ===
+        tpid_frame = QFrame()
+        tpid_frame.setStyleSheet(SS("QFrame { background-color: #1a1a2a; border-radius: 5px; padding: 5px; }"))
+        tpid_status_layout = QGridLayout(tpid_frame)
+        tpid_status_layout.setSpacing(8)
+        
+        tpid_title = QLabel("🟣 三环 PID")
+        tpid_title.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #9C27B0;"))
+        tpid_status_layout.addWidget(tpid_title, 0, 0, 1, 2)
+        
+        self.tpid_wmode_label = QLabel("模式: --")
+        self.tpid_wmode_label.setStyleSheet(SS("font-weight: bold; color: #bb88ff;"))
+        tpid_status_layout.addWidget(self.tpid_wmode_label, 0, 2, 1, 2)
+        
+        self.tpid_pitch_label = QLabel("pitch: --°")
+        self.tpid_pitch_label.setStyleSheet(SS("font-weight: bold; color: #ffcc00;"))
+        tpid_status_layout.addWidget(self.tpid_pitch_label, 0, 4, 1, 2)
+        
+        self.tpid_wspd_label = QLabel("spd: --")
+        self.tpid_wspd_label.setStyleSheet(SS("font-weight: bold; color: #88ccff;"))
+        tpid_status_layout.addWidget(self.tpid_wspd_label, 0, 6, 1, 2)
+        
+        # 第二行: 速度环(外)
+        tpid_status_layout.addWidget(QLabel("速度环(外):"), 1, 0)
+        tpid_status_layout.addWidget(QLabel("err="), 1, 1)
+        self.tpid_spd_err = QLabel("--")
+        self.tpid_spd_err.setStyleSheet(SS("color: #ff8800;"))
+        tpid_status_layout.addWidget(self.tpid_spd_err, 1, 2)
+        tpid_status_layout.addWidget(QLabel("→ pitch_tgt="), 1, 3)
+        self.tpid_pitch_tgt = QLabel("--°")
+        self.tpid_pitch_tgt.setStyleSheet(SS("color: #00aaff;"))
+        tpid_status_layout.addWidget(self.tpid_pitch_tgt, 1, 4)
+        
+        # 第三行: 角度环(中)
+        tpid_status_layout.addWidget(QLabel("角度环(中):"), 2, 0)
+        tpid_status_layout.addWidget(QLabel("err="), 2, 1)
+        self.tpid_ang_err = QLabel("--")
+        self.tpid_ang_err.setStyleSheet(SS("color: #ff8800;"))
+        tpid_status_layout.addWidget(self.tpid_ang_err, 2, 2)
+        tpid_status_layout.addWidget(QLabel("→ whl_tgt="), 2, 3)
+        self.tpid_whl_tgt = QLabel("--")
+        self.tpid_whl_tgt.setStyleSheet(SS("color: #00aaff;"))
+        tpid_status_layout.addWidget(self.tpid_whl_tgt, 2, 4)
+        
+        # 第四行: 轮速环(内)
+        tpid_status_layout.addWidget(QLabel("轮速环(内):"), 3, 0)
+        tpid_status_layout.addWidget(QLabel("err="), 3, 1)
+        self.tpid_whl_err = QLabel("--")
+        self.tpid_whl_err.setStyleSheet(SS("color: #ff8800;"))
+        tpid_status_layout.addWidget(self.tpid_whl_err, 3, 2)
+        tpid_status_layout.addWidget(QLabel("→ out="), 3, 3)
+        self.tpid_out = QLabel("--")
+        self.tpid_out.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #00ff88;"))
+        tpid_status_layout.addWidget(self.tpid_out, 3, 4)
+        
+        status_main_layout.addWidget(tpid_frame)
+        
         # 刷新按钮
         status_btn_layout = QHBoxLayout()
         self.refresh_btn = QPushButton("🔄 刷新状态")
@@ -4391,6 +4493,188 @@ class DualPIDPanel(QWidget):
         spid_group.setLayout(spid_layout)
         layout.addWidget(spid_group)
         
+        # ========== 三环 PID 参数区域 (速度→角度→轮速) ==========
+        tpid_group = QGroupBox("🟣 三环 PID 参数 (速度→角度→轮速)")
+        tpid_group.setStyleSheet(SS("QGroupBox { color: #9C27B0; }"))
+        tpid_main_layout = QVBoxLayout()
+        
+        tpid_desc = QLabel("三环串级: 速度环(外)→角度环(中)→轮速环(内)，轮速环可选速度/扭矩输出")
+        tpid_desc.setStyleSheet(SS("color: #888; font-size: 10px;"))
+        tpid_main_layout.addWidget(tpid_desc)
+        
+        # 速度环 PID (外环)
+        tpid_speed_layout = QGridLayout()
+        tpid_speed_layout.addWidget(QLabel("速度环(外):"), 0, 0)
+        tpid_speed_layout.addWidget(QLabel("Kp:"), 0, 1)
+        self.tpid_speed_kp = QDoubleSpinBox()
+        self.tpid_speed_kp.setRange(0, 10)
+        self.tpid_speed_kp.setSingleStep(0.0001)
+        self.tpid_speed_kp.setDecimals(6)
+        self.tpid_speed_kp.setValue(0.85)
+        tpid_speed_layout.addWidget(self.tpid_speed_kp, 0, 2)
+        tpid_speed_layout.addWidget(QLabel("Ki:"), 0, 3)
+        self.tpid_speed_ki = QDoubleSpinBox()
+        self.tpid_speed_ki.setRange(0, 1)
+        self.tpid_speed_ki.setSingleStep(0.000001)
+        self.tpid_speed_ki.setDecimals(6)
+        self.tpid_speed_ki.setValue(0.00006)
+        tpid_speed_layout.addWidget(self.tpid_speed_ki, 0, 4)
+        tpid_speed_layout.addWidget(QLabel("Kd:"), 0, 5)
+        self.tpid_speed_kd = QDoubleSpinBox()
+        self.tpid_speed_kd.setRange(0, 1)
+        self.tpid_speed_kd.setSingleStep(0.000001)
+        self.tpid_speed_kd.setDecimals(6)
+        self.tpid_speed_kd.setValue(0.0)
+        tpid_speed_layout.addWidget(self.tpid_speed_kd, 0, 6)
+        self.tpid_speed_send = QPushButton("发送")
+        self.tpid_speed_send.clicked.connect(self.send_tpid_speed)
+        tpid_speed_layout.addWidget(self.tpid_speed_send, 0, 7)
+        tpid_main_layout.addLayout(tpid_speed_layout)
+        
+        # 角度环 PID (中环)
+        tpid_angle_layout = QGridLayout()
+        tpid_angle_layout.addWidget(QLabel("角度环(中):"), 0, 0)
+        tpid_angle_layout.addWidget(QLabel("Kp:"), 0, 1)
+        self.tpid_angle_kp = QDoubleSpinBox()
+        self.tpid_angle_kp.setRange(0, 100)
+        self.tpid_angle_kp.setSingleStep(0.001)
+        self.tpid_angle_kp.setDecimals(6)
+        self.tpid_angle_kp.setValue(1.2)
+        tpid_angle_layout.addWidget(self.tpid_angle_kp, 0, 2)
+        tpid_angle_layout.addWidget(QLabel("Ki:"), 0, 3)
+        self.tpid_angle_ki = QDoubleSpinBox()
+        self.tpid_angle_ki.setRange(0, 10)
+        self.tpid_angle_ki.setSingleStep(0.000001)
+        self.tpid_angle_ki.setDecimals(6)
+        self.tpid_angle_ki.setValue(0.0)
+        tpid_angle_layout.addWidget(self.tpid_angle_ki, 0, 4)
+        tpid_angle_layout.addWidget(QLabel("Kd:"), 0, 5)
+        self.tpid_angle_kd = QDoubleSpinBox()
+        self.tpid_angle_kd.setRange(0, 10)
+        self.tpid_angle_kd.setSingleStep(0.001)
+        self.tpid_angle_kd.setDecimals(6)
+        self.tpid_angle_kd.setValue(0.0)
+        tpid_angle_layout.addWidget(self.tpid_angle_kd, 0, 6)
+        self.tpid_angle_send = QPushButton("发送")
+        self.tpid_angle_send.clicked.connect(self.send_tpid_angle)
+        tpid_angle_layout.addWidget(self.tpid_angle_send, 0, 7)
+        tpid_main_layout.addLayout(tpid_angle_layout)
+        
+        # 轮速环 PID (内环)
+        tpid_wheel_layout = QGridLayout()
+        tpid_wheel_layout.addWidget(QLabel("轮速环(内):"), 0, 0)
+        tpid_wheel_layout.addWidget(QLabel("Kp:"), 0, 1)
+        self.tpid_wheel_kp = QDoubleSpinBox()
+        self.tpid_wheel_kp.setRange(0, 100)
+        self.tpid_wheel_kp.setSingleStep(0.1)
+        self.tpid_wheel_kp.setDecimals(4)
+        self.tpid_wheel_kp.setValue(0.5)
+        tpid_wheel_layout.addWidget(self.tpid_wheel_kp, 0, 2)
+        tpid_wheel_layout.addWidget(QLabel("Ki:"), 0, 3)
+        self.tpid_wheel_ki = QDoubleSpinBox()
+        self.tpid_wheel_ki.setRange(0, 10)
+        self.tpid_wheel_ki.setSingleStep(0.01)
+        self.tpid_wheel_ki.setDecimals(4)
+        self.tpid_wheel_ki.setValue(0.01)
+        tpid_wheel_layout.addWidget(self.tpid_wheel_ki, 0, 4)
+        tpid_wheel_layout.addWidget(QLabel("Kd:"), 0, 5)
+        self.tpid_wheel_kd = QDoubleSpinBox()
+        self.tpid_wheel_kd.setRange(0, 10)
+        self.tpid_wheel_kd.setSingleStep(0.001)
+        self.tpid_wheel_kd.setDecimals(4)
+        self.tpid_wheel_kd.setValue(0.0)
+        tpid_wheel_layout.addWidget(self.tpid_wheel_kd, 0, 6)
+        self.tpid_wheel_send = QPushButton("发送")
+        self.tpid_wheel_send.clicked.connect(self.send_tpid_wheel)
+        tpid_wheel_layout.addWidget(self.tpid_wheel_send, 0, 7)
+        tpid_main_layout.addLayout(tpid_wheel_layout)
+        
+        # 角速度阻尼 PID (Gyro damping)
+        tpid_gyro_layout = QGridLayout()
+        tpid_gyro_layout.addWidget(QLabel("角速度阻尼:"), 0, 0)
+        tpid_gyro_layout.addWidget(QLabel("Kp:"), 0, 1)
+        self.tpid_gyro_kp = QDoubleSpinBox()
+        self.tpid_gyro_kp.setRange(0, 10)
+        self.tpid_gyro_kp.setSingleStep(0.001)
+        self.tpid_gyro_kp.setDecimals(4)
+        self.tpid_gyro_kp.setValue(0.1)
+        tpid_gyro_layout.addWidget(self.tpid_gyro_kp, 0, 2)
+        tpid_gyro_layout.addWidget(QLabel("Ki:"), 0, 3)
+        self.tpid_gyro_ki = QDoubleSpinBox()
+        self.tpid_gyro_ki.setRange(0, 1)
+        self.tpid_gyro_ki.setSingleStep(0.001)
+        self.tpid_gyro_ki.setDecimals(4)
+        self.tpid_gyro_ki.setValue(0.0)
+        tpid_gyro_layout.addWidget(self.tpid_gyro_ki, 0, 4)
+        tpid_gyro_layout.addWidget(QLabel("Kd:"), 0, 5)
+        self.tpid_gyro_kd = QDoubleSpinBox()
+        self.tpid_gyro_kd.setRange(0, 1)
+        self.tpid_gyro_kd.setSingleStep(0.0001)
+        self.tpid_gyro_kd.setDecimals(6)
+        self.tpid_gyro_kd.setValue(0.0)
+        tpid_gyro_layout.addWidget(self.tpid_gyro_kd, 0, 6)
+        self.tpid_gyro_send = QPushButton("发送")
+        self.tpid_gyro_send.clicked.connect(self.send_tpid_gyro)
+        tpid_gyro_layout.addWidget(self.tpid_gyro_send, 0, 7)
+        tpid_main_layout.addLayout(tpid_gyro_layout)
+        
+        # 轮速环模式 + 增益 + 操作
+        tpid_ctrl_layout = QHBoxLayout()
+        tpid_ctrl_layout.addWidget(QLabel("轮速环模式:"))
+        self.tpid_wmode_combo = QComboBox()
+        self.tpid_wmode_combo.addItem("速度直驱 (0)", 0)
+        self.tpid_wmode_combo.addItem("扭矩PID (1)", 1)
+        tpid_ctrl_layout.addWidget(self.tpid_wmode_combo)
+        self.tpid_wmode_btn = QPushButton("切换")
+        self.tpid_wmode_btn.clicked.connect(self.send_tpid_wmode)
+        tpid_ctrl_layout.addWidget(self.tpid_wmode_btn)
+        
+        tpid_ctrl_layout.addWidget(QLabel("指令增益:"))
+        self.tpid_gain = QDoubleSpinBox()
+        self.tpid_gain.setRange(0, 999999)
+        self.tpid_gain.setSingleStep(1000)
+        self.tpid_gain.setDecimals(1)
+        self.tpid_gain.setValue(8000.0)
+        self.tpid_gain.setToolTip("speed_cmd_gain: target_speed × 此增益 → 速度外环输入\n三环模式建议 5000~10000 (角度环输出是速度，量级比双环大)")
+        tpid_ctrl_layout.addWidget(self.tpid_gain)
+        self.tpid_gain_btn = QPushButton("发送")
+        self.tpid_gain_btn.clicked.connect(self.send_tpid_gain)
+        tpid_ctrl_layout.addWidget(self.tpid_gain_btn)
+        
+        tpid_ctrl_layout.addStretch()
+        
+        self.tpid_status_btn = QPushButton("📊 状态")
+        self.tpid_status_btn.clicked.connect(lambda: self.send_cmd("balance tpid status"))
+        tpid_ctrl_layout.addWidget(self.tpid_status_btn)
+        
+        self.tpid_reset_btn = QPushButton("🔄 重置")
+        self.tpid_reset_btn.clicked.connect(lambda: self.send_cmd("balance tpid reset"))
+        tpid_ctrl_layout.addWidget(self.tpid_reset_btn)
+        
+        tpid_main_layout.addLayout(tpid_ctrl_layout)
+        
+        # 轮速 WMA 滤波器开关 (12点加权滑动平均)
+        wma_layout = QHBoxLayout()
+        wma_layout.addWidget(QLabel("轮速滤波:"))
+        self.wma_toggle_btn = QPushButton("WMA 滤波: OFF")
+        self.wma_toggle_btn.setCheckable(True)
+        self.wma_toggle_btn.setChecked(False)
+        self.wma_toggle_btn.setToolTip("12点加权滑动平均滤波器 (用于双环/三环PID的轮速输入)\n"
+                                        "权重线性递增 w=[1,2,...,12]，群延迟~6ms @500Hz\n"
+                                        "对编码器噪声有良好抑制效果")
+        self.wma_toggle_btn.setStyleSheet("""
+            QPushButton { padding: 4px 12px; border-radius: 4px; 
+                          background: #555; color: #ccc; font-weight: bold; }
+            QPushButton:checked { background: #4CAF50; color: white; }
+        """)
+        self.wma_toggle_btn.clicked.connect(self.toggle_wma_filter)
+        wma_layout.addWidget(self.wma_toggle_btn)
+        wma_layout.addStretch()
+        tpid_main_layout.addLayout(wma_layout)
+        
+        tpid_group.setLayout(tpid_main_layout)
+        layout.addWidget(tpid_group)
+        
         # ========== 调试输出控制 ==========
         debug_group = QGroupBox("🔧 实时调试输出")
         debug_group.setStyleSheet(SS("QGroupBox { color: #9C27B0; }"))
@@ -4444,6 +4728,9 @@ class DualPIDPanel(QWidget):
         elif mode == "spid":
             self.mode_label.setText("当前模式: 单环 PID (速度)")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF9800;"))
+        elif mode == "tpid":
+            self.mode_label.setText("当前模式: 三环 PID")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #9C27B0;"))
         else:
             self.mode_label.setText("当前模式: LQR")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #2196F3;"))
@@ -4491,6 +4778,13 @@ class DualPIDPanel(QWidget):
         kd = self.speed_kd.value()
         self.send_cmd(f"balance dpid speed {kp} {ki} {kd}")
     
+    def send_dpid_gyro(self):
+        """发送双环 PID 角速度阻尼参数"""
+        kp = self.dpid_gyro_kp.value()
+        ki = self.dpid_gyro_ki.value()
+        kd = self.dpid_gyro_kd.value()
+        self.send_cmd(f"balance dpid gyro {kp} {ki} {kd}")
+    
     def send_speed_cmd_gain(self):
         gain = self.speed_cmd_gain.value()
         self.send_cmd(f"balance dpid gain {gain}")
@@ -4506,6 +4800,50 @@ class DualPIDPanel(QWidget):
         """发送单环 PID 输出限幅"""
         limit = self.spid_limit.value()
         self.send_cmd(f"balance spid limit {limit}")
+    
+    def send_tpid_speed(self):
+        """发送三环 PID 速度环参数"""
+        kp = self.tpid_speed_kp.value()
+        ki = self.tpid_speed_ki.value()
+        kd = self.tpid_speed_kd.value()
+        self.send_cmd(f"balance tpid speed {kp} {ki} {kd}")
+    
+    def send_tpid_angle(self):
+        """发送三环 PID 角度环参数"""
+        kp = self.tpid_angle_kp.value()
+        ki = self.tpid_angle_ki.value()
+        kd = self.tpid_angle_kd.value()
+        self.send_cmd(f"balance tpid angle {kp} {ki} {kd}")
+    
+    def send_tpid_wheel(self):
+        """发送三环 PID 轮速环参数"""
+        kp = self.tpid_wheel_kp.value()
+        ki = self.tpid_wheel_ki.value()
+        kd = self.tpid_wheel_kd.value()
+        self.send_cmd(f"balance tpid wheel {kp} {ki} {kd}")
+    
+    def send_tpid_gyro(self):
+        """发送三环 PID 角速度阻尼参数"""
+        kp = self.tpid_gyro_kp.value()
+        ki = self.tpid_gyro_ki.value()
+        kd = self.tpid_gyro_kd.value()
+        self.send_cmd(f"balance tpid gyro {kp} {ki} {kd}")
+    
+    def send_tpid_wmode(self):
+        """发送三环 PID 轮速环模式切换"""
+        wmode = self.tpid_wmode_combo.currentData()
+        self.send_cmd(f"balance tpid wmode {wmode}")
+    
+    def send_tpid_gain(self):
+        """发送三环 PID 速度指令增益"""
+        gain = self.tpid_gain.value()
+        self.send_cmd(f"balance tpid gain {gain}")
+    
+    def toggle_wma_filter(self):
+        """切换轮速 WMA 滤波器开关"""
+        enabled = self.wma_toggle_btn.isChecked()
+        self.send_cmd(f"balance wma {'on' if enabled else 'off'}")
+        self.wma_toggle_btn.setText(f"WMA 滤波: {'ON' if enabled else 'OFF'}")
     
     def send_debug_div(self):
         """发送调试输出分频系数"""
@@ -4591,6 +4929,20 @@ class DualPIDPanel(QWidget):
         self.debug_update_label.setText(f"调试数据: 单环 PID ✓")
         self.debug_update_label.setStyleSheet(SS("color: #FF9800; font-size: 10px;"))
     
+    def update_tpid_debug(self, pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode):
+        """更新三环 PID 调试数据 (解析 [TPID] 输出)"""
+        self.tpid_pitch_label.setText(f"pitch: {pitch:.2f}°")
+        self.tpid_wspd_label.setText(f"spd: {spd:.2f}")
+        self.tpid_wmode_label.setText(f"模式: {'速度' if wmode == 'spd' else '扭矩'}")
+        self.tpid_spd_err.setText(f"{spd_err:.2f}")
+        self.tpid_pitch_tgt.setText(f"{pitch_tgt:.2f}°")
+        self.tpid_ang_err.setText(f"{ang_err:.2f}")
+        self.tpid_whl_tgt.setText(f"{whl_tgt:.2f}")
+        self.tpid_whl_err.setText(f"{whl_err:.2f}")
+        self.tpid_out.setText(f"{out:.3f}")
+        self.debug_update_label.setText(f"调试数据: 三环 PID [{wmode}] ✓")
+        self.debug_update_label.setStyleSheet(SS("color: #9C27B0; font-size: 10px;"))
+    
     def update_mode(self, mode):
         """更新模式显示 (由主窗口解析数据后调用)"""
         if mode == "DUAL_PID":
@@ -4599,6 +4951,12 @@ class DualPIDPanel(QWidget):
         elif mode == "SINGLE_PID":
             self.mode_label.setText("当前模式: 单环 PID (速度)")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF9800;"))
+        elif mode == "TRIPLE_PID":
+            self.mode_label.setText("当前模式: 三环 PID")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #9C27B0;"))
+        elif mode == "CAR":
+            self.mode_label.setText("当前模式: 小车模式")
+            self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF5722;"))
         else:
             self.mode_label.setText("当前模式: LQR")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #2196F3;"))
@@ -6106,6 +6464,33 @@ class PIDTunerUI(QMainWindow):
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         
+        # 三环 PID 调试输出 (实时)
+        # 格式: [TPID] pitch=X° spd=X | Speed(外): err=X → pitch_tgt=X° | Angle(中): err=X → whl_tgt=X | Wheel(内): err=X → out=X [spd|trq]
+        if line.startswith("[TPID]"):
+            tpid_debug_match = re.search(
+                r'\[TPID\] pitch=([-\d.]+)° spd=([-\d.]+) \| '
+                r'Speed\(外\): err=([-\d.]+) → pitch_tgt=([-\d.]+)° \| '
+                r'Angle\(中\): err=([-\d.]+) → whl_tgt=([-\d.]+) \| '
+                r'Wheel\(内\): err=([-\d.]+) → out=([-\d.]+) \[(spd|trq)\]', line)
+            if tpid_debug_match:
+                try:
+                    pitch = float(tpid_debug_match.group(1))
+                    spd = float(tpid_debug_match.group(2))
+                    spd_err = float(tpid_debug_match.group(3))
+                    pitch_tgt = float(tpid_debug_match.group(4))
+                    ang_err = float(tpid_debug_match.group(5))
+                    whl_tgt = float(tpid_debug_match.group(6))
+                    whl_err = float(tpid_debug_match.group(7))
+                    out = float(tpid_debug_match.group(8))
+                    wmode = tpid_debug_match.group(9)
+                    if hasattr(self, 'dual_pid_panel'):
+                        self.dual_pid_panel.update_tpid_debug(
+                            pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode)
+                except:
+                    pass
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
         # X-Offset 调试输出
         # 格式: [XOFF] spd=X → x_off=Xm (Kp=X Ki=X Kd=X lim=X)
         if line.startswith("[XOFF]"):
@@ -6150,7 +6535,7 @@ class PIDTunerUI(QMainWindow):
         
         # 控制模式切换
         if line.startswith("CTRL_MODE:"):
-            ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID|SINGLE_PID|CAR)', line)
+            ctrl_mode_match = re.search(r'CTRL_MODE:(LQR|DUAL_PID|SINGLE_PID|CAR|TRIPLE_PID)', line)
             if ctrl_mode_match:
                 try:
                     mode = ctrl_mode_match.group(1)
@@ -6160,6 +6545,18 @@ class PIDTunerUI(QMainWindow):
                     pass
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
+        
+        # WMA 滤波器状态反馈
+        if line.startswith("WMA_STATUS:"):
+            wma_match = re.search(r'WMA_STATUS:(\d)', line)
+            if wma_match:
+                try:
+                    enabled = int(wma_match.group(1)) == 1
+                    if hasattr(self, 'dual_pid_panel') and hasattr(self.dual_pid_panel, 'wma_toggle_btn'):
+                        self.dual_pid_panel.wma_toggle_btn.setChecked(enabled)
+                        self.dual_pid_panel.wma_toggle_btn.setText(f"WMA 滤波: {'ON' if enabled else 'OFF'}")
+                except:
+                    pass
         
         # 腿部状态 (高频): LEG_STATE: L_Len=xxx ...
         if line.startswith("LEG_STATE:"):

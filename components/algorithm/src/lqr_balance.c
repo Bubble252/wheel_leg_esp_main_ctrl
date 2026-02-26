@@ -715,6 +715,12 @@ static const dual_pid_params_t dual_pid_default_params = {
     // 遥杆目标速度低通滤波 (与 LQR 的 lpf_joyy 相同)
     .lpf_joyy_tf = 0.2f,
     
+    // 角速度阻尼环 (默认关闭, kp=0)
+    .gyro_kp = 0.0f,
+    .gyro_ki = 0.0f,
+    .gyro_kd = 0.0f,
+    .gyro_limit = 10.0f,
+    
     // 环路顺序: 速度优先 (默认)
     .loop_order = DUAL_PID_SPEED_FIRST,
 };
@@ -768,6 +774,18 @@ esp_err_t dual_pid_init(dual_pid_controller_t *ctrl, const dual_pid_params_t *pa
     // 初始化遥杆目标速度低通滤波器
     lpf_init(&ctrl->lpf_joyy, p->lpf_joyy_tf);
     
+    // 初始化角速度阻尼环 PID
+    pid_params_t gyro_pid_params = {
+        .kp = p->gyro_kp,
+        .ki = p->gyro_ki,
+        .kd = p->gyro_kd,
+        .output_min = -p->gyro_limit,
+        .output_max = p->gyro_limit,
+        .integral_max = p->gyro_limit * 2.0f,
+        .d_filter_coef = 0.8f,
+    };
+    pid_init(&ctrl->pid_gyro, &gyro_pid_params);
+    
     ctrl->initialized = true;
     
     ESP_LOGI(TAG, "Dual PID controller initialized (loop_order=%s)",
@@ -776,6 +794,8 @@ esp_err_t dual_pid_init(dual_pid_controller_t *ctrl, const dual_pid_params_t *pa
              p->angle_kp, p->angle_ki, p->angle_kd, p->angle_limit);
     ESP_LOGI(TAG, "  Speed PID: kp=%.2f, ki=%.2f, kd=%.3f, limit=%.1f",
              p->speed_kp, p->speed_ki, p->speed_kd, p->speed_limit);
+    ESP_LOGI(TAG, "  Gyro PID:  kp=%.4f, ki=%.4f, kd=%.4f, limit=%.1f",
+             p->gyro_kp, p->gyro_ki, p->gyro_kd, p->gyro_limit);
     
     return ESP_OK;
 }
@@ -785,6 +805,7 @@ void dual_pid_reset(dual_pid_controller_t *ctrl) {
     
     pid_reset(&ctrl->pid_angle);
     pid_reset(&ctrl->pid_speed);
+    pid_reset(&ctrl->pid_gyro);
     lpf_reset(&ctrl->lpf_joyy);
     
     ESP_LOGI(TAG, "Dual PID controller reset");
@@ -804,6 +825,10 @@ void dual_pid_set_params(dual_pid_controller_t *ctrl, const dual_pid_params_t *p
     // 更新速度环 PID
     pid_set_gains(&ctrl->pid_speed, p->speed_kp, p->speed_ki, p->speed_kd);
     pid_set_output_limits(&ctrl->pid_speed, -p->speed_limit, p->speed_limit);
+    
+    // 更新角速度阻尼环 PID
+    pid_set_gains(&ctrl->pid_gyro, p->gyro_kp, p->gyro_ki, p->gyro_kd);
+    pid_set_output_limits(&ctrl->pid_gyro, -p->gyro_limit, p->gyro_limit);
     
     // 更新遥杆低通滤波器
     lpf_set_tf(&ctrl->lpf_joyy, p->lpf_joyy_tf);
@@ -825,6 +850,15 @@ void dual_pid_set_speed_gains(dual_pid_controller_t *ctrl, float kp, float ki, f
     ctrl->params.speed_ki = ki;
     ctrl->params.speed_kd = kd;
     pid_set_gains(&ctrl->pid_speed, kp, ki, kd);
+}
+
+void dual_pid_set_gyro_gains(dual_pid_controller_t *ctrl, float kp, float ki, float kd) {
+    if (ctrl == NULL) return;
+    
+    ctrl->params.gyro_kp = kp;
+    ctrl->params.gyro_ki = ki;
+    ctrl->params.gyro_kd = kd;
+    pid_set_gains(&ctrl->pid_gyro, kp, ki, kd);
 }
 
 void dual_pid_set_angle_zeropoint(dual_pid_controller_t *ctrl, float zeropoint) {
@@ -922,6 +956,12 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         //   前倾超过目标 → 需要正扭矩(向前加速追上去) ✓
         float torque = pid_compute(&ctrl->pid_angle, 0.0f, -angle_error, dt);
         
+        // ===== 角速度阻尼 (参考 LQR gyro_control) =====
+        // pid_gyro(0, pitch_rate): 抑制角速度，提供阻尼
+        // pitch_rate > 0 (正在前倾) → gyro_control < 0 (产生后倾扭矩来阻尼)
+        float gyro_control = pid_compute(&ctrl->pid_gyro, 0.0f, pitch_rate, dt);
+        torque += gyro_control;
+        
         // 输出限幅
         torque = clamp_f(torque, -ctrl->params.max_torque, ctrl->params.max_torque);
         
@@ -931,6 +971,10 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         output->angle_p_out = ctrl->params.angle_kp * (-angle_error);
         output->angle_i_out = ctrl->pid_angle.integral;
         output->angle_d_out = ctrl->pid_angle.prev_d_term;
+        output->gyro_p_out = ctrl->params.gyro_kp * (0.0f - pitch_rate);
+        output->gyro_i_out = ctrl->pid_gyro.integral;
+        output->gyro_d_out = ctrl->pid_gyro.prev_d_term;
+        output->gyro_control = gyro_control;
         
     } else {
         // =============================================================
@@ -977,6 +1021,10 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         // 这样当 target_speed > wheel_speed 时，输出正扭矩来加速
         float torque = pid_compute(&ctrl->pid_speed, 0.0f, -speed_error, dt);
         
+        // ===== 角速度阻尼 (参考 LQR gyro_control) =====
+        float gyro_control = pid_compute(&ctrl->pid_gyro, 0.0f, pitch_rate, dt);
+        torque += gyro_control;
+        
         // 输出限幅
         torque = clamp_f(torque, -ctrl->params.max_torque, ctrl->params.max_torque);
         
@@ -986,6 +1034,10 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
         output->speed_p_out = ctrl->params.speed_kp * speed_error;
         output->speed_i_out = ctrl->pid_speed.integral;
         output->speed_d_out = ctrl->pid_speed.prev_d_term;
+        output->gyro_p_out = ctrl->params.gyro_kp * (0.0f - pitch_rate);
+        output->gyro_i_out = ctrl->pid_gyro.integral;
+        output->gyro_d_out = ctrl->pid_gyro.prev_d_term;
+        output->gyro_control = gyro_control;
     }
     
     output->emergency = false;
@@ -994,21 +1046,16 @@ esp_err_t dual_pid_balance_loop(dual_pid_controller_t *ctrl,
 }
 
 // ============================================================================
-// 单环 PID 控制器实现 (直立环 → 目标速度)
+// 单环 PID 控制器实现 (直立环 → 目标速度，配合轮电机速度模式)
 // ============================================================================
 
-// 单环 PID 默认参数
+// 单环PID默认参数
 static const single_pid_params_t single_pid_default_params = {
-    // 直立环 PID: pitch → target_speed
-    .angle_kp = 2.0f,
+    .angle_kp = 15.0f,
     .angle_ki = 0.0f,
-    .angle_kd = 0.3f,
-    .angle_limit = 100.0f,      // 最大目标速度 100 rad/s (约 955 rpm)
-    
-    // 角度零点
+    .angle_kd = 0.5f,
+    .angle_limit = 100.0f,      // 最大目标速度 100 rad/s
     .angle_zeropoint = 0.0f,
-    
-    // 安全阈值
     .emergency_angle = 45.0f,
 };
 
@@ -1025,7 +1072,6 @@ esp_err_t single_pid_init(single_pid_controller_t *ctrl, const single_pid_params
     
     memset(ctrl, 0, sizeof(single_pid_controller_t));
     
-    // 使用提供的参数或默认参数
     if (params != NULL) {
         memcpy(&ctrl->params, params, sizeof(single_pid_params_t));
     } else {
@@ -1042,14 +1088,14 @@ esp_err_t single_pid_init(single_pid_controller_t *ctrl, const single_pid_params
         .output_min = -p->angle_limit,
         .output_max = p->angle_limit,
         .integral_max = p->angle_limit * 2.0f,
-        .d_filter_coef = 0.1f,
+        .d_filter_coef = 0.8f,
     };
     pid_init(&ctrl->pid_angle, &angle_pid_params);
     
     ctrl->initialized = true;
     
     ESP_LOGI(TAG, "Single PID controller initialized");
-    ESP_LOGI(TAG, "  Angle PID: kp=%.2f, ki=%.2f, kd=%.3f, limit=%.1f",
+    ESP_LOGI(TAG, "  Angle PID: kp=%.2f, ki=%.2f, kd=%.3f, limit=%.1f rad/s",
              p->angle_kp, p->angle_ki, p->angle_kd, p->angle_limit);
     
     return ESP_OK;
@@ -1057,9 +1103,7 @@ esp_err_t single_pid_init(single_pid_controller_t *ctrl, const single_pid_params
 
 void single_pid_reset(single_pid_controller_t *ctrl) {
     if (ctrl == NULL || !ctrl->initialized) return;
-    
     pid_reset(&ctrl->pid_angle);
-    
     ESP_LOGI(TAG, "Single PID controller reset");
 }
 
@@ -1069,15 +1113,12 @@ void single_pid_set_params(single_pid_controller_t *ctrl, const single_pid_param
     memcpy(&ctrl->params, params, sizeof(single_pid_params_t));
     
     const single_pid_params_t *p = &ctrl->params;
-    
-    // 更新直立环 PID
     pid_set_gains(&ctrl->pid_angle, p->angle_kp, p->angle_ki, p->angle_kd);
     pid_set_output_limits(&ctrl->pid_angle, -p->angle_limit, p->angle_limit);
 }
 
 void single_pid_set_angle_gains(single_pid_controller_t *ctrl, float kp, float ki, float kd) {
     if (ctrl == NULL) return;
-    
     ctrl->params.angle_kp = kp;
     ctrl->params.angle_ki = ki;
     ctrl->params.angle_kd = kd;
@@ -1106,40 +1147,327 @@ esp_err_t single_pid_balance_loop(single_pid_controller_t *ctrl,
         return ESP_ERR_INVALID_STATE;
     }
     
-    // 清零输出
     memset(output, 0, sizeof(single_pid_output_t));
     
-    // 时间步长检查
     if (dt <= 0.0f || dt > 0.1f) {
-        dt = 0.005f;  // 默认 200Hz
+        dt = 0.005f;
     }
     
-    // ===== 紧急停止检查 =====
+    // 紧急停止检查
     if (single_pid_check_emergency(ctrl, pitch)) {
         output->emergency = true;
         output->target_speed = 0.0f;
         return ESP_ERR_INVALID_STATE;
     }
     
-    // ===== 直立环: pitch → target_speed =====
-    // 目标: 让 pitch 趋近于 angle_zeropoint (通常是 0)
-    // 当机器人前倾 (pitch > 0) 时，需要向前加速 (正速度)
-    // 当机器人后倾 (pitch < 0) 时，需要向后加速 (负速度)
+    // 角度误差: pitch 相对于零点的偏差
     float angle_error = pitch - ctrl->params.angle_zeropoint;
     
-    // 直立环 PID 计算
-    // pid_compute(0, -angle_error) → error = 0 - (-angle_error) = angle_error
-    // 输出 = kp * angle_error，前倾时 angle_error > 0 → 正速度
+    // 直立环 PID: angle_error → target_speed
+    // 前倾 (pitch > 0) → 需要正速度(向前追) → error > 0 → output > 0
     float target_speed = pid_compute(&ctrl->pid_angle, 0.0f, -angle_error, dt);
     
-    // 保存输出
+    // 保存调试信息
     output->angle_error = angle_error;
-    output->target_speed = -target_speed;
-
-    // PID 内部分量 (调试用)
+    output->target_speed = -target_speed;  // 取负使符号直觉正确: 前倾→前进
     output->angle_p_out = ctrl->params.angle_kp * (-angle_error);
     output->angle_i_out = ctrl->pid_angle.integral;
     output->angle_d_out = ctrl->pid_angle.prev_d_term;
+    output->emergency = false;
+    
+    return ESP_OK;
+}
+
+// ============================================================================
+// 三环 PID 控制器实现 (速度环→角度环→轮速环)
+// ============================================================================
+
+// 三环PID默认参数 (前两环复用双环PID SPEED_FIRST 的参数)
+static const triple_pid_params_t triple_pid_default_params = {
+    // 速度环 (外环): target_speed - wheel_speed → pitch_target
+    .speed_kp = 0.85f,
+    .speed_ki = 0.00006f,
+    .speed_kd = 0.0f,
+    .speed_limit = 20.0f,       // 最大目标倾角 20 deg
+
+    // 角度环 (中环): pitch_target - pitch → wheel_speed_target
+    .angle_kp = 1.2f,
+    .angle_ki = 0.0f,
+    .angle_kd = 0.0f,
+    .angle_limit = 50.0f,       // 最大目标轮速 50 rad/s
+
+    // 轮速环 (内环): wheel_speed_target - wheel_speed → torque
+    .wheel_kp = 0.5f,
+    .wheel_ki = 0.01f,
+    .wheel_kd = 0.0f,
+    .wheel_limit = 15.0f,       // 最大扭矩 15 Nm
+
+    // 通用参数
+    .angle_zeropoint = -7.0f,
+    .emergency_angle = 45.0f,
+    .max_torque = 15.0f,
+    .speed_cmd_gain = 8000.0f,
+    .lpf_joyy_tf = 0.2f,
+    
+    // 角速度阻尼环
+    .gyro_kp = 0.1f,
+    .gyro_ki = 0.0f,
+    .gyro_kd = 0.0f,
+    .gyro_limit = 10.0f,
+    
+    // 默认使用电机速度模式 (不经过软件轮速PID)
+    .wheel_mode = TRIPLE_PID_WHEEL_SPEED,
+};
+
+void triple_pid_get_default_params(triple_pid_params_t *params) {
+    if (params != NULL) {
+        memcpy(params, &triple_pid_default_params, sizeof(triple_pid_params_t));
+    }
+}
+
+esp_err_t triple_pid_init(triple_pid_controller_t *ctrl, const triple_pid_params_t *params) {
+    if (ctrl == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    memset(ctrl, 0, sizeof(triple_pid_controller_t));
+    
+    if (params != NULL) {
+        memcpy(&ctrl->params, params, sizeof(triple_pid_params_t));
+    } else {
+        memcpy(&ctrl->params, &triple_pid_default_params, sizeof(triple_pid_params_t));
+    }
+    
+    const triple_pid_params_t *p = &ctrl->params;
+    
+    // 初始化角度环 PID (中环)
+    pid_params_t angle_pid_params = {
+        .kp = p->angle_kp,
+        .ki = p->angle_ki,
+        .kd = p->angle_kd,
+        .output_min = -p->angle_limit,
+        .output_max = p->angle_limit,
+        .integral_max = p->angle_limit * 2.0f,
+        .d_filter_coef = 0.8f,
+    };
+    pid_init(&ctrl->pid_angle, &angle_pid_params);
+    
+    // 初始化速度环 PID (外环)
+    pid_params_t speed_pid_params = {
+        .kp = p->speed_kp,
+        .ki = p->speed_ki,
+        .kd = p->speed_kd,
+        .output_min = -p->speed_limit,
+        .output_max = p->speed_limit,
+        .integral_max = p->speed_limit * 2.0f,
+        .d_filter_coef = 0.8f,
+    };
+    pid_init(&ctrl->pid_speed, &speed_pid_params);
+    
+    // 初始化轮速环 PID (内环, 仅 WHEEL_TORQUE 模式使用)
+    pid_params_t wheel_pid_params = {
+        .kp = p->wheel_kp,
+        .ki = p->wheel_ki,
+        .kd = p->wheel_kd,
+        .output_min = -p->wheel_limit,
+        .output_max = p->wheel_limit,
+        .integral_max = p->wheel_limit * 2.0f,
+        .d_filter_coef = 0.8f,
+    };
+    pid_init(&ctrl->pid_wheel, &wheel_pid_params);
+    
+    // 初始化角速度阻尼环 PID
+    pid_params_t gyro_pid_params = {
+        .kp = p->gyro_kp,
+        .ki = p->gyro_ki,
+        .kd = p->gyro_kd,
+        .output_min = -p->gyro_limit,
+        .output_max = p->gyro_limit,
+        .integral_max = p->gyro_limit * 2.0f,
+        .d_filter_coef = 0.8f,
+    };
+    pid_init(&ctrl->pid_gyro, &gyro_pid_params);
+    
+    // 初始化遥杆目标速度低通滤波器
+    lpf_init(&ctrl->lpf_joyy, p->lpf_joyy_tf);
+    
+    ctrl->initialized = true;
+    
+    ESP_LOGI(TAG, "Triple PID controller initialized (wheel_mode=%s)",
+             p->wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "SPEED_CMD" : "TORQUE_PID");
+    ESP_LOGI(TAG, "  Speed PID (outer): kp=%.4f, ki=%.6f, kd=%.6f",
+             p->speed_kp, p->speed_ki, p->speed_kd);
+    ESP_LOGI(TAG, "  Angle PID (mid):   kp=%.4f, ki=%.6f, kd=%.4f",
+             p->angle_kp, p->angle_ki, p->angle_kd);
+    ESP_LOGI(TAG, "  Gyro PID (damp):   kp=%.4f, ki=%.4f, kd=%.4f",
+             p->gyro_kp, p->gyro_ki, p->gyro_kd);
+    ESP_LOGI(TAG, "  Wheel PID (inner): kp=%.4f, ki=%.4f, kd=%.4f",
+             p->wheel_kp, p->wheel_ki, p->wheel_kd);
+    
+    return ESP_OK;
+}
+
+void triple_pid_reset(triple_pid_controller_t *ctrl) {
+    if (ctrl == NULL || !ctrl->initialized) return;
+    
+    pid_reset(&ctrl->pid_angle);
+    pid_reset(&ctrl->pid_speed);
+    pid_reset(&ctrl->pid_wheel);
+    pid_reset(&ctrl->pid_gyro);
+    lpf_reset(&ctrl->lpf_joyy);
+    
+    ESP_LOGI(TAG, "Triple PID controller reset");
+}
+
+void triple_pid_set_angle_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd) {
+    if (ctrl == NULL) return;
+    ctrl->params.angle_kp = kp;
+    ctrl->params.angle_ki = ki;
+    ctrl->params.angle_kd = kd;
+    pid_set_gains(&ctrl->pid_angle, kp, ki, kd);
+}
+
+void triple_pid_set_speed_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd) {
+    if (ctrl == NULL) return;
+    ctrl->params.speed_kp = kp;
+    ctrl->params.speed_ki = ki;
+    ctrl->params.speed_kd = kd;
+    pid_set_gains(&ctrl->pid_speed, kp, ki, kd);
+}
+
+void triple_pid_set_wheel_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd) {
+    if (ctrl == NULL) return;
+    ctrl->params.wheel_kp = kp;
+    ctrl->params.wheel_ki = ki;
+    ctrl->params.wheel_kd = kd;
+    pid_set_gains(&ctrl->pid_wheel, kp, ki, kd);
+}
+
+void triple_pid_set_gyro_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd) {
+    if (ctrl == NULL) return;
+    ctrl->params.gyro_kp = kp;
+    ctrl->params.gyro_ki = ki;
+    ctrl->params.gyro_kd = kd;
+    pid_set_gains(&ctrl->pid_gyro, kp, ki, kd);
+}
+
+void triple_pid_set_angle_zeropoint(triple_pid_controller_t *ctrl, float zeropoint) {
+    if (ctrl == NULL) return;
+    ctrl->params.angle_zeropoint = zeropoint;
+}
+
+void triple_pid_set_wheel_mode(triple_pid_controller_t *ctrl, uint8_t wheel_mode) {
+    if (ctrl == NULL) return;
+    ctrl->params.wheel_mode = wheel_mode;
+    // 切换模式时重置轮速环PID积分
+    pid_reset(&ctrl->pid_wheel);
+    ESP_LOGI(TAG, "Triple PID wheel mode set to %s",
+             wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "SPEED_CMD" : "TORQUE_PID");
+}
+
+bool triple_pid_check_emergency(triple_pid_controller_t *ctrl, float pitch) {
+    if (ctrl == NULL) return true;
+    return fabsf(pitch) > ctrl->params.emergency_angle;
+}
+
+esp_err_t triple_pid_balance_loop(triple_pid_controller_t *ctrl,
+                                   float pitch, float pitch_rate,
+                                   float wheel_speed, float target_speed,
+                                   float dt,
+                                   triple_pid_output_t *output) {
+    if (ctrl == NULL || output == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (!ctrl->initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    memset(output, 0, sizeof(triple_pid_output_t));
+    
+    if (dt <= 0.0f || dt > 0.1f) {
+        dt = 0.005f;
+    }
+    
+    // ===== 紧急停止检查 =====
+    if (triple_pid_check_emergency(ctrl, pitch)) {
+        output->emergency = true;
+        output->torque = 0.0f;
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // ===== 遥杆目标速度低通滤波 =====
+    float filtered_target_speed = lpf_compute_dt(&ctrl->lpf_joyy, target_speed, dt);
+    
+    // =============================================================
+    // 第一环: 速度环 (外环)
+    //   target_speed - wheel_speed → pitch_target
+    //   (与双环PID SPEED_FIRST 的速度环完全相同)
+    // =============================================================
+    float amplified_target = filtered_target_speed * ctrl->params.speed_cmd_gain;
+    float speed_measurement = wheel_speed - amplified_target;
+    float pitch_target = pid_compute(&ctrl->pid_speed, 0.0f, speed_measurement, dt);
+    
+    output->speed_error = amplified_target - wheel_speed;
+    output->pitch_target = pitch_target;
+    output->speed_p_out = ctrl->params.speed_kp * (amplified_target - wheel_speed);
+    output->speed_i_out = ctrl->pid_speed.integral;
+    output->speed_d_out = ctrl->pid_speed.prev_d_term;
+    
+    // =============================================================
+    // 第二环: 角度环 (中环)
+    //   pitch_target - pitch → wheel_speed_target
+    //   (与双环PID SPEED_FIRST 的角度环类似，但输出含义变了:
+    //    双环输出 torque, 三环输出 wheel_speed_target)
+    // =============================================================
+    float adjusted_target = pitch_target + ctrl->params.angle_zeropoint;
+    float angle_error = pitch - adjusted_target;
+    
+    float wheel_speed_target = pid_compute(&ctrl->pid_angle, 0.0f, -angle_error, dt);
+    // 取反: 与双环PID保持一致的符号约定
+    wheel_speed_target = -wheel_speed_target;
+    
+    // ===== 角速度阻尼 (参考 LQR gyro_control) =====
+    // pid_gyro(0, pitch_rate): 抑制角速度，提供阻尼
+    float gyro_control = pid_compute(&ctrl->pid_gyro, 0.0f, pitch_rate, dt);
+    wheel_speed_target += gyro_control;  // 叠加到角度环输出 (wheel_speed_target)
+    
+    output->angle_error = angle_error;
+    output->wheel_speed_target = wheel_speed_target;
+    output->angle_p_out = ctrl->params.angle_kp * (-angle_error);
+    output->angle_i_out = ctrl->pid_angle.integral;
+    output->angle_d_out = ctrl->pid_angle.prev_d_term;
+    output->gyro_p_out = ctrl->params.gyro_kp * (0.0f - pitch_rate);
+    output->gyro_i_out = ctrl->pid_gyro.integral;
+    output->gyro_d_out = ctrl->pid_gyro.prev_d_term;
+    output->gyro_control = gyro_control;
+    
+    // =============================================================
+    // 第三环: 轮速环 (内环)
+    //   根据 wheel_mode 选择:
+    //   WHEEL_SPEED:  直接输出 wheel_speed_target (送电机速度模式)
+    //   WHEEL_TORQUE: wheel_speed_target - wheel_speed → torque (送电机扭矩模式)
+    // =============================================================
+    if (ctrl->params.wheel_mode == TRIPLE_PID_WHEEL_TORQUE) {
+        // 软件PID轮速环
+        float wheel_error = wheel_speed_target - wheel_speed;
+        float torque = pid_compute(&ctrl->pid_wheel, 0.0f, -wheel_error, dt);
+        torque = clamp_f(-torque, -ctrl->params.max_torque, ctrl->params.max_torque);
+        
+        output->wheel_speed_error = wheel_error;
+        output->torque = torque;
+        output->wheel_p_out = ctrl->params.wheel_kp * wheel_error;
+        output->wheel_i_out = ctrl->pid_wheel.integral;
+        output->wheel_d_out = ctrl->pid_wheel.prev_d_term;
+    } else {
+        // 电机速度模式: 直接输出 wheel_speed_target
+        // torque 字段存储的是速度 (rad/s)，后续由 apply_motor_commands 处理
+        output->wheel_speed_error = 0.0f;
+        output->torque = wheel_speed_target;
+        output->wheel_p_out = 0.0f;
+        output->wheel_i_out = 0.0f;
+        output->wheel_d_out = 0.0f;
+    }
     
     output->emergency = false;
     

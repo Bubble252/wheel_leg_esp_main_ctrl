@@ -35,6 +35,18 @@ typedef struct {
 } slewrate_filter_t;
 
 /**
+ * @brief 加权滑动平均滤波器 (Weighted Moving Average)
+ * @note 12 点窗口，线性递增权重 (1,2,3,...,12)，最新采样权重最大
+ *       群延迟约 3.15 个采样 (~6.3 ms @500Hz)，-3dB 截止约 55Hz
+ */
+#define WMA_WINDOW_SIZE 12
+typedef struct {
+    float buf[WMA_WINDOW_SIZE];   // 环形缓冲区
+    int   head;                    // 下一个写入位置
+    int   count;                   // 已填充的采样数 (0~WMA_WINDOW_SIZE)
+} weighted_ma_filter_t;
+
+/**
  * @brief 初始化低通滤波器
  * @param lpf 滤波器实例
  * @param tf 滤波时间常数 (秒)，越大滤波越强
@@ -101,6 +113,32 @@ void slewrate_set_max_rate(slewrate_filter_t *sf, float max_rate);
  *       否则钳位到 y_prev ± max_rate * dt
  */
 float slewrate_compute_dt(slewrate_filter_t *sf, float x, float dt);
+
+// ============================================================================
+// 加权滑动平均滤波器 (Weighted Moving Average, 12-point)
+// ============================================================================
+
+/**
+ * @brief 初始化加权滑动平均滤波器
+ * @param wma 滤波器实例
+ */
+void wma_init(weighted_ma_filter_t *wma);
+
+/**
+ * @brief 重置加权滑动平均滤波器
+ * @param wma 滤波器实例
+ */
+void wma_reset(weighted_ma_filter_t *wma);
+
+/**
+ * @brief 加权滑动平均滤波计算
+ * @param wma 滤波器实例
+ * @param x 输入值
+ * @return 滤波后的输出值
+ * @note 权重线性递增: w[0]=1, w[1]=2, ..., w[11]=12
+ *       output = Σ(w[i]*x[i]) / Σ(w[i])，Σw = 78
+ */
+float wma_compute(weighted_ma_filter_t *wma, float x);
 
 #ifdef __cplusplus
 }
