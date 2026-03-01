@@ -3214,6 +3214,7 @@ class BalanceControlPanel(QWidget):
             # 轮子
             'O': ('左轮速/加速', False),
             'P': ('右轮速/加速', False),
+            'X': ('电机电流', False),
             # 各环输出
             'Q': ('角度环输出', False),
             'R': ('角速度环输出', False),
@@ -3233,7 +3234,7 @@ class BalanceControlPanel(QWidget):
             ("滤波", ['G', 'N', 'W']),
             ("输出", ['H', 'V']),
             ("零点/Roll", ['I', 'J', 'K', 'L']),
-            ("轮子", ['O', 'P']),
+            ("轮子", ['O', 'P', 'X']),
             ("环路分量", ['Q', 'R', 'S', 'T', 'U']),
         ]
         
@@ -6113,6 +6114,9 @@ class PIDTunerUI(QMainWindow):
         self.wheel_panels['right'] = PIDControlPanel("右轮调试 (蓝=速度rad/s, 红=加速度rad/s²)", "P", self)
         self.tab_widget.addTab(_make_scrollable(self.wheel_panels['right']), "P - 右轮调试")
         
+        self.wheel_panels['current'] = PIDControlPanel("电机电流 (蓝=左轮A, 红=右轮A)", "X", self)
+        self.tab_widget.addTab(_make_scrollable(self.wheel_panels['current']), "X - 电机电流")
+        
         # 腿部控制面板
         self.leg_panel = LegControlPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.leg_panel), "🦿 腿部控制")
@@ -6280,7 +6284,8 @@ class PIDTunerUI(QMainWindow):
                     # 轮速调试面板映射
                     wheel_map = {
                         'O': 'left',      # 左轮调试
-                        'P': 'right'      # 右轮调试
+                        'P': 'right',     # 右轮调试
+                        'X': 'current',   # 电机电流
                     }
                     
                     # 环路输出映射 (通道ID → PID面板key)

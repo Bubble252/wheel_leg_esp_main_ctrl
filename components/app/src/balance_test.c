@@ -802,6 +802,7 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     if (PLOT_CH_ENABLED('T')) printf("#DATA,T,0.0,%.4f\n", output->speed_control);
     if (PLOT_CH_ENABLED('U')) printf("#DATA,U,0.0,%.4f\n", g_yaw_output);
     if (PLOT_CH_ENABLED('V')) printf("#DATA,V,%.4f,%.4f\n", output->lqr_u_raw, output->lqr_u);
+    if (PLOT_CH_ENABLED('X')) printf("#DATA,X,%.3f,%.3f\n", can_motor_read_current(g_motor_left), can_motor_read_current(g_motor_right));
     if (PLOT_CH_ENABLED('Y')) printf("#DATA,Y,%.2f,%.2f\n", g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
     if (PLOT_CH_ENABLED('Y')) {
         printf("#YAW_DBG,out=%.3f,err=%.2f,hold=%d,rate=%.2f\n", 
