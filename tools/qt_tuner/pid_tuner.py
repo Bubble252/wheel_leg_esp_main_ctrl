@@ -4569,7 +4569,7 @@ class DualPIDPanel(QWidget):
         self.tpid_angle_limit.setRange(0.1, 1000)
         self.tpid_angle_limit.setSingleStep(5.0)
         self.tpid_angle_limit.setDecimals(1)
-        self.tpid_angle_limit.setValue(100.0)
+        self.tpid_angle_limit.setValue(20.0)
         self.tpid_angle_limit.setToolTip("角度环输出限幅 (最大目标轮速, rad/s)")
         tpid_angle_layout.addWidget(self.tpid_angle_limit, 0, 8)
         self.tpid_angle_send = QPushButton("发送")
