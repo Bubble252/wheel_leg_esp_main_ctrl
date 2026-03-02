@@ -4527,9 +4527,17 @@ class DualPIDPanel(QWidget):
         self.tpid_speed_kd.setDecimals(6)
         self.tpid_speed_kd.setValue(0.0)
         tpid_speed_layout.addWidget(self.tpid_speed_kd, 0, 6)
+        tpid_speed_layout.addWidget(QLabel("Limit:"), 0, 7)
+        self.tpid_speed_limit = QDoubleSpinBox()
+        self.tpid_speed_limit.setRange(0.1, 500)
+        self.tpid_speed_limit.setSingleStep(1.0)
+        self.tpid_speed_limit.setDecimals(1)
+        self.tpid_speed_limit.setValue(40.0)
+        self.tpid_speed_limit.setToolTip("速度环输出限幅 (最大目标倾角, deg)")
+        tpid_speed_layout.addWidget(self.tpid_speed_limit, 0, 8)
         self.tpid_speed_send = QPushButton("发送")
         self.tpid_speed_send.clicked.connect(self.send_tpid_speed)
-        tpid_speed_layout.addWidget(self.tpid_speed_send, 0, 7)
+        tpid_speed_layout.addWidget(self.tpid_speed_send, 0, 9)
         tpid_main_layout.addLayout(tpid_speed_layout)
         
         # 角度环 PID (中环)
@@ -4556,9 +4564,17 @@ class DualPIDPanel(QWidget):
         self.tpid_angle_kd.setDecimals(6)
         self.tpid_angle_kd.setValue(0.0)
         tpid_angle_layout.addWidget(self.tpid_angle_kd, 0, 6)
+        tpid_angle_layout.addWidget(QLabel("Limit:"), 0, 7)
+        self.tpid_angle_limit = QDoubleSpinBox()
+        self.tpid_angle_limit.setRange(0.1, 1000)
+        self.tpid_angle_limit.setSingleStep(5.0)
+        self.tpid_angle_limit.setDecimals(1)
+        self.tpid_angle_limit.setValue(100.0)
+        self.tpid_angle_limit.setToolTip("角度环输出限幅 (最大目标轮速, rad/s)")
+        tpid_angle_layout.addWidget(self.tpid_angle_limit, 0, 8)
         self.tpid_angle_send = QPushButton("发送")
         self.tpid_angle_send.clicked.connect(self.send_tpid_angle)
-        tpid_angle_layout.addWidget(self.tpid_angle_send, 0, 7)
+        tpid_angle_layout.addWidget(self.tpid_angle_send, 0, 9)
         tpid_main_layout.addLayout(tpid_angle_layout)
         
         # 轮速环 PID (内环)
@@ -4585,9 +4601,17 @@ class DualPIDPanel(QWidget):
         self.tpid_wheel_kd.setDecimals(4)
         self.tpid_wheel_kd.setValue(0.0)
         tpid_wheel_layout.addWidget(self.tpid_wheel_kd, 0, 6)
+        tpid_wheel_layout.addWidget(QLabel("Limit:"), 0, 7)
+        self.tpid_wheel_limit = QDoubleSpinBox()
+        self.tpid_wheel_limit.setRange(0.1, 100)
+        self.tpid_wheel_limit.setSingleStep(1.0)
+        self.tpid_wheel_limit.setDecimals(1)
+        self.tpid_wheel_limit.setValue(15.0)
+        self.tpid_wheel_limit.setToolTip("轮速环输出限幅 (最大扭矩, Nm)")
+        tpid_wheel_layout.addWidget(self.tpid_wheel_limit, 0, 8)
         self.tpid_wheel_send = QPushButton("发送")
         self.tpid_wheel_send.clicked.connect(self.send_tpid_wheel)
-        tpid_wheel_layout.addWidget(self.tpid_wheel_send, 0, 7)
+        tpid_wheel_layout.addWidget(self.tpid_wheel_send, 0, 9)
         tpid_main_layout.addLayout(tpid_wheel_layout)
         
         # 角速度阻尼 PID (Gyro damping)
@@ -4614,9 +4638,17 @@ class DualPIDPanel(QWidget):
         self.tpid_gyro_kd.setDecimals(6)
         self.tpid_gyro_kd.setValue(0.0)
         tpid_gyro_layout.addWidget(self.tpid_gyro_kd, 0, 6)
+        tpid_gyro_layout.addWidget(QLabel("Limit:"), 0, 7)
+        self.tpid_gyro_limit = QDoubleSpinBox()
+        self.tpid_gyro_limit.setRange(0.1, 100)
+        self.tpid_gyro_limit.setSingleStep(1.0)
+        self.tpid_gyro_limit.setDecimals(1)
+        self.tpid_gyro_limit.setValue(10.0)
+        self.tpid_gyro_limit.setToolTip("角速度阻尼环输出限幅")
+        tpid_gyro_layout.addWidget(self.tpid_gyro_limit, 0, 8)
         self.tpid_gyro_send = QPushButton("发送")
         self.tpid_gyro_send.clicked.connect(self.send_tpid_gyro)
-        tpid_gyro_layout.addWidget(self.tpid_gyro_send, 0, 7)
+        tpid_gyro_layout.addWidget(self.tpid_gyro_send, 0, 9)
         tpid_main_layout.addLayout(tpid_gyro_layout)
         
         # 轮速环模式 + 增益 + 操作
@@ -4807,28 +4839,36 @@ class DualPIDPanel(QWidget):
         kp = self.tpid_speed_kp.value()
         ki = self.tpid_speed_ki.value()
         kd = self.tpid_speed_kd.value()
+        limit = self.tpid_speed_limit.value()
         self.send_cmd(f"balance tpid speed {kp} {ki} {kd}")
+        self.send_cmd(f"balance tpid limit speed {limit}")
     
     def send_tpid_angle(self):
         """发送三环 PID 角度环参数"""
         kp = self.tpid_angle_kp.value()
         ki = self.tpid_angle_ki.value()
         kd = self.tpid_angle_kd.value()
+        limit = self.tpid_angle_limit.value()
         self.send_cmd(f"balance tpid angle {kp} {ki} {kd}")
+        self.send_cmd(f"balance tpid limit angle {limit}")
     
     def send_tpid_wheel(self):
         """发送三环 PID 轮速环参数"""
         kp = self.tpid_wheel_kp.value()
         ki = self.tpid_wheel_ki.value()
         kd = self.tpid_wheel_kd.value()
+        limit = self.tpid_wheel_limit.value()
         self.send_cmd(f"balance tpid wheel {kp} {ki} {kd}")
+        self.send_cmd(f"balance tpid limit wheel {limit}")
     
     def send_tpid_gyro(self):
         """发送三环 PID 角速度阻尼参数"""
         kp = self.tpid_gyro_kp.value()
         ki = self.tpid_gyro_ki.value()
         kd = self.tpid_gyro_kd.value()
+        limit = self.tpid_gyro_limit.value()
         self.send_cmd(f"balance tpid gyro {kp} {ki} {kd}")
+        self.send_cmd(f"balance tpid limit gyro {limit}")
     
     def send_tpid_wmode(self):
         """发送三环 PID 轮速环模式切换"""

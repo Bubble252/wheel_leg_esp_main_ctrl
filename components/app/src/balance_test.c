@@ -4880,6 +4880,7 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("       balance tpid speed <kp> <ki> <kd>\n");
             printf("       balance tpid wheel <kp> <ki> <kd>\n");
             printf("       balance tpid gyro <kp> <ki> <kd>  (角速度阻尼PID)\n");
+            printf("       balance tpid limit <speed|angle|wheel|gyro> <value>\n");
             printf("       balance tpid gain <value>  (speed_cmd_gain)\n");
             printf("       balance tpid wmode <0|1>  (0=SPEED_CMD, 1=TORQUE_PID)\n");
             printf("       balance tpid zero <degrees>\n");
@@ -4938,6 +4939,67 @@ void balance_test_process_cmd(const char *cmd_str) {
             triple_pid_set_gyro_gains(&g_triple_pid_ctrl, kp, ki, kd);
             printf("Triple PID Gyro set: kp=%.4f ki=%.4f kd=%.6f\n", kp, ki, kd);
             printf("TPID:GYRO,%.4f,%.4f,%.6f\n", kp, ki, kd);
+        } else if (strcmp(token, "limit") == 0) {
+            // 设置各环输出限幅
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("=== Triple PID Limits ===\n");
+                printf("Speed limit:  %.1f (max pitch target, deg)\n", g_triple_pid_ctrl.params.speed_limit);
+                printf("Angle limit:  %.1f (max wheel_speed_target, rad/s)\n", g_triple_pid_ctrl.params.angle_limit);
+                printf("Wheel limit:  %.1f (max torque, Nm)\n", g_triple_pid_ctrl.params.wheel_limit);
+                printf("Gyro limit:   %.1f\n", g_triple_pid_ctrl.params.gyro_limit);
+                printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f\n",
+                       g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
+                       g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
+                printf("Usage: balance tpid limit <speed|angle|wheel|gyro> <value>\n");
+            } else if (strcmp(token, "speed") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    float limit = atof(token);
+                    g_triple_pid_ctrl.params.speed_limit = limit;
+                    pid_set_output_limits(&g_triple_pid_ctrl.pid_speed, -limit, limit);
+                    printf("Triple PID speed limit set to %.1f\n", limit);
+                    printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f\n",
+                           g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
+                           g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
+                }
+            } else if (strcmp(token, "angle") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    float limit = atof(token);
+                    g_triple_pid_ctrl.params.angle_limit = limit;
+                    pid_set_output_limits(&g_triple_pid_ctrl.pid_angle, -limit, limit);
+                    printf("Triple PID angle limit set to %.1f\n", limit);
+                    printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f\n",
+                           g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
+                           g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
+                }
+            } else if (strcmp(token, "wheel") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    float limit = atof(token);
+                    g_triple_pid_ctrl.params.wheel_limit = limit;
+                    pid_set_output_limits(&g_triple_pid_ctrl.pid_wheel, -limit, limit);
+                    printf("Triple PID wheel limit set to %.1f\n", limit);
+                    printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f\n",
+                           g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
+                           g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
+                }
+            } else if (strcmp(token, "gyro") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    float limit = atof(token);
+                    g_triple_pid_ctrl.params.gyro_limit = limit;
+                    pid_set_output_limits(&g_triple_pid_ctrl.pid_gyro, -limit, limit);
+                    printf("Triple PID gyro limit set to %.1f\n", limit);
+                    printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f\n",
+                           g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
+                           g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
+                }
+            } else {
+                printf("Unknown limit target: %s\n", token);
+                printf("Usage: balance tpid limit <speed|angle|wheel|gyro> <value>\n");
+            }
         } else if (strcmp(token, "gain") == 0) {
             token = strtok(NULL, " \t\n\r");
             if (token) {
