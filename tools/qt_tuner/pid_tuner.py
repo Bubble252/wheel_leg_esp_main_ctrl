@@ -269,13 +269,16 @@ class SerialThread(QThread):
 class PIDControlPanel(QWidget):
     """单个PID控制器的参数面板"""
     
-    def __init__(self, name, commander_id, parent=None, output_channel_id=None, output_dual=False):
+    def __init__(self, name, commander_id, parent=None, output_channel_id=None, output_dual=False,
+                 extra_channel_id=None, extra_labels=None):
         super().__init__(parent)
         self.name = name
         self.commander_id = commander_id
         self.parent_window = parent
         self.output_channel_id = output_channel_id  # 环路输出通道 ID (Q/R/S/T/U/V)
         self.output_dual = output_dual  # 是否双线模式 (target + control)
+        self.extra_channel_id = extra_channel_id  # 额外观测通道 ID (如 'Z')
+        self.extra_labels = extra_labels or ('值1', '值2')  # 额外通道的两条线标签
         
         # 数据缓存 (最多保存500个点)
         self.max_points = 500
@@ -289,6 +292,12 @@ class PIDControlPanel(QWidget):
         self.output_data = deque(maxlen=self.max_points)
         self.output_data2 = deque(maxlen=self.max_points)  # 双线模式第二条线
         self.output_counter = 0
+        
+        # 额外通道波形数据缓存
+        self.extra_time_data = deque(maxlen=self.max_points)
+        self.extra_data1 = deque(maxlen=self.max_points)
+        self.extra_data2 = deque(maxlen=self.max_points)
+        self.extra_counter = 0
         
         self.init_ui()
     
@@ -507,6 +516,67 @@ class PIDControlPanel(QWidget):
             
             output_group.setLayout(output_plot_layout)
             layout.addWidget(output_group)
+        
+        # 额外观测通道波形显示区 (仅当指定了 extra_channel_id 时显示)
+        if self.extra_channel_id:
+            self._init_extra_channel_ui(layout)
+    
+    def _init_extra_channel_ui(self, layout):
+        """初始化额外观测通道的波形UI"""
+        label1, label2 = self.extra_labels
+        extra_group = QGroupBox(
+            f"📊 观测通道 {self.extra_channel_id} (🟢绿={label1}, 🟡黄={label2})"
+        )
+        extra_layout = QVBoxLayout()
+        
+        # 当前值显示
+        self.extra_value_label = QLabel(f"{label1}: --  |  {label2}: --")
+        self.extra_value_label.setStyleSheet(SS(
+            "font-size: 14px; font-weight: bold; color: #cccc00; "
+            "background-color: #1a1a0a; padding: 8px; border-radius: 5px; "
+            "border: 1px solid #666600;"
+        ))
+        self.extra_value_label.setAlignment(Qt.AlignCenter)
+        extra_layout.addWidget(self.extra_value_label)
+        
+        # 波形图
+        self.extra_plot_widget = pg.PlotWidget()
+        self.extra_plot_widget.setBackground('#0a1a0a')
+        self.extra_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.extra_plot_widget.setLabel('left', '数值')
+        self.extra_plot_widget.setLabel('bottom', '时间 (采样点)')
+        self.extra_plot_widget.setMinimumHeight(150)
+        self.extra_plot_widget.setMaximumHeight(200)
+        self.extra_plot_widget.addLegend()
+        
+        # 零线
+        self.extra_plot_widget.addLine(y=0, pen=pg.mkPen(color='w', width=1, style=Qt.DashLine))
+        
+        # 绿色=值1, 黄色=值2
+        self.extra_curve1 = self.extra_plot_widget.plot(
+            pen=pg.mkPen(color='#00cc66', width=2), name=label1
+        )
+        self.extra_curve2 = self.extra_plot_widget.plot(
+            pen=pg.mkPen(color='#cccc00', width=2), name=label2
+        )
+        
+        extra_layout.addWidget(self.extra_plot_widget)
+        
+        # 控制按钮
+        extra_btn_layout = QHBoxLayout()
+        self.clear_extra_btn = QPushButton("清空")
+        self.clear_extra_btn.clicked.connect(self.clear_extra_plot)
+        extra_btn_layout.addWidget(self.clear_extra_btn)
+        
+        self.pause_extra_btn = QPushButton("暂停")
+        self.pause_extra_btn.setCheckable(True)
+        extra_btn_layout.addWidget(self.pause_extra_btn)
+        
+        extra_btn_layout.addStretch()
+        extra_layout.addLayout(extra_btn_layout)
+        
+        extra_group.setLayout(extra_layout)
+        layout.addWidget(extra_group)
     
     def create_param_display(self, text):
         """创建参数显示标签"""
@@ -640,6 +710,39 @@ class PIDControlPanel(QWidget):
             self.output_curve2.setData([], [])
         if hasattr(self, 'output_value_label'):
             self.output_value_label.setText("当前输出: --")
+    
+    def update_extra_plot(self, value1, value2):
+        """更新额外观测通道波形数据"""
+        if not self.extra_channel_id:
+            return
+        if hasattr(self, 'pause_extra_btn') and self.pause_extra_btn.isChecked():
+            return
+        
+        self.extra_counter += 1
+        self.extra_time_data.append(self.extra_counter)
+        self.extra_data1.append(value1)
+        self.extra_data2.append(value2)
+        
+        self.extra_curve1.setData(list(self.extra_time_data), list(self.extra_data1))
+        self.extra_curve2.setData(list(self.extra_time_data), list(self.extra_data2))
+        
+        # 更新数值显示
+        label1, label2 = self.extra_labels
+        self.extra_value_label.setText(f"{label1}: {value1:.3f}  |  {label2}: {value2:.1f}")
+    
+    def clear_extra_plot(self):
+        """清除额外通道波形数据"""
+        self.extra_time_data.clear()
+        self.extra_data1.clear()
+        self.extra_data2.clear()
+        self.extra_counter = 0
+        if hasattr(self, 'extra_curve1'):
+            self.extra_curve1.setData([], [])
+        if hasattr(self, 'extra_curve2'):
+            self.extra_curve2.setData([], [])
+        if hasattr(self, 'extra_value_label'):
+            label1, label2 = self.extra_labels
+            self.extra_value_label.setText(f"{label1}: --  |  {label2}: --")
 
 
 # ============================================================================
@@ -1621,7 +1724,7 @@ class LegControlPanel(QWidget):
     DEFAULT_LEG_LENGTH_MIN = 0.045   # 默认最小腿长 (m) - 与 C 代码一致
     DEFAULT_LEG_LENGTH_MAX = 0.11    # 默认最大腿长 (m) - 与 C 代码一致
     LEG_BODY_ANGLE_MIN = -160.0  # 最小身体夹角 (度), 向前蹬腿
-    LEG_BODY_ANGLE_MAX = -20.0   # 最大身体夹角 (度), 向后蹬腿
+    LEG_BODY_ANGLE_MAX = 10.0    # 最大身体夹角 (度), 向后蹬腿
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3072,27 +3175,57 @@ class BalanceControlPanel(QWidget):
         sync_group.setLayout(sync_layout)
         layout.addWidget(sync_group)
         
-        # 角度零点设置
-        zero_group = QGroupBox("角度零点设置")
-        zero_layout = QHBoxLayout()
+        # 角度零点设置 & 自适应调试
+        zero_group = QGroupBox("🎯 角度零点设置 & 自适应")
+        zero_main_layout = QVBoxLayout()
         
-        zero_layout.addWidget(QLabel("零点角度 (°):"))
+        # 第一行: 手动设置零点
+        zero_row1 = QHBoxLayout()
+        zero_row1.addWidget(QLabel("零点角度 (°):"))
         self.zero_input = QDoubleSpinBox()
         self.zero_input.setRange(-30, 30)
         self.zero_input.setSingleStep(0.01)
         self.zero_input.setDecimals(3)
         self.zero_input.setValue(7.4)
-        zero_layout.addWidget(self.zero_input)
+        zero_row1.addWidget(self.zero_input)
         
         self.set_zero_btn = QPushButton("设置零点")
         self.set_zero_btn.clicked.connect(self.set_zero_point)
-        zero_layout.addWidget(self.set_zero_btn)
+        zero_row1.addWidget(self.set_zero_btn)
         
-        self.get_zero_btn = QPushButton("获取当前")
+        self.get_zero_btn = QPushButton("查询状态")
         self.get_zero_btn.clicked.connect(lambda: self.send_cmd("balance zero"))
-        zero_layout.addWidget(self.get_zero_btn)
+        zero_row1.addWidget(self.get_zero_btn)
+        zero_main_layout.addLayout(zero_row1)
         
-        zero_group.setLayout(zero_layout)
+        # 第二行: 轮速阈值设置
+        zero_row2 = QHBoxLayout()
+        zero_row2.addWidget(QLabel("轮速阈值 (m/s):"))
+        self.zp_threshold_input = QDoubleSpinBox()
+        self.zp_threshold_input.setRange(0.01, 5.0)
+        self.zp_threshold_input.setSingleStep(0.01)
+        self.zp_threshold_input.setDecimals(3)
+        self.zp_threshold_input.setValue(0.1)
+        self.zp_threshold_input.setToolTip("轮速低于此值时零点自适应PID才工作")
+        zero_row2.addWidget(self.zp_threshold_input)
+        
+        self.set_zp_thr_btn = QPushButton("设置阈值")
+        self.set_zp_thr_btn.clicked.connect(self.set_zp_threshold)
+        zero_row2.addWidget(self.set_zp_thr_btn)
+        zero_main_layout.addLayout(zero_row2)
+        
+        # 第三行: 自适应状态显示
+        self.zp_status_label = QLabel("零点自适应: 等待查询...")
+        self.zp_status_label.setStyleSheet(SS("color: #aaa; font-size: 10px;"))
+        self.zp_status_label.setWordWrap(True)
+        zero_main_layout.addWidget(self.zp_status_label)
+        
+        # 波形提示
+        zp_plot_hint = QLabel("📊 波形通道: I=pitch vs 零点 | J=PID输出(raw/filtered) | Z=角度误差+激活状态")
+        zp_plot_hint.setStyleSheet(SS("color: #888; font-size: 9px;"))
+        zero_main_layout.addWidget(zp_plot_hint)
+        
+        zero_group.setLayout(zero_main_layout)
         layout.addWidget(zero_group)
         
         # ========== 遥杆映射比例调节 ==========
@@ -3209,8 +3342,11 @@ class BalanceControlPanel(QWidget):
             # 零点/Roll
             'I': ('零点偏移', False),
             'J': ('零点LPF', False),
+            'Z': ('零点误差/激活', False),
             'K': ('Roll角度', False),
             'L': ('Roll LPF', False),
+            # 速度自适应
+            'M': ('速度自适应Kp', False),
             # 轮子
             'O': ('左轮速/加速', False),
             'P': ('右轮速/加速', False),
@@ -3233,9 +3369,10 @@ class BalanceControlPanel(QWidget):
             ("YAW", ['E', 'F', 'Y']),
             ("滤波", ['G', 'N', 'W']),
             ("输出", ['H', 'V']),
-            ("零点/Roll", ['I', 'J', 'K', 'L']),
+            ("零点/Roll", ['I', 'J', 'Z', 'K', 'L']),
             ("轮子", ['O', 'P', 'X']),
             ("环路分量", ['Q', 'R', 'S', 'T', 'U']),
+            ("自适应", ['M']),
         ]
         
         ch_grid = QGridLayout()
@@ -3747,6 +3884,9 @@ class BalanceControlPanel(QWidget):
     
     def set_zero_point(self):
         self.send_cmd(f"balance zero {self.zero_input.value()}")
+    
+    def set_zp_threshold(self):
+        self.send_cmd(f"balance zero threshold {self.zp_threshold_input.value()}")
     
     def on_init_success(self):
         self.balance_initialized = True
@@ -6118,7 +6258,11 @@ class PIDTunerUI(QMainWindow):
         self.pid_panels['lqr_u'] = PIDControlPanel("LQR输出补偿", "H", self, output_channel_id='V', output_dual=True)
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['lqr_u']), "H - LQR输出PID")
         
-        self.pid_panels['zeropoint'] = PIDControlPanel("零点自适应", "I", self)
+        self.pid_panels['zeropoint'] = PIDControlPanel(
+            "零点自适应", "I", self,
+            extra_channel_id='Z',
+            extra_labels=('角度误差', '激活状态')
+        )
         self.tab_widget.addTab(_make_scrollable(self.pid_panels['zeropoint']), "I - 零点PID")
         
         self.pid_panels['roll_angle'] = PIDControlPanel("Roll轴平衡", "K", self)
@@ -6362,6 +6506,12 @@ class PIDTunerUI(QMainWindow):
                         # YAW输出同时更新 yaw_gyro 面板
                         if panel_id == 'U' and 'yaw_gyro' in self.pid_panels:
                             self.pid_panels['yaw_gyro'].update_output_plot(control)
+                    
+                    # 额外观测通道: Z → 零点面板的 extra 波形
+                    elif panel_id == 'Z':
+                        if 'zeropoint' in self.pid_panels:
+                            self.pid_panels['zeropoint'].update_extra_plot(target, control)
+                    
                 except (ValueError, IndexError) as e:
                     if self.debug_mode:
                         self.log(f"解析数据失败: {line} ({e})", is_error=True)
@@ -6810,15 +6960,74 @@ class PIDTunerUI(QMainWindow):
             if 'gyro' in self.lpf_panels and isinstance(self.lpf_panels['gyro'], GyroFilterPanel):
                 self.lpf_panels['gyro'].update_display(mode, tf, rate)
         
-        # 解析角度零点查询响应
-        # 格式: Current angle zeropoint: %.2f (所有控制器共用)
+        # 解析角度零点查询响应 (新格式: 完整自适应状态)
+        # 格式: "  当前零点: %.3f°"
+        match = re.search(r'当前零点:\s*([-\d.]+)', line)
+        if match:
+            zeropoint = float(match.group(1))
+            if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zero_input'):
+                self.balance_panel.zero_input.setValue(zeropoint)
+            if hasattr(self, 'dual_pid_panel') and hasattr(self.dual_pid_panel, 'zero_input'):
+                self.dual_pid_panel.zero_input.setValue(zeropoint)
+        
+        # 解析自适应状态多行信息, 拼成状态文本
+        # "  当前pitch: %.3f°"
+        match = re.search(r'当前pitch:\s*([-\d.]+)', line)
+        if match and hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zp_status_label'):
+            self._zp_status_pitch = float(match.group(1))
+        # "  角度误差: %.3f°"
+        match = re.search(r'角度误差:\s*([-\d.]+)', line)
+        if match:
+            self._zp_status_err = float(match.group(1))
+        # "  PID输出: raw=%.6f, filtered=%.6f"
+        match = re.search(r'PID输出:\s*raw=([-\d.]+),\s*filtered=([-\d.]+)', line)
+        if match:
+            self._zp_status_raw = float(match.group(1))
+            self._zp_status_filt = float(match.group(2))
+        # "  轮速阈值: %.3f m/s (当前轮速: %.3f)"
+        match = re.search(r'轮速阈值:\s*([-\d.]+)\s*m/s.*当前轮速:\s*([-\d.]+)', line)
+        if match:
+            thr = float(match.group(1))
+            spd = float(match.group(2))
+            if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zp_threshold_input'):
+                self.balance_panel.zp_threshold_input.setValue(thr)
+            self._zp_status_thr = thr
+            self._zp_status_spd = spd
+        # "  PID激活: YES/NO"
+        match = re.search(r'PID激活:\s*(YES|NO)', line)
+        if match:
+            active = match.group(1)
+            self._zp_status_active = active
+        # "  PID参数: kp=%.6f, ki=%.6f, kd=%.6f"
+        match = re.search(r'PID参数:\s*kp=([-\d.]+),\s*ki=([-\d.]+),\s*kd=([-\d.]+)', line)
+        if match:
+            kp = match.group(1)
+            ki = match.group(2)
+            kd = match.group(3)
+            # 最后一行, 拼接完整状态
+            if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zp_status_label'):
+                zp_val = getattr(self, '_zp_status_pitch', 0)
+                err_val = getattr(self, '_zp_status_err', 0)
+                raw_val = getattr(self, '_zp_status_raw', 0)
+                filt_val = getattr(self, '_zp_status_filt', 0)
+                thr_val = getattr(self, '_zp_status_thr', 0.1)
+                spd_val = getattr(self, '_zp_status_spd', 0)
+                act_val = getattr(self, '_zp_status_active', '?')
+                status_text = (f"pitch={zp_val:.2f}° | 误差={err_val:.3f}° | "
+                               f"PID: raw={raw_val:.6f} filt={filt_val:.6f} | "
+                               f"轮速={spd_val:.3f}/{thr_val:.3f} | "
+                               f"激活={act_val} | kp={kp} ki={ki} kd={kd}")
+                self.balance_panel.zp_status_label.setText(status_text)
+                color = "#4CAF50" if act_val == "YES" else "#FF9800"
+                self.balance_panel.zp_status_label.setStyleSheet(SS(f"color: {color}; font-size: 10px;"))
+            self.log(f"✓ 零点自适应状态已更新", is_receive=True)
+        
+        # 兼容旧格式: "Current angle zeropoint: %.2f"
         match = re.search(r'Current angle zeropoint:\s*([-\d.]+)', line)
         if match:
             zeropoint = float(match.group(1))
-            # 更新 LQR 面板的零点 spinbox
             if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zero_input'):
                 self.balance_panel.zero_input.setValue(zeropoint)
-            # 更新 DualPID 面板的零点 spinbox
             if hasattr(self, 'dual_pid_panel') and hasattr(self.dual_pid_panel, 'zero_input'):
                 self.dual_pid_panel.zero_input.setValue(zeropoint)
             self.log(f"✓ 零点已同步: {zeropoint:.2f}°", is_receive=True)
@@ -6836,6 +7045,14 @@ class PIDTunerUI(QMainWindow):
             if hasattr(self, 'dual_pid_panel') and hasattr(self.dual_pid_panel, 'zero_input'):
                 self.dual_pid_panel.zero_input.setValue(zeropoint)
             self.log(f"✓ 零点已设置: {zeropoint:.2f}°", is_receive=True)
+        
+        # 解析零点轮速阈值设置确认
+        match = re.search(r'Zeropoint speed threshold set to\s*([-\d.]+)', line)
+        if match:
+            thr = float(match.group(1))
+            if hasattr(self, 'balance_panel') and hasattr(self.balance_panel, 'zp_threshold_input'):
+                self.balance_panel.zp_threshold_input.setValue(thr)
+            self.log(f"✓ 零点轮速阈值: {thr:.3f} m/s", is_receive=True)
         
         # ===== 新增: 设备控制面板数据解析 =====
         

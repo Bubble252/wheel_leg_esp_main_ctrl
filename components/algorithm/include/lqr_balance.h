@@ -432,6 +432,7 @@ void lqr_roll_reset(lqr_controller_t *ctrl);
  * @param ctrl 控制器实例 (使用其 pid_zeropoint 和 lpf_zeropoint)
  * @param angle_error 当前角度误差 = pitch - angle_zeropoint (度)
  * @param wheel_speed 当前轮速 (m/s 或 rad/s, 用于判断是否静止)
+ * @param speed_threshold 轮速阈值, 低于此值才启用自动调整 (默认 0.1)
  * @param dt 时间步长 (秒)
  * @param out_raw [out] 零点调整原始值 (可为NULL)
  * @param out_filtered [out] 零点调整滤波后值 (可为NULL)
@@ -441,10 +442,11 @@ void lqr_roll_reset(lqr_controller_t *ctrl);
  *       通过缓慢调整 angle_zeropoint 使得平均角度误差趋向零.
  *       使用 zeropoint_kp/ki/kd PID + lpf_zeropoint 低通滤波, 
  *       通过 Commander ID='I' 或 CLI 可调参.
- *       仅在轮速 < 1.0 时启用 (静止或低速), 避免运动中干扰.
+ *       仅在轮速 < speed_threshold 时启用 (静止或低速), 避免运动中干扰.
  */
 float lqr_zeropoint_auto_adjust(lqr_controller_t *ctrl, float angle_error,
-                                 float wheel_speed, float dt,
+                                 float wheel_speed, float speed_threshold,
+                                 float dt,
                                  float *out_raw, float *out_filtered);
 
 /**

@@ -42,6 +42,29 @@ typedef struct {
     bool go;                    // 使能开关 (Robot Go!)
     bool car_mode;              // 小车模式开关 (从网页切换)
     
+    // 扩展控制
+    bool balance_enable;        // 平衡使能 (true=使能平衡控制)
+    bool estop;                 // 紧急停止 (true=急停)
+    int8_t control_mode;        // 控制模式 (0=LQR, 1=DUAL_PID, 2=SINGLE_PID, 4=TRIPLE_PID)
+    bool pitch_comp;            // Pitch 补偿开关
+    bool leg_enable;            // 腿部使能
+    float leg_angle;            // 腿部角度 (度, -160 ~ 10)
+    float leg_length;           // 腿部长度 (米, 0.06 ~ 0.115)
+    
+    // 详细调控模式
+    bool detail_mode;           // 详细调控模式开关 (true=进入详细调控)
+    bool detail_sync;           // 双腿协同开关 (true=左右联动, false=独立控制)
+    float detail_left_length;   // 左腿腿长 (米, 0.045 ~ 0.11)
+    float detail_left_angle;    // 左腿身体夹角 (度, -160 ~ 10)
+    float detail_left_speed;    // 左轮速度 (rpm, -200 ~ 200)
+    float detail_right_length;  // 右腿腿长 (米, 0.045 ~ 0.11)
+    float detail_right_angle;   // 右腿身体夹角 (度, -160 ~ 10)
+    float detail_right_speed;   // 右轮速度 (rpm, -200 ~ 200)
+    
+    // 遥杆增益
+    float joy_speed_gain;       // 遥杆速度增益 (0.001 ~ 0.02)
+    float joy_yaw_gain;         // 遥杆转向增益 (0.005 ~ 0.2)
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量

@@ -87,7 +87,7 @@ extern "C" {
 #endif
 
 #ifndef LEG_BODY_ANGLE_MAX
-#define LEG_BODY_ANGLE_MAX          (-20.0f)  // 身体夹角最大值 (度), 向后蹬腿
+#define LEG_BODY_ANGLE_MAX          (10.0f)   // 身体夹角最大值 (度), 向后蹬腿
 #endif
 
 // ============================================================================

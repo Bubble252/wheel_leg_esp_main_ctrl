@@ -45,6 +45,24 @@ static remote_data_t g_remote_data = {
     .linear = 0,
     .angular = 0,
     .go = false,
+    .car_mode = false,
+    .balance_enable = false,
+    .estop = false,
+    .control_mode = 4,         // 默认 TRIPLE_PID
+    .pitch_comp = false,
+    .leg_enable = false,
+    .leg_angle = -90.0f,
+    .leg_length = 0.09f,
+    .detail_mode = false,
+    .detail_sync = true,
+    .detail_left_length = 0.09f,
+    .detail_left_angle = -90.0f,
+    .detail_left_speed = 0.0f,
+    .detail_right_length = 0.09f,
+    .detail_right_angle = -90.0f,
+    .detail_right_speed = 0.0f,
+    .joy_speed_gain = 0.003f,
+    .joy_yaw_gain = 0.03f,
     .last_update_ms = 0,
     .msg_count = 0,
     .connected = false,
@@ -149,6 +167,94 @@ static void parse_json_command(const char *json_str) {
     cJSON *car_mode = cJSON_GetObjectItem(json, "car_mode");
     if (car_mode && cJSON_IsNumber(car_mode)) {
         g_remote_data.car_mode = (car_mode->valueint == 1);
+    }
+    
+    // 解析扩展控制字段
+    cJSON *balance_enable = cJSON_GetObjectItem(json, "balance_enable");
+    if (balance_enable && cJSON_IsNumber(balance_enable)) {
+        g_remote_data.balance_enable = (balance_enable->valueint == 1);
+    }
+    
+    cJSON *estop = cJSON_GetObjectItem(json, "estop");
+    if (estop && cJSON_IsNumber(estop)) {
+        g_remote_data.estop = (estop->valueint == 1);
+    }
+    
+    cJSON *ctrl_mode = cJSON_GetObjectItem(json, "control_mode");
+    if (ctrl_mode && cJSON_IsNumber(ctrl_mode)) {
+        g_remote_data.control_mode = (int8_t)ctrl_mode->valueint;
+    }
+    
+    cJSON *pitch_comp = cJSON_GetObjectItem(json, "pitch_comp");
+    if (pitch_comp && cJSON_IsNumber(pitch_comp)) {
+        g_remote_data.pitch_comp = (pitch_comp->valueint == 1);
+    }
+    
+    cJSON *leg_enable = cJSON_GetObjectItem(json, "leg_enable");
+    if (leg_enable && cJSON_IsNumber(leg_enable)) {
+        g_remote_data.leg_enable = (leg_enable->valueint == 1);
+    }
+    
+    cJSON *leg_angle = cJSON_GetObjectItem(json, "leg_angle");
+    if (leg_angle && cJSON_IsNumber(leg_angle)) {
+        g_remote_data.leg_angle = (float)leg_angle->valuedouble;
+    }
+    
+    cJSON *leg_length = cJSON_GetObjectItem(json, "leg_length");
+    if (leg_length && cJSON_IsNumber(leg_length)) {
+        g_remote_data.leg_length = (float)leg_length->valuedouble;
+    }
+    
+    // 解析详细调控模式字段
+    cJSON *detail_mode = cJSON_GetObjectItem(json, "detail_mode");
+    if (detail_mode && cJSON_IsNumber(detail_mode)) {
+        g_remote_data.detail_mode = (detail_mode->valueint == 1);
+    }
+    
+    cJSON *detail_sync = cJSON_GetObjectItem(json, "detail_sync");
+    if (detail_sync && cJSON_IsNumber(detail_sync)) {
+        g_remote_data.detail_sync = (detail_sync->valueint == 1);
+    }
+    
+    cJSON *dl_len = cJSON_GetObjectItem(json, "detail_left_length");
+    if (dl_len && cJSON_IsNumber(dl_len)) {
+        g_remote_data.detail_left_length = (float)dl_len->valuedouble;
+    }
+    
+    cJSON *dl_ang = cJSON_GetObjectItem(json, "detail_left_angle");
+    if (dl_ang && cJSON_IsNumber(dl_ang)) {
+        g_remote_data.detail_left_angle = (float)dl_ang->valuedouble;
+    }
+    
+    cJSON *dl_spd = cJSON_GetObjectItem(json, "detail_left_speed");
+    if (dl_spd && cJSON_IsNumber(dl_spd)) {
+        g_remote_data.detail_left_speed = (float)dl_spd->valuedouble;
+    }
+    
+    cJSON *dr_len = cJSON_GetObjectItem(json, "detail_right_length");
+    if (dr_len && cJSON_IsNumber(dr_len)) {
+        g_remote_data.detail_right_length = (float)dr_len->valuedouble;
+    }
+    
+    cJSON *dr_ang = cJSON_GetObjectItem(json, "detail_right_angle");
+    if (dr_ang && cJSON_IsNumber(dr_ang)) {
+        g_remote_data.detail_right_angle = (float)dr_ang->valuedouble;
+    }
+    
+    cJSON *dr_spd = cJSON_GetObjectItem(json, "detail_right_speed");
+    if (dr_spd && cJSON_IsNumber(dr_spd)) {
+        g_remote_data.detail_right_speed = (float)dr_spd->valuedouble;
+    }
+    
+    // 解析遥杆增益
+    cJSON *joy_spd_gain = cJSON_GetObjectItem(json, "joy_speed_gain");
+    if (joy_spd_gain && cJSON_IsNumber(joy_spd_gain)) {
+        g_remote_data.joy_speed_gain = (float)joy_spd_gain->valuedouble;
+    }
+    
+    cJSON *joy_yaw_gain = cJSON_GetObjectItem(json, "joy_yaw_gain");
+    if (joy_yaw_gain && cJSON_IsNumber(joy_yaw_gain)) {
+        g_remote_data.joy_yaw_gain = (float)joy_yaw_gain->valuedouble;
     }
     
     // 更新时间戳和计数

@@ -149,6 +149,112 @@ static const char web_page_html[] = R"rawliteral(
         overflow-y: auto;
     }
     
+    /* 扩展控制面板 */
+    .ctrl-panel {
+        background: rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 12px 16px;
+        margin: 10px 20px;
+    }
+    .ctrl-panel h3 {
+        margin: 0 0 10px 0;
+        font-size: 16px;
+        color: #aaa;
+        border-bottom: 1px solid #444;
+        padding-bottom: 6px;
+    }
+    .ctrl-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin: 8px 0;
+    }
+    .ctrl-row label {
+        font-size: 14px;
+        flex: 1;
+    }
+    .ctrl-row select {
+        background: #333;
+        color: white;
+        border: 1px solid #555;
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-size: 14px;
+        outline: none;
+    }
+    .switch.estop-switch:checked + label::before {
+        content: '';
+    }
+    .switch.estop-switch + label {
+        cursor: pointer;
+    }
+    /* E-Stop 红色样式 */
+    .estop-container {
+        margin: 8px 0;
+    }
+    .estop-btn {
+        width: 100%;
+        height: 50px;
+        border-radius: 10px;
+        font-size: 18px;
+        font-weight: bold;
+        border: 2px solid #f44336;
+        cursor: pointer;
+        transition: 0.2s;
+        background: #333;
+        color: #f44336;
+    }
+    .estop-btn.active {
+        background: #f44336;
+        color: white;
+        animation: pulse-red 1s infinite;
+    }
+    @keyframes pulse-red {
+        0%, 100% { box-shadow: 0 0 5px #f44336; }
+        50% { box-shadow: 0 0 20px #f44336; }
+    }
+    
+    /* 详细调控面板 */
+    .detail-panel {
+        background: rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 12px 16px;
+        margin: 10px 20px;
+        border: 2px solid #2196F3;
+    }
+    .detail-panel h3 {
+        margin: 0 0 10px 0;
+        font-size: 16px;
+        color: #2196F3;
+        border-bottom: 1px solid #2196F3;
+        padding-bottom: 6px;
+    }
+    .detail-panel.hidden {
+        display: none;
+    }
+    .detail-side {
+        background: rgba(255,255,255,0.04);
+        border-radius: 8px;
+        padding: 8px 12px;
+        margin: 8px 0;
+    }
+    .detail-side h4 {
+        margin: 0 0 6px 0;
+        font-size: 14px;
+        color: #aaa;
+    }
+    .detail-side.left-side { border-left: 3px solid #4CAF50; }
+    .detail-side.right-side { border-left: 3px solid #FF9800; }
+    .detail-side.synced { border-left: 3px solid #2196F3; }
+    .sync-indicator {
+        text-align: center;
+        font-size: 12px;
+        color: #2196F3;
+        padding: 4px;
+        display: none;
+    }
+    .sync-indicator.active { display: block; }
+    
     * {
         -webkit-touch-callout: none;
         -webkit-user-select: none;
@@ -170,6 +276,126 @@ static const char web_page_html[] = R"rawliteral(
         <div class="switch-container">
             <input type="checkbox" id="carSwitch" class="switch car-switch" onclick="toggleCarMode()">
             <label for="carSwitch" style="font-size:16px; font-weight:bold;"> 🚗 Car Mode</label>
+        </div>
+        
+        <!-- 紧急停止 -->
+        <div class="ctrl-panel">
+            <div class="estop-container">
+                <button class="estop-btn" id="estopBtn" onclick="toggleEstop()">🛑 Emergency Stop</button>
+            </div>
+        </div>
+        
+        <!-- 扩展控制面板 -->
+        <div class="ctrl-panel">
+            <h3>⚙️ Control Settings</h3>
+            
+            <div class="ctrl-row">
+                <label>🎯 Balance Enable</label>
+                <input type="checkbox" id="balanceSwitch" class="switch" onclick="toggleBalance()">
+            </div>
+            
+            <div class="ctrl-row">
+                <label>📐 Pitch Compensation</label>
+                <input type="checkbox" id="pitchCompSwitch" class="switch" onclick="togglePitchComp()">
+            </div>
+            
+            <div class="ctrl-row">
+                <label>🔧 Control Mode</label>
+                <select id="ctrlModeSelect" onchange="updateCtrlMode()">
+                    <option value="0">LQR</option>
+                    <option value="1">Dual PID</option>
+                    <option value="2">Single PID</option>
+                    <option value="4" selected>Triple PID</option>
+                </select>
+            </div>
+            
+            <div class="slider-row">
+                <label id="joySpeedLabel">🏎️ Speed Gain: 3.0 ‰</label>
+                <input type="range" id="joySpeedSlider" min="1" max="20" value="3" step="0.5" oninput="updateJoySpeed()">
+            </div>
+            
+            <div class="slider-row">
+                <label id="joyYawLabel">🔄 Yaw Gain: 30 ‰</label>
+                <input type="range" id="joyYawSlider" min="5" max="200" value="30" step="1" oninput="updateJoyYaw()">
+            </div>
+        </div>
+        
+        <!-- 腿部控制面板 -->
+        <div class="ctrl-panel">
+            <h3>🦿 Leg Control</h3>
+            
+            <div class="ctrl-row">
+                <label>🔌 Leg Enable</label>
+                <input type="checkbox" id="legEnableSwitch" class="switch" onclick="toggleLegEnable()">
+            </div>
+            
+            <div class="slider-row">
+                <label id="legAngleLabel">Leg Angle: -90°</label>
+                <input type="range" id="legAngleSlider" min="-160" max="10" value="-90" oninput="updateLegAngle()">
+            </div>
+            
+            <div class="slider-row">
+                <label id="legLengthLabel">Leg Length: 90 mm</label>
+                <input type="range" id="legLengthSlider" min="45" max="110" value="90" oninput="updateLegLength()">
+            </div>
+        </div>
+        
+        <!-- 详细调控模式面板 -->
+        <div class="ctrl-panel">
+            <div class="ctrl-row">
+                <label>🔬 Detail Control Mode</label>
+                <input type="checkbox" id="detailModeSwitch" class="switch" onclick="toggleDetailMode()">
+            </div>
+        </div>
+        
+        <div class="detail-panel hidden" id="detailPanel">
+            <h3>🔬 Detailed Control</h3>
+            
+            <div class="ctrl-row">
+                <label>🔗 Sync L/R (协同控制)</label>
+                <input type="checkbox" id="detailSyncSwitch" class="switch" checked onclick="toggleDetailSync()">
+            </div>
+            <div class="sync-indicator active" id="syncIndicator">🔗 协同模式: 左侧滑条同时控制双腿双轮</div>
+            
+            <!-- 左侧控制 -->
+            <div class="detail-side left-side" id="leftSide">
+                <h4>🟢 Left / 左侧</h4>
+                <div class="slider-row">
+                    <label id="dlLengthLabel">Leg Length: 90 mm</label>
+                    <input type="range" id="dlLengthSlider" min="45" max="110" value="90" oninput="updateDetailLeft()">
+                </div>
+                <div class="slider-row">
+                    <label id="dlAngleLabel">Body Angle: -90°</label>
+                    <input type="range" id="dlAngleSlider" min="-160" max="10" value="-90" oninput="updateDetailLeft()">
+                </div>
+                <div class="slider-row">
+                    <label id="dlSpeedLabel">Wheel Speed: 0 rpm</label>
+                    <input type="range" id="dlSpeedSlider" min="-200" max="200" value="0" oninput="updateDetailLeft()">
+                </div>
+                <div style="text-align:center; margin-top:4px;">
+                    <button class="dir-btn" style="width:120px; height:32px; font-size:12px;" onclick="resetDetailLeftSpeed()">Reset Speed</button>
+                </div>
+            </div>
+            
+            <!-- 右侧控制 -->
+            <div class="detail-side right-side" id="rightSide">
+                <h4>🟠 Right / 右侧</h4>
+                <div class="slider-row">
+                    <label id="drLengthLabel">Leg Length: 90 mm</label>
+                    <input type="range" id="drLengthSlider" min="45" max="110" value="90" oninput="updateDetailRight()">
+                </div>
+                <div class="slider-row">
+                    <label id="drAngleLabel">Body Angle: -90°</label>
+                    <input type="range" id="drAngleSlider" min="-160" max="10" value="-90" oninput="updateDetailRight()">
+                </div>
+                <div class="slider-row">
+                    <label id="drSpeedLabel">Wheel Speed: 0 rpm</label>
+                    <input type="range" id="drSpeedSlider" min="-200" max="200" value="0" oninput="updateDetailRight()">
+                </div>
+                <div style="text-align:center; margin-top:4px;">
+                    <button class="dir-btn" style="width:120px; height:32px; font-size:12px;" onclick="resetDetailRightSpeed()">Reset Speed</button>
+                </div>
+            </div>
         </div>
         
         <div class="joystick-container" id="joystickDiv"></div>
@@ -214,6 +440,23 @@ static const char web_page_html[] = R"rawliteral(
     var g_joyX = 0;
     var g_joyY = 0;
     var g_dir = "stop";
+    var g_balanceEnable = 0;
+    var g_estop = 0;
+    var g_ctrlMode = 4;
+    var g_pitchComp = 0;
+    var g_legEnable = 0;
+    var g_legAngle = -90;
+    var g_legLength = 90;
+    var g_joySpeedGain = 3.0;
+    var g_joyYawGain = 30;
+    var g_detailMode = 0;
+    var g_detailSync = 1;
+    var g_dlLength = 90;
+    var g_dlAngle = -90;
+    var g_dlSpeed = 0;
+    var g_drLength = 90;
+    var g_drAngle = -90;
+    var g_drSpeed = 0;
     var msgCount = 0;
     
     // WebSocket 初始化
@@ -264,7 +507,24 @@ static const char web_page_html[] = R"rawliteral(
                 stable: g_go,
                 car_mode: g_carMode,
                 linear: 0,
-                angular: 0
+                angular: 0,
+                balance_enable: g_balanceEnable,
+                estop: g_estop,
+                control_mode: g_ctrlMode,
+                pitch_comp: g_pitchComp,
+                leg_enable: g_legEnable,
+                leg_angle: g_legAngle,
+                leg_length: g_legLength / 1000.0,
+                detail_mode: g_detailMode,
+                detail_sync: g_detailSync,
+                detail_left_length: g_dlLength / 1000.0,
+                detail_left_angle: g_dlAngle,
+                detail_left_speed: g_dlSpeed,
+                detail_right_length: g_drLength / 1000.0,
+                detail_right_angle: g_drAngle,
+                detail_right_speed: g_drSpeed,
+                joy_speed_gain: g_joySpeedGain / 1000.0,
+                joy_yaw_gain: g_joyYawGain / 1000.0
             };
             socket.send(JSON.stringify(data));
             msgCount++;
@@ -302,6 +562,157 @@ static const char web_page_html[] = R"rawliteral(
     
     function dirRelease() {
         g_dir = 'stop';
+        sendData();
+    }
+    
+    function toggleBalance() {
+        g_balanceEnable = document.getElementById('balanceSwitch').checked ? 1 : 0;
+        sendData();
+        log('Balance: ' + (g_balanceEnable ? 'ON' : 'OFF'));
+    }
+    
+    function toggleEstop() {
+        g_estop = g_estop ? 0 : 1;
+        var btn = document.getElementById('estopBtn');
+        if (g_estop) {
+            btn.className = 'estop-btn active';
+            btn.innerText = '🛑 E-STOP ACTIVE!';
+            // 急停时自动关闭 go
+            g_go = 0;
+            document.getElementById('goSwitch').checked = false;
+        } else {
+            btn.className = 'estop-btn';
+            btn.innerText = '🛑 Emergency Stop';
+        }
+        sendData();
+        log('E-Stop: ' + (g_estop ? 'ACTIVE' : 'Released'));
+    }
+    
+    function updateCtrlMode() {
+        g_ctrlMode = parseInt(document.getElementById('ctrlModeSelect').value);
+        var names = {0:'LQR', 1:'Dual PID', 2:'Single PID', 4:'Triple PID'};
+        sendData();
+        log('Control mode: ' + (names[g_ctrlMode] || 'Unknown'));
+    }
+    
+    function togglePitchComp() {
+        g_pitchComp = document.getElementById('pitchCompSwitch').checked ? 1 : 0;
+        sendData();
+        log('Pitch Comp: ' + (g_pitchComp ? 'ON' : 'OFF'));
+    }
+    
+    function toggleLegEnable() {
+        g_legEnable = document.getElementById('legEnableSwitch').checked ? 1 : 0;
+        sendData();
+        log('Leg Enable: ' + (g_legEnable ? 'ON' : 'OFF'));
+    }
+    
+    function updateLegAngle() {
+        g_legAngle = parseInt(document.getElementById('legAngleSlider').value);
+        document.getElementById('legAngleLabel').innerText = 'Leg Angle: ' + g_legAngle + '°';
+        sendData();
+    }
+    
+    function updateLegLength() {
+        g_legLength = parseInt(document.getElementById('legLengthSlider').value);
+        document.getElementById('legLengthLabel').innerText = 'Leg Length: ' + g_legLength + ' mm';
+        sendData();
+    }
+    
+    function updateJoySpeed() {
+        g_joySpeedGain = parseFloat(document.getElementById('joySpeedSlider').value);
+        document.getElementById('joySpeedLabel').innerText = '🏎️ Speed Gain: ' + g_joySpeedGain.toFixed(1) + ' ‰';
+        sendData();
+        log('Joy speed gain: ' + g_joySpeedGain + '‰ (scale=' + (g_joySpeedGain/1000).toFixed(4) + ')');
+    }
+    
+    function updateJoyYaw() {
+        g_joyYawGain = parseInt(document.getElementById('joyYawSlider').value);
+        document.getElementById('joyYawLabel').innerText = '🔄 Yaw Gain: ' + g_joyYawGain + ' ‰';
+        sendData();
+        log('Joy yaw gain: ' + g_joyYawGain + '‰ (scale=' + (g_joyYawGain/1000).toFixed(4) + ')');
+    }
+    
+    // ======== 详细调控模式 ========
+    function toggleDetailMode() {
+        g_detailMode = document.getElementById('detailModeSwitch').checked ? 1 : 0;
+        var panel = document.getElementById('detailPanel');
+        if (g_detailMode) {
+            panel.className = 'detail-panel';
+        } else {
+            panel.className = 'detail-panel hidden';
+        }
+        sendData();
+        log('Detail mode: ' + (g_detailMode ? 'ON' : 'OFF'));
+    }
+    
+    function toggleDetailSync() {
+        g_detailSync = document.getElementById('detailSyncSwitch').checked ? 1 : 0;
+        var rightSide = document.getElementById('rightSide');
+        var syncInd = document.getElementById('syncIndicator');
+        var leftSide = document.getElementById('leftSide');
+        if (g_detailSync) {
+            rightSide.style.opacity = '0.4';
+            rightSide.style.pointerEvents = 'none';
+            syncInd.className = 'sync-indicator active';
+            leftSide.className = 'detail-side left-side synced';
+            // 同步右侧显示为左侧值
+            syncRightToLeft();
+        } else {
+            rightSide.style.opacity = '1';
+            rightSide.style.pointerEvents = 'auto';
+            syncInd.className = 'sync-indicator';
+            leftSide.className = 'detail-side left-side';
+        }
+        sendData();
+        log('Detail sync: ' + (g_detailSync ? 'SYNC' : 'INDEPENDENT'));
+    }
+    
+    function syncRightToLeft() {
+        g_drLength = g_dlLength;
+        g_drAngle = g_dlAngle;
+        g_drSpeed = g_dlSpeed;
+        document.getElementById('drLengthSlider').value = g_drLength;
+        document.getElementById('drAngleSlider').value = g_drAngle;
+        document.getElementById('drSpeedSlider').value = g_drSpeed;
+        document.getElementById('drLengthLabel').innerText = 'Leg Length: ' + g_drLength + ' mm';
+        document.getElementById('drAngleLabel').innerText = 'Body Angle: ' + g_drAngle + '°';
+        document.getElementById('drSpeedLabel').innerText = 'Wheel Speed: ' + g_drSpeed + ' rpm';
+    }
+    
+    function updateDetailLeft() {
+        g_dlLength = parseInt(document.getElementById('dlLengthSlider').value);
+        g_dlAngle = parseInt(document.getElementById('dlAngleSlider').value);
+        g_dlSpeed = parseInt(document.getElementById('dlSpeedSlider').value);
+        document.getElementById('dlLengthLabel').innerText = 'Leg Length: ' + g_dlLength + ' mm';
+        document.getElementById('dlAngleLabel').innerText = 'Body Angle: ' + g_dlAngle + '°';
+        document.getElementById('dlSpeedLabel').innerText = 'Wheel Speed: ' + g_dlSpeed + ' rpm';
+        if (g_detailSync) { syncRightToLeft(); }
+        sendData();
+    }
+    
+    function updateDetailRight() {
+        g_drLength = parseInt(document.getElementById('drLengthSlider').value);
+        g_drAngle = parseInt(document.getElementById('drAngleSlider').value);
+        g_drSpeed = parseInt(document.getElementById('drSpeedSlider').value);
+        document.getElementById('drLengthLabel').innerText = 'Leg Length: ' + g_drLength + ' mm';
+        document.getElementById('drAngleLabel').innerText = 'Body Angle: ' + g_drAngle + '°';
+        document.getElementById('drSpeedLabel').innerText = 'Wheel Speed: ' + g_drSpeed + ' rpm';
+        sendData();
+    }
+    
+    function resetDetailLeftSpeed() {
+        g_dlSpeed = 0;
+        document.getElementById('dlSpeedSlider').value = 0;
+        document.getElementById('dlSpeedLabel').innerText = 'Wheel Speed: 0 rpm';
+        if (g_detailSync) { syncRightToLeft(); }
+        sendData();
+    }
+    
+    function resetDetailRightSpeed() {
+        g_drSpeed = 0;
+        document.getElementById('drSpeedSlider').value = 0;
+        document.getElementById('drSpeedLabel').innerText = 'Wheel Speed: 0 rpm';
         sendData();
     }
     
@@ -386,6 +797,10 @@ static const char web_page_html[] = R"rawliteral(
     window.onload = function() {
         initWebSocket();
         new JoyStick('joystickDiv');
+        // 初始化详细调控面板: 协同模式下禁用右侧
+        var rightSide = document.getElementById('rightSide');
+        rightSide.style.opacity = '0.4';
+        rightSide.style.pointerEvents = 'none';
     };
 </script>
 </body>

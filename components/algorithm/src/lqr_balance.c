@@ -613,7 +613,8 @@ void lqr_roll_reset(lqr_controller_t *ctrl) {
 // ============================================================================
 
 float lqr_zeropoint_auto_adjust(lqr_controller_t *ctrl, float angle_error,
-                                 float wheel_speed, float dt,
+                                 float wheel_speed, float speed_threshold,
+                                 float dt,
                                  float *out_raw, float *out_filtered) {
     if (ctrl == NULL || !ctrl->initialized) {
         if (out_raw) *out_raw = 0.0f;
@@ -626,11 +627,12 @@ float lqr_zeropoint_auto_adjust(lqr_controller_t *ctrl, float angle_error,
     float delta = 0.0f;
     
     // 仅在近乎静止时启用自动调整, 避免运动中干扰
-    if (fabsf(wheel_speed) < 0.1f) {
+    if (fabsf(wheel_speed) < speed_threshold) {
         // 使用 zeropoint PID: 角度误差 → 零点调整量
-        // pid_compute(0, angle_error): error = 0 - angle_error = -angle_error
-        //   → output ∝ -angle_error → delta 与 angle_error 反号
-        adjust_raw = pid_compute(&ctrl->pid_zeropoint, 0.0f, angle_error, dt);
+        // pid_compute(angle_error, 0): error = angle_error - 0 = angle_error
+        //   → output ∝ angle_error → delta 与 angle_error 同号
+        //   pitch偏大 → delta>0 → zeropoint增大 → 向pitch方向靠拢
+        adjust_raw = pid_compute(&ctrl->pid_zeropoint, angle_error, 0.0f, dt);
         // 低通滤波: 确保调整非常平缓
         adjust_filtered = lpf_compute_dt(&ctrl->lpf_zeropoint, adjust_raw, dt);
         delta = adjust_filtered;

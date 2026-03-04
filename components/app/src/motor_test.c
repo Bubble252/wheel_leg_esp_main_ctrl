@@ -45,6 +45,11 @@
 
 static const char *TAG = "MOTOR_TEST";
 
+// ============================================================================
+// 编译选项: 设为1时程序启动后自动执行 balance init + balance start
+// ============================================================================
+#define AUTO_BALANCE_START  1
+
 // 电机句柄
 static can_motor_handle_t g_motors[MOTOR_COUNT] = {NULL};
 static TaskHandle_t g_rx_task = NULL;
@@ -937,6 +942,25 @@ esp_err_t motor_test_start(void) {
     
     ESP_LOGI(TAG, "Motor test started (non-blocking)");
     ESP_LOGI(TAG, "Tasks: can_rx(CPU1), status(CPU1), console(CPU0)");
+    
+#if AUTO_BALANCE_START
+    // 自动初始化并启动平衡模块
+    ESP_LOGI(TAG, "AUTO_BALANCE_START enabled, auto-running balance init + start...");
+    vTaskDelay(pdMS_TO_TICKS(500));  // 等待 CAN 总线稳定
+    
+    ret = balance_test_init();
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Auto balance_test_init: OK");
+        ret = balance_test_start();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Auto balance_test_start: OK");
+        } else {
+            ESP_LOGE(TAG, "Auto balance_test_start: FAILED (%s)", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGE(TAG, "Auto balance_test_init: FAILED (%s)", esp_err_to_name(ret));
+    }
+#endif
     
     return ESP_OK;
 }

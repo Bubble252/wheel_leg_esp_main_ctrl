@@ -186,7 +186,7 @@ typedef enum {
     CTRL_MODE_CAR,          // 普通小车模式 (无直立环, 趴下跑)
     CTRL_MODE_TRIPLE_PID,   // 三环 PID 控制 (速度环→角度环→轮速环)
 } control_mode_t;
-static control_mode_t g_control_mode = CTRL_MODE_LQR;  // 默认 LQR 模式
+static control_mode_t g_control_mode = CTRL_MODE_TRIPLE_PID;  // 默认三环 PID 模式
 
 // 普通小车模式参数
 #define CAR_MODE_BODY_ANGLE     (-134.0f)   // 小车模式身体夹角 (度), 趴下
@@ -264,6 +264,7 @@ static int g_uncontrolable = 0;             // 失控标志
 // 遥杆映射比例 (可通过 UI/CLI 在线调节)
 static float g_joy_speed_scale = 0.003f;    // joy_y → target_speed 比例 (默认 0.003, max ±0.3)
 static float g_joy_yaw_scale = 0.03f;       // joy_x → target_yaw_rate 比例 (默认 0.03)
+static float g_tpid_yaw_scale = 500.0f;     // 三环PID yaw输出缩放 (LQR yaw输出太小, 需放大)
 
 // 轮速加速度计算 (用于离地检测)
 static float g_left_wheel_speed_rad = 0.0f;     // 左轮速度 (rad/s)
@@ -352,6 +353,16 @@ static bool g_roll_control_enabled = false;  // 默认禁用
 
 // Pitch 腿部角度补偿开关
 static bool g_pitch_leg_comp_enabled = false; // 默认禁用腿部角度补偿
+
+// ============================================================================
+// 零点自适应 PID 调试变量
+// ============================================================================
+static float g_zp_speed_threshold = 0.1f;         // 轮速阈值 (m/s), 低于此值才启用零点自适应
+static float g_zp_pitch_for_ctrl = 0.0f;         // 当前 pitch_for_control (用于零点调试)
+static float g_zp_angle_error = 0.0f;            // 零点自适应的角度误差
+static float g_zp_pid_raw = 0.0f;                // PID 原始输出 (滤波前)
+static float g_zp_pid_filtered = 0.0f;           // PID 滤波后输出
+static bool  g_zp_active = false;                // 是否进入了零点PID计算 (轮速<阈值)
 
 // ============================================================================
 // X-Offset 腿部速度自适应偏移 (独立腿部姿态控制)
@@ -785,13 +796,14 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     if (PLOT_CH_ENABLED('F')) printf("#DATA,F,%.2f,%.2f\n", input->target_yaw_rate, input->yaw_rate);
     if (PLOT_CH_ENABLED('G')) printf("#DATA,G,%.2f,%.2f\n", input->target_speed, output->filtered_target_speed);
     if (PLOT_CH_ENABLED('H')) printf("#DATA,H,0.0,%.2f\n", g_last_lqr_u);
-    if (PLOT_CH_ENABLED('I')) printf("#DATA,I,0.0,%.3f\n", g_angle_zeropoint);
-    if (PLOT_CH_ENABLED('J')) printf("#DATA,J,%.4f,%.4f\n", output->zeropoint_adjust_raw, output->zeropoint_adjust_filtered);
+    if (PLOT_CH_ENABLED('I')) printf("#DATA,I,%.3f,%.3f\n", g_zp_pitch_for_ctrl, g_angle_zeropoint);
+    if (PLOT_CH_ENABLED('J')) printf("#DATA,J,%.4f,%.4f\n", g_zp_pid_raw, g_zp_pid_filtered);
     if (PLOT_CH_ENABLED('K')) printf("#DATA,K,0.0,%.2f\n", input->roll);
     if (PLOT_CH_ENABLED('L')) {
         float roll_filtered_display = lpf_compute_dt(&g_lqr_ctrl.lpf_roll, input->roll, input->dt);
         printf("#DATA,L,%.2f,%.2f\n", input->roll, roll_filtered_display);
     }
+    if (PLOT_CH_ENABLED('M')) printf("#DATA,M,%.4f,%.4f\n", g_lqr_ctrl.params.speed_kp, g_lqr_ctrl.params.speed_kp_max);
     if (PLOT_CH_ENABLED('N')) printf("#DATA,N,%.2f,%.2f\n", input->pitch_rate, output->filtered_gyro);
     if (PLOT_CH_ENABLED('W')) printf("#DATA,W,%.3f,%.3f\n", input->lqr_speed, output->filtered_speed);
     if (PLOT_CH_ENABLED('O')) printf("#DATA,O,%.2f,%.2f\n", g_left_wheel_speed_rad, g_left_wheel_accel);
@@ -811,6 +823,7 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
                g_lqr_ctrl.yaw_holding ? 1 : 0,
                input->yaw_rate);
     }
+    if (PLOT_CH_ENABLED('Z')) printf("#DATA,Z,%.3f,%.1f\n", g_zp_angle_error, g_zp_active ? 1.0f : 0.0f);
 }
 
 /**
@@ -2451,13 +2464,221 @@ static void update_remote_from_wifi(void) {
         }
     }
     last_car_mode = wifi_data->car_mode;
+    
+    // ======== 处理紧急停止 ========
+    static bool last_estop = false;
+    if (wifi_data->estop && !last_estop) {
+        ESP_LOGW(TAG, "WiFi: E-STOP activated!");
+        balance_test_disable();
+        if (g_leg_control_enabled) {
+            balance_test_set_leg_control(false);
+        }
+    } else if (!wifi_data->estop && last_estop) {
+        ESP_LOGI(TAG, "WiFi: E-STOP released");
+    }
+    last_estop = wifi_data->estop;
+    
+    // ======== 处理平衡使能 ========
+    static bool last_balance_enable = false;
+    if (wifi_data->balance_enable && !last_balance_enable) {
+        if (!wifi_data->estop) {
+            balance_test_enable();
+            ESP_LOGI(TAG, "WiFi: Balance ENABLED");
+        }
+    } else if (!wifi_data->balance_enable && last_balance_enable) {
+        balance_test_disable();
+        ESP_LOGI(TAG, "WiFi: Balance DISABLED");
+    }
+    last_balance_enable = wifi_data->balance_enable;
+    
+    // ======== 处理控制模式切换 ========
+    static int8_t last_ctrl_mode = 0;
+    if (wifi_data->control_mode != last_ctrl_mode && !wifi_data->estop) {
+        control_mode_t new_mode;
+        const char *mode_str = "Unknown";
+        switch (wifi_data->control_mode) {
+            case 0: new_mode = CTRL_MODE_LQR; mode_str = "LQR"; break;
+            case 1: new_mode = CTRL_MODE_DUAL_PID; mode_str = "DUAL_PID"; break;
+            case 2: new_mode = CTRL_MODE_SINGLE_PID; mode_str = "SINGLE_PID"; break;
+            case 4: new_mode = CTRL_MODE_TRIPLE_PID; mode_str = "TRIPLE_PID"; break;
+            default: new_mode = g_control_mode; break;  // 无效值忽略
+        }
+        if (new_mode != g_control_mode && g_control_mode != CTRL_MODE_CAR) {
+            g_control_mode = new_mode;
+            // 根据模式设置电机模式
+            if (g_state == BALANCE_TEST_RUNNING) {
+                if (g_control_mode == CTRL_MODE_SINGLE_PID ||
+                    (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
+                    can_motor_set_mode(g_motor_left, MODE_SPEED);
+                    can_motor_set_mode(g_motor_right, MODE_SPEED);
+                } else {
+                    can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                    can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                }
+            }
+            ESP_LOGI(TAG, "WiFi: Control mode → %s", mode_str);
+            printf("CTRL_MODE:%s\n", mode_str);
+        }
+    }
+    last_ctrl_mode = wifi_data->control_mode;
+    
+    // ======== 处理 Pitch 补偿开关 ========
+    static bool last_pitch_comp = false;
+    if (wifi_data->pitch_comp != last_pitch_comp) {
+        balance_test_set_pitch_comp(wifi_data->pitch_comp);
+        ESP_LOGI(TAG, "WiFi: Pitch comp %s", wifi_data->pitch_comp ? "ON" : "OFF");
+    }
+    last_pitch_comp = wifi_data->pitch_comp;
+    
+    // ======== 处理遥杆增益 ========
+    static float last_joy_speed_gain = 0.003f;
+    static float last_joy_yaw_gain = 0.03f;
+    if (fabsf(wifi_data->joy_speed_gain - last_joy_speed_gain) > 0.0001f) {
+        g_joy_speed_scale = wifi_data->joy_speed_gain;
+        ESP_LOGI(TAG, "WiFi: Joy speed scale = %.4f", g_joy_speed_scale);
+        last_joy_speed_gain = wifi_data->joy_speed_gain;
+    }
+    if (fabsf(wifi_data->joy_yaw_gain - last_joy_yaw_gain) > 0.0001f) {
+        g_joy_yaw_scale = wifi_data->joy_yaw_gain;
+        ESP_LOGI(TAG, "WiFi: Joy yaw scale = %.4f", g_joy_yaw_scale);
+        last_joy_yaw_gain = wifi_data->joy_yaw_gain;
+    }
+    
+    // ======== 处理腿部使能 ========
+    static bool last_leg_enable = false;
+    if (wifi_data->leg_enable != last_leg_enable && !wifi_data->estop) {
+        balance_test_set_leg_control(wifi_data->leg_enable);
+        ESP_LOGI(TAG, "WiFi: Leg control %s", wifi_data->leg_enable ? "ENABLED" : "DISABLED");
+    }
+    last_leg_enable = wifi_data->leg_enable;
+    
+    // ======== 处理腿部角度和长度 ========
+    if (g_leg_control_enabled && !wifi_data->estop) {
+        static float last_leg_angle = -90.0f;
+        static float last_leg_length = 0.09f;
+        if (fabsf(wifi_data->leg_angle - last_leg_angle) > 0.5f ||
+            fabsf(wifi_data->leg_length - last_leg_length) > 0.001f) {
+            g_leg_base_angle = wifi_data->leg_angle;
+            g_leg_base_length = wifi_data->leg_length;
+            leg_ctrl_set_target(true, g_leg_base_length, g_leg_base_angle);
+            leg_ctrl_set_target(false, g_leg_base_length, g_leg_base_angle);
+            last_leg_angle = wifi_data->leg_angle;
+            last_leg_length = wifi_data->leg_length;
+        }
+    }
+    
+    // ======== 详细调控模式 ========
+    static bool last_detail_mode = false;
+    static control_mode_t detail_prev_mode = CTRL_MODE_TRIPLE_PID;
+    static bool detail_prev_go = false;
+    if (wifi_data->detail_mode && !last_detail_mode) {
+        // 进入详细调控模式: 保存当前状态, 停止平衡控制, 切换轮电机到速度模式
+        detail_prev_mode = g_control_mode;
+        detail_prev_go = wifi_data->go;
+        balance_test_disable();
+        if (g_motor_left != NULL) {
+            can_motor_set_mode(g_motor_left, MODE_SPEED);
+            can_motor_set_mode(g_motor_right, MODE_SPEED);
+            can_motor_set_speed(g_motor_left, 0);
+            can_motor_set_speed(g_motor_right, 0);
+        }
+        ESP_LOGI(TAG, "WiFi: Detail control mode ENTERED (prev_mode=%d)", detail_prev_mode);
+    } else if (!wifi_data->detail_mode && last_detail_mode) {
+        // 退出详细调控模式: 停止轮电机, 恢复之前的控制模式和电机模式
+        if (g_motor_left != NULL) {
+            can_motor_set_speed(g_motor_left, 0);
+            can_motor_set_speed(g_motor_right, 0);
+        }
+        // 恢复控制模式
+        g_control_mode = detail_prev_mode;
+        // 恢复电机模式 (根据控制模式选择扭矩/速度)
+        if (g_motor_left != NULL) {
+            if (g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR ||
+                (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
+                can_motor_set_mode(g_motor_left, MODE_SPEED);
+                can_motor_set_mode(g_motor_right, MODE_SPEED);
+            } else {
+                can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                can_motor_set_mode(g_motor_right, MODE_TORQUE);
+            }
+        }
+        const char *restored_str = (detail_prev_mode == CTRL_MODE_LQR) ? "LQR" :
+                                   (detail_prev_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" :
+                                   (detail_prev_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" :
+                                   (detail_prev_mode == CTRL_MODE_SINGLE_PID) ? "SINGLE_PID" : "CAR";
+        ESP_LOGI(TAG, "WiFi: Detail control mode EXITED → restored %s", restored_str);
+        printf("CTRL_MODE:%s\n", restored_str);
+    }
+    last_detail_mode = wifi_data->detail_mode;
+    
+    // 详细调控模式下的实时控制
+    if (wifi_data->detail_mode && !wifi_data->estop) {
+        // --- 左腿控制 ---
+        static float last_dl_len = 0.09f, last_dl_ang = -90.0f;
+        static float last_dr_len = 0.09f, last_dr_ang = -90.0f;
+        
+        if (wifi_data->detail_sync) {
+            // 协同模式: 左侧滑条同时控制双腿
+            if (fabsf(wifi_data->detail_left_length - last_dl_len) > 0.001f ||
+                fabsf(wifi_data->detail_left_angle - last_dl_ang) > 0.5f) {
+                if (g_leg_control_enabled) {
+                    leg_ctrl_set_target(true, wifi_data->detail_left_length, wifi_data->detail_left_angle);
+                    leg_ctrl_set_target(false, wifi_data->detail_left_length, wifi_data->detail_left_angle);
+                }
+                last_dl_len = wifi_data->detail_left_length;
+                last_dl_ang = wifi_data->detail_left_angle;
+                last_dr_len = wifi_data->detail_left_length;
+                last_dr_ang = wifi_data->detail_left_angle;
+            }
+        } else {
+            // 独立模式: 左右分别控制
+            if (fabsf(wifi_data->detail_left_length - last_dl_len) > 0.001f ||
+                fabsf(wifi_data->detail_left_angle - last_dl_ang) > 0.5f) {
+                if (g_leg_control_enabled) {
+                    leg_ctrl_set_target(true, wifi_data->detail_left_length, wifi_data->detail_left_angle);
+                }
+                last_dl_len = wifi_data->detail_left_length;
+                last_dl_ang = wifi_data->detail_left_angle;
+            }
+            if (fabsf(wifi_data->detail_right_length - last_dr_len) > 0.001f ||
+                fabsf(wifi_data->detail_right_angle - last_dr_ang) > 0.5f) {
+                if (g_leg_control_enabled) {
+                    leg_ctrl_set_target(false, wifi_data->detail_right_length, wifi_data->detail_right_angle);
+                }
+                last_dr_len = wifi_data->detail_right_length;
+                last_dr_ang = wifi_data->detail_right_angle;
+            }
+        }
+        
+        // --- 轮速控制 ---
+        static float last_dl_spd = 0.0f, last_dr_spd = 0.0f;
+        if (wifi_data->detail_sync) {
+            // 协同模式: 左侧速度同时控制双轮
+            if (fabsf(wifi_data->detail_left_speed - last_dl_spd) > 0.5f) {
+                if (g_motor_left != NULL) {
+                    can_motor_set_speed(g_motor_left, wifi_data->detail_left_speed);
+                    can_motor_set_speed(g_motor_right, wifi_data->detail_left_speed);
+                }
+                last_dl_spd = wifi_data->detail_left_speed;
+                last_dr_spd = wifi_data->detail_left_speed;
+            }
+        } else {
+            // 独立模式: 左右分别控制
+            if (fabsf(wifi_data->detail_left_speed - last_dl_spd) > 0.5f) {
+                if (g_motor_left != NULL) {
+                    can_motor_set_speed(g_motor_left, wifi_data->detail_left_speed);
+                }
+                last_dl_spd = wifi_data->detail_left_speed;
+            }
+            if (fabsf(wifi_data->detail_right_speed - last_dr_spd) > 0.5f) {
+                if (g_motor_right != NULL) {
+                    can_motor_set_speed(g_motor_right, wifi_data->detail_right_speed);
+                }
+                last_dr_spd = wifi_data->detail_right_speed;
+            }
+        }
+    }
 }
-
-/**
- * @brief 计算平衡控制输出
- * @param dt 时间步长 (秒)
- * @note 参考 shibo_wheel_leg 的 lqr_balance_loop
- */
 static void compute_balance_output(float dt) {
     // 读取共享数据
     shared_imu_data_t imu;
@@ -2853,7 +3074,7 @@ static void compute_balance_output(float dt) {
             // YAW 控制 (go=true 或 CLI 强制使能)
             if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
                 lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
-                g_yaw_output = output.yaw_control;
+                g_yaw_output = output.yaw_control * g_tpid_yaw_scale;  // 缩放到三环PID量级
                 output.left_wheel_torque = ctrl_output + g_yaw_output;
                 output.right_wheel_torque = ctrl_output - g_yaw_output;
             } else {
@@ -3085,8 +3306,16 @@ static void compute_balance_output(float dt) {
         
         float zp_raw = 0.0f, zp_filtered = 0.0f;
         float zp_delta = lqr_zeropoint_auto_adjust(&g_lqr_ctrl, angle_err_for_auto,
-                                                     g_lqr_speed, dt,
+                                                     g_lqr_speed, g_zp_speed_threshold,
+                                                     dt,
                                                      &zp_raw, &zp_filtered);
+        
+        // 保存零点自适应调试变量
+        g_zp_pitch_for_ctrl = pitch_for_control;
+        g_zp_angle_error = angle_err_for_auto;
+        g_zp_pid_raw = zp_raw;
+        g_zp_pid_filtered = zp_filtered;
+        g_zp_active = (fabsf(g_lqr_speed) < g_zp_speed_threshold);  // 与函数内部判断条件一致
         
         if (fabsf(zp_delta) > 0.0f) {
             // 累加到全局角度零点, 并同步到所有控制器
@@ -3419,13 +3648,37 @@ void balance_test_process_cmd(const char *cmd_str) {
     }
     else if (strcmp(token, "zero") == 0) {
         token = strtok(NULL, " \t\n\r");
-        if (token) {
+        if (token == NULL) {
+            // 无参数: 显示完整零点自适应状态
+            printf("=== 角度零点自适应状态 ===\n");
+            printf("  当前零点: %.3f°\n", g_angle_zeropoint);
+            printf("  当前pitch: %.3f°\n", g_zp_pitch_for_ctrl);
+            printf("  角度误差: %.3f° (pitch - zeropoint)\n", g_zp_angle_error);
+            printf("  PID输出: raw=%.6f, filtered=%.6f\n", g_zp_pid_raw, g_zp_pid_filtered);
+            printf("  轮速阈值: %.3f m/s (当前轮速: %.3f)\n", g_zp_speed_threshold, g_lqr_speed);
+            printf("  PID激活: %s\n", g_zp_active ? "YES (轮速<阈值)" : "NO (运动中)");
+            printf("  PID参数: kp=%.6f, ki=%.6f, kd=%.6f\n", 
+                   g_lqr_ctrl.pid_zeropoint.kp, g_lqr_ctrl.pid_zeropoint.ki, g_lqr_ctrl.pid_zeropoint.kd);
+            printf("Usage: balance zero <degrees>       - 手动设置零点\n");
+            printf("       balance zero threshold <val> - 设置轮速阈值 (m/s)\n");
+        } else if (strcmp(token, "threshold") == 0 || strcmp(token, "thr") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                float thr = atof(token);
+                if (thr > 0.0f && thr < 10.0f) {
+                    g_zp_speed_threshold = thr;
+                    printf("Zeropoint speed threshold set to %.3f m/s\n", g_zp_speed_threshold);
+                } else {
+                    printf("Invalid threshold, range: 0.001 ~ 10.0 m/s\n");
+                }
+            } else {
+                printf("Current speed threshold: %.3f m/s\n", g_zp_speed_threshold);
+                printf("Usage: balance zero threshold <value>\n");
+            }
+        } else {
             float zero = atof(token);
             balance_test_set_angle_zeropoint(zero);
             printf("Angle zeropoint set to %.2f\n", zero);
-        } else {
-            printf("Current angle zeropoint: %.2f\n", balance_test_get_angle_zeropoint());
-            printf("Usage: balance zero <degrees>\n");
         }
     }
     else if (strcmp(token, "plot") == 0) {
@@ -4423,17 +4676,27 @@ void balance_test_process_cmd(const char *cmd_str) {
         if (token == NULL) {
             printf("YAW force enable: %s\n", g_yaw_force_enable ? "ON" : "OFF");
             printf("YAW loop enabled: %s\n", g_yaw_control_enabled ? "YES" : "NO");
+            printf("TPID yaw scale:  %.1f\n", g_tpid_yaw_scale);
             printf("  When FORCE ON, YAW works without remote.go\n");
-            printf("Usage: balance yaw [on|off]\n");
+            printf("Usage: balance yaw [on|off|scale <value>]\n");
         } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0 || strcmp(token, "enable") == 0) {
             g_yaw_force_enable = true;
             printf("YAW force enable ON - YAW active without remote\n");
         } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0 || strcmp(token, "disable") == 0) {
             g_yaw_force_enable = false;
             printf("YAW force enable OFF - YAW requires remote.go\n");
+        } else if (strcmp(token, "scale") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_tpid_yaw_scale = atof(token);
+                printf("TPID yaw scale = %.1f\n", g_tpid_yaw_scale);
+            } else {
+                printf("Current TPID yaw scale = %.1f\n", g_tpid_yaw_scale);
+                printf("Usage: balance yaw scale <value>  (default 500)\n");
+            }
         } else {
             printf("Unknown yaw command: %s\n", token);
-            printf("Usage: balance yaw [on|off]\n");
+            printf("Usage: balance yaw [on|off|scale <value>]\n");
         }
     }
     // ===== 离地检测命令 =====
