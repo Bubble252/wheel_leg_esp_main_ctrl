@@ -29,10 +29,10 @@ static const lqr_params_t default_params = {
     .gyro_limit = 16.0f,
     
     // 位移环 PID
-    .distance_kp = 4.0f,
-    .distance_ki = 0.0f,
-    .distance_kd = 0.0f,
-    .distance_limit = 0.05f,
+    .distance_kp = 2.0f,
+    .distance_ki = 0.001f,
+    .distance_kd = 0.1f,
+    .distance_limit = 10.0f,
     
     // 速度环 PID
     .speed_kp = 0.5f,
@@ -1217,6 +1217,13 @@ static const triple_pid_params_t triple_pid_default_params = {
     .gyro_kd = 0.0f,
     .gyro_limit = 10.0f,
     
+    // 位移环 (最外环, 默认开启)
+    .distance_kp = 2.0f,
+    .distance_ki = 0.001f,
+    .distance_kd = 0.1f,
+    .distance_limit = 10.0f,   // 最大速度修正
+    .distance_enable = 1,      // 默认开启
+    
     // 默认使用电机速度模式 (不经过软件轮速PID)
     .wheel_mode = TRIPLE_PID_WHEEL_SPEED,
 };
@@ -1290,6 +1297,21 @@ esp_err_t triple_pid_init(triple_pid_controller_t *ctrl, const triple_pid_params
     };
     pid_init(&ctrl->pid_gyro, &gyro_pid_params);
     
+    // 初始化位移环 PID (最外环)
+    pid_params_t distance_pid_params = {
+        .kp = p->distance_kp,
+        .ki = p->distance_ki,
+        .kd = p->distance_kd,
+        .output_min = -p->distance_limit,
+        .output_max = p->distance_limit,
+        .integral_max = p->distance_limit * 2.0f,
+        .d_filter_coef = 0.8f,
+    };
+    pid_init(&ctrl->pid_distance, &distance_pid_params);
+    
+    // 初始化位移零点
+    ctrl->distance_zeropoint = 0.0f;
+    
     // 初始化遥杆目标速度低通滤波器
     lpf_init(&ctrl->lpf_joyy, p->lpf_joyy_tf);
     
@@ -1305,6 +1327,8 @@ esp_err_t triple_pid_init(triple_pid_controller_t *ctrl, const triple_pid_params
              p->gyro_kp, p->gyro_ki, p->gyro_kd);
     ESP_LOGI(TAG, "  Wheel PID (inner): kp=%.4f, ki=%.4f, kd=%.4f",
              p->wheel_kp, p->wheel_ki, p->wheel_kd);
+    ESP_LOGI(TAG, "  Distance PID (outermost): kp=%.4f, ki=%.4f, kd=%.4f (limit=%.1f)",
+             p->distance_kp, p->distance_ki, p->distance_kd, p->distance_limit);
     
     return ESP_OK;
 }
@@ -1316,6 +1340,7 @@ void triple_pid_reset(triple_pid_controller_t *ctrl) {
     pid_reset(&ctrl->pid_speed);
     pid_reset(&ctrl->pid_wheel);
     pid_reset(&ctrl->pid_gyro);
+    pid_reset(&ctrl->pid_distance);
     lpf_reset(&ctrl->lpf_joyy);
     
     ESP_LOGI(TAG, "Triple PID controller reset");
@@ -1353,6 +1378,19 @@ void triple_pid_set_gyro_gains(triple_pid_controller_t *ctrl, float kp, float ki
     pid_set_gains(&ctrl->pid_gyro, kp, ki, kd);
 }
 
+void triple_pid_set_distance_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd) {
+    if (ctrl == NULL) return;
+    ctrl->params.distance_kp = kp;
+    ctrl->params.distance_ki = ki;
+    ctrl->params.distance_kd = kd;
+    pid_set_gains(&ctrl->pid_distance, kp, ki, kd);
+}
+
+void triple_pid_set_distance_zeropoint(triple_pid_controller_t *ctrl, float zeropoint) {
+    if (ctrl == NULL) return;
+    ctrl->distance_zeropoint = zeropoint;
+}
+
 void triple_pid_set_angle_zeropoint(triple_pid_controller_t *ctrl, float zeropoint) {
     if (ctrl == NULL) return;
     ctrl->params.angle_zeropoint = zeropoint;
@@ -1375,6 +1413,7 @@ bool triple_pid_check_emergency(triple_pid_controller_t *ctrl, float pitch) {
 esp_err_t triple_pid_balance_loop(triple_pid_controller_t *ctrl,
                                    float pitch, float pitch_rate,
                                    float wheel_speed, float target_speed,
+                                   float lqr_distance,
                                    float dt,
                                    triple_pid_output_t *output) {
     if (ctrl == NULL || output == NULL) {
@@ -1402,11 +1441,40 @@ esp_err_t triple_pid_balance_loop(triple_pid_controller_t *ctrl,
     float filtered_target_speed = lpf_compute_dt(&ctrl->lpf_joyy, target_speed, dt);
     
     // =============================================================
+    // 第零环: 位移环 (最外环)
+    //   distance_zeropoint - lqr_distance → speed_correction
+    //   叠加到 target_speed, 使机器人保持目标位置
+    //   kp=0 时自动关闭, 不影响原有三环行为
+    // =============================================================
+    float distance_control = 0.0f;
+    float distance_error = 0.0f;
+    bool distance_active = (ctrl->params.distance_enable != 0);
+    if (distance_active) {
+        // 四环PID的位移环: 误差符号与LQR相反
+        // LQR: distance_control 直接叠加到力矩 (负反馈)
+        // 四环PID: distance_control 叠加到 target_speed, 速度环内部再取反
+        //   向前漂移 → distance_error > 0 → distance_control > 0 → target_speed 增大
+        //   → 速度环 speed_measurement = wheel_speed - target 变小 → pitch_target 负
+        //   → 机器人后仰 → 减速回来
+        distance_error = lqr_distance - ctrl->distance_zeropoint;
+        distance_control = pid_compute(&ctrl->pid_distance, 0.0f, distance_error, dt);
+    }
+    
+    output->distance_error = distance_error;
+    output->distance_control = distance_control;
+    output->distance_p_out = distance_active ? ctrl->params.distance_kp * distance_error : 0.0f;
+    output->distance_i_out = ctrl->pid_distance.integral;
+    output->distance_d_out = ctrl->pid_distance.prev_d_term;
+    
+    // 位移环输出叠加到目标速度 (speed_correction 修正原有 target_speed)
+    float effective_target_speed = filtered_target_speed + distance_control;
+    
+    // =============================================================
     // 第一环: 速度环 (外环)
-    //   target_speed - wheel_speed → pitch_target
+    //   effective_target_speed - wheel_speed → pitch_target
     //   (与双环PID SPEED_FIRST 的速度环完全相同)
     // =============================================================
-    float amplified_target = filtered_target_speed * ctrl->params.speed_cmd_gain;
+    float amplified_target = effective_target_speed * ctrl->params.speed_cmd_gain;
     float speed_measurement = wheel_speed - amplified_target;
     float pitch_target = pid_compute(&ctrl->pid_speed, 0.0f, speed_measurement, dt);
     

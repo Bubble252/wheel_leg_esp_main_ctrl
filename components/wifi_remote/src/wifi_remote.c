@@ -63,6 +63,7 @@ static remote_data_t g_remote_data = {
     .detail_right_speed = 0.0f,
     .joy_speed_gain = 0.003f,
     .joy_yaw_gain = 0.03f,
+    .dist_enable = true,       // 默认开启位移环
     .last_update_ms = 0,
     .msg_count = 0,
     .connected = false,
@@ -255,6 +256,12 @@ static void parse_json_command(const char *json_str) {
     cJSON *joy_yaw_gain = cJSON_GetObjectItem(json, "joy_yaw_gain");
     if (joy_yaw_gain && cJSON_IsNumber(joy_yaw_gain)) {
         g_remote_data.joy_yaw_gain = (float)joy_yaw_gain->valuedouble;
+    }
+    
+    // 解析位移环开关
+    cJSON *dist_enable = cJSON_GetObjectItem(json, "dist_enable");
+    if (dist_enable && cJSON_IsNumber(dist_enable)) {
+        g_remote_data.dist_enable = (dist_enable->valueint == 1);
     }
     
     // 更新时间戳和计数

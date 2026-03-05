@@ -552,6 +552,7 @@ typedef struct {
     float _last_L;              // 上一次腿长 (m), 数值微分用
     float _last_alpha_rad;      // 上一次身体角度 (rad), 数值微分用
     bool  _diff_initialized;    // 数值微分初始化标志
+    int64_t _last_timestamp_us; // 上一次时间戳 (微秒), 数值微分用
     
     // 调试信息
     vmc_output_t debug;     // 详细调试输出

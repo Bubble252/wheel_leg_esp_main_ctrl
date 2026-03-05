@@ -9,6 +9,7 @@
 #include <math.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "LEG_KIN";
 
@@ -824,9 +825,18 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
     if (params->vmc_diff_method == VMC_DIFF_NUMERIC) {
         // === 数值微分方法: 不需要电机速度反馈 ===
         if (output->_diff_initialized) {
-            // 假设 200Hz 调用频率
-            current_dL = (current_L - output->_last_L) * 200.0f;
-            current_dalpha = (current_alpha_rad - output->_last_alpha_rad) * 200.0f;
+            // 使用实际时间间隔计算微分
+            int64_t now_us = esp_timer_get_time();
+            float dt_diff = (now_us - output->_last_timestamp_us) * 1e-6f;
+            if (dt_diff > 0.0001f && dt_diff < 0.1f) {
+                float inv_dt = 1.0f / dt_diff;
+                current_dL = (current_L - output->_last_L) * inv_dt;
+                current_dalpha = (current_alpha_rad - output->_last_alpha_rad) * inv_dt;
+            } else {
+                // 时间间隔异常，不做微分
+                current_dL = 0.0f;
+                current_dalpha = 0.0f;
+            }
         } else {
             // 首次调用，无历史数据
             current_dL = 0.0f;
@@ -903,6 +913,7 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
     // 保存当前值供下一次数值微分使用
     output->_last_L = current_L;
     output->_last_alpha_rad = current_alpha_rad;
+    output->_last_timestamp_us = esp_timer_get_time();
     output->_diff_initialized = true;
     
     // === 8. 右腿扭矩方向修正 ===
@@ -982,15 +993,20 @@ esp_err_t vmc_dual_compute(const vmc_params_t *params,
             float right_rate_rad = output->right.current_body_angle_rate * (M_PI / 180.0f);
             angle_diff_rate_rad = left_rate_rad - right_rate_rad;
         } else {
-            // === 数值微分方法 (默认): 使用静态变量保存上一次角度差 ===
+            // === 数值微分方法: 使用静态变量保存上一次角度差 ===
             static float last_angle_diff_rad = 0.0f;
-            static bool first_call = true;
+            static int64_t last_sync_timestamp_us = 0;
             
-            if (!first_call) {
-                // 假设 200Hz 调用频率
-                angle_diff_rate_rad = (angle_diff_rad - last_angle_diff_rad) * 200.0f;
+            if (last_sync_timestamp_us != 0) {
+                int64_t now_us = esp_timer_get_time();
+                float dt_sync = (now_us - last_sync_timestamp_us) * 1e-6f;
+                if (dt_sync > 0.0001f && dt_sync < 0.1f) {
+                    angle_diff_rate_rad = (angle_diff_rad - last_angle_diff_rad) / dt_sync;
+                }
+                last_sync_timestamp_us = now_us;
+            } else {
+                last_sync_timestamp_us = esp_timer_get_time();
             }
-            first_call = false;
             last_angle_diff_rad = angle_diff_rad;
         }
         

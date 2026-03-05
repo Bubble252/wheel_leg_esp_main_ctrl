@@ -47,6 +47,19 @@ typedef struct {
 } weighted_ma_filter_t;
 
 /**
+ * @brief 中值滤波器结构体 (Median Filter)
+ * @note 可变窗口大小 (3~9)，取窗口内中间值，对脉冲噪声有极好的抑制效果
+ *       群延迟 = (window_size - 1) / 2 个采样
+ */
+#define MEDIAN_FILTER_MAX_WINDOW 9
+typedef struct {
+    float buf[MEDIAN_FILTER_MAX_WINDOW];   // 环形缓冲区
+    int   head;                             // 下一个写入位置
+    int   count;                            // 已填充的采样数
+    int   window_size;                      // 当前窗口大小 (3~9, 必须奇数)
+} median_filter_t;
+
+/**
  * @brief 初始化低通滤波器
  * @param lpf 滤波器实例
  * @param tf 滤波时间常数 (秒)，越大滤波越强
@@ -139,6 +152,39 @@ void wma_reset(weighted_ma_filter_t *wma);
  *       output = Σ(w[i]*x[i]) / Σ(w[i])，Σw = 78
  */
 float wma_compute(weighted_ma_filter_t *wma, float x);
+
+// ============================================================================
+// 中值滤波器 (Median Filter)
+// ============================================================================
+
+/**
+ * @brief 初始化中值滤波器
+ * @param mf 滤波器实例
+ * @param window_size 窗口大小 (3, 5, 7, 9)，必须奇数，超范围自动钳位
+ */
+void median_init(median_filter_t *mf, int window_size);
+
+/**
+ * @brief 重置中值滤波器
+ * @param mf 滤波器实例
+ */
+void median_reset(median_filter_t *mf);
+
+/**
+ * @brief 设置中值滤波器窗口大小
+ * @param mf 滤波器实例
+ * @param window_size 新窗口大小 (3, 5, 7, 9)，自动重置缓冲区
+ */
+void median_set_window(median_filter_t *mf, int window_size);
+
+/**
+ * @brief 中值滤波计算
+ * @param mf 滤波器实例
+ * @param x 输入值
+ * @return 滤波后的输出值 (窗口内中间值)
+ * @note 窗口未填满时直通
+ */
+float median_compute(median_filter_t *mf, float x);
 
 #ifdef __cplusplus
 }

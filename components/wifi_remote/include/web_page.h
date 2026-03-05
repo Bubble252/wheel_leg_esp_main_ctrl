@@ -318,6 +318,11 @@ static const char web_page_html[] = R"rawliteral(
                 <label id="joyYawLabel">🔄 Yaw Gain: 30 ‰</label>
                 <input type="range" id="joyYawSlider" min="5" max="200" value="30" step="1" oninput="updateJoyYaw()">
             </div>
+            
+            <div class="ctrl-row">
+                <label>📍 Distance Loop (位移环)</label>
+                <input type="checkbox" id="distEnableSwitch" class="switch" checked onclick="toggleDistEnable()">
+            </div>
         </div>
         
         <!-- 腿部控制面板 -->
@@ -449,6 +454,7 @@ static const char web_page_html[] = R"rawliteral(
     var g_legLength = 90;
     var g_joySpeedGain = 3.0;
     var g_joyYawGain = 30;
+    var g_distEnable = 1;
     var g_detailMode = 0;
     var g_detailSync = 1;
     var g_dlLength = 90;
@@ -524,7 +530,8 @@ static const char web_page_html[] = R"rawliteral(
                 detail_right_angle: g_drAngle,
                 detail_right_speed: g_drSpeed,
                 joy_speed_gain: g_joySpeedGain / 1000.0,
-                joy_yaw_gain: g_joyYawGain / 1000.0
+                joy_yaw_gain: g_joyYawGain / 1000.0,
+                dist_enable: g_distEnable
             };
             socket.send(JSON.stringify(data));
             msgCount++;
@@ -631,6 +638,12 @@ static const char web_page_html[] = R"rawliteral(
         document.getElementById('joyYawLabel').innerText = '🔄 Yaw Gain: ' + g_joyYawGain + ' ‰';
         sendData();
         log('Joy yaw gain: ' + g_joyYawGain + '‰ (scale=' + (g_joyYawGain/1000).toFixed(4) + ')');
+    }
+    
+    function toggleDistEnable() {
+        g_distEnable = document.getElementById('distEnableSwitch').checked ? 1 : 0;
+        sendData();
+        log('Distance loop: ' + (g_distEnable ? 'ON' : 'OFF'));
     }
     
     // ======== 详细调控模式 ========

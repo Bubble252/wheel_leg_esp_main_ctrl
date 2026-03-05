@@ -65,6 +65,9 @@ typedef struct {
     float joy_speed_gain;       // 遥杆速度增益 (0.001 ~ 0.02)
     float joy_yaw_gain;         // 遥杆转向增益 (0.005 ~ 0.2)
     
+    // 位移环开关
+    bool dist_enable;           // 位移环使能 (true=开启位移环)
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量

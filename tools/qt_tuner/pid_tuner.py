@@ -4141,8 +4141,8 @@ class DualPIDPanel(QWidget):
         self.spid_btn.clicked.connect(lambda: self.set_mode("spid"))
         mode_layout.addWidget(self.spid_btn)
         
-        self.tpid_btn = QPushButton("🟣 三环PID")
-        self.tpid_btn.setToolTip("三环 PID 控制 (速度→角度→轮速)")
+        self.tpid_btn = QPushButton("🟣 四环PID")
+        self.tpid_btn.setToolTip("四环 PID 控制 (位移→速度→角度→轮速)")
         self.tpid_btn.setStyleSheet(SS("background-color: #9C27B0; color: white;"))
         self.tpid_btn.clicked.connect(lambda: self.set_mode("tpid"))
         mode_layout.addWidget(self.tpid_btn)
@@ -4468,13 +4468,13 @@ class DualPIDPanel(QWidget):
         
         status_main_layout.addWidget(spid_frame)
         
-        # === 三环 PID 状态 ===
+        # === 四环 PID 状态 ===
         tpid_frame = QFrame()
         tpid_frame.setStyleSheet(SS("QFrame { background-color: #1a1a2a; border-radius: 5px; padding: 5px; }"))
         tpid_status_layout = QGridLayout(tpid_frame)
         tpid_status_layout.setSpacing(8)
         
-        tpid_title = QLabel("🟣 三环 PID")
+        tpid_title = QLabel("🟣 四环 PID")
         tpid_title.setStyleSheet(SS("font-size: 12px; font-weight: bold; color: #9C27B0;"))
         tpid_status_layout.addWidget(tpid_title, 0, 0, 1, 2)
         
@@ -4490,38 +4490,51 @@ class DualPIDPanel(QWidget):
         self.tpid_wspd_label.setStyleSheet(SS("font-weight: bold; color: #88ccff;"))
         tpid_status_layout.addWidget(self.tpid_wspd_label, 0, 6, 1, 2)
         
-        # 第二行: 速度环(外)
-        tpid_status_layout.addWidget(QLabel("速度环(外):"), 1, 0)
+        # 第1.5行: 位移环(最外, 可选)
+        self.tpid_dist_row_label = QLabel("位移环(最外):")
+        self.tpid_dist_row_label.setStyleSheet(SS("color: #666;"))
+        tpid_status_layout.addWidget(self.tpid_dist_row_label, 1, 0)
         tpid_status_layout.addWidget(QLabel("err="), 1, 1)
+        self.tpid_dist_err = QLabel("--")
+        self.tpid_dist_err.setStyleSheet(SS("color: #ff8800;"))
+        tpid_status_layout.addWidget(self.tpid_dist_err, 1, 2)
+        tpid_status_layout.addWidget(QLabel("→ spd_corr="), 1, 3)
+        self.tpid_dist_corr = QLabel("--")
+        self.tpid_dist_corr.setStyleSheet(SS("color: #00aaff;"))
+        tpid_status_layout.addWidget(self.tpid_dist_corr, 1, 4)
+        
+        # 第二行: 速度环(外)
+        tpid_status_layout.addWidget(QLabel("速度环(外):"), 2, 0)
+        tpid_status_layout.addWidget(QLabel("err="), 2, 1)
         self.tpid_spd_err = QLabel("--")
         self.tpid_spd_err.setStyleSheet(SS("color: #ff8800;"))
-        tpid_status_layout.addWidget(self.tpid_spd_err, 1, 2)
-        tpid_status_layout.addWidget(QLabel("→ pitch_tgt="), 1, 3)
+        tpid_status_layout.addWidget(self.tpid_spd_err, 2, 2)
+        tpid_status_layout.addWidget(QLabel("→ pitch_tgt="), 2, 3)
         self.tpid_pitch_tgt = QLabel("--°")
         self.tpid_pitch_tgt.setStyleSheet(SS("color: #00aaff;"))
-        tpid_status_layout.addWidget(self.tpid_pitch_tgt, 1, 4)
+        tpid_status_layout.addWidget(self.tpid_pitch_tgt, 2, 4)
         
         # 第三行: 角度环(中)
-        tpid_status_layout.addWidget(QLabel("角度环(中):"), 2, 0)
-        tpid_status_layout.addWidget(QLabel("err="), 2, 1)
+        tpid_status_layout.addWidget(QLabel("角度环(中):"), 3, 0)
+        tpid_status_layout.addWidget(QLabel("err="), 3, 1)
         self.tpid_ang_err = QLabel("--")
         self.tpid_ang_err.setStyleSheet(SS("color: #ff8800;"))
-        tpid_status_layout.addWidget(self.tpid_ang_err, 2, 2)
-        tpid_status_layout.addWidget(QLabel("→ whl_tgt="), 2, 3)
+        tpid_status_layout.addWidget(self.tpid_ang_err, 3, 2)
+        tpid_status_layout.addWidget(QLabel("→ whl_tgt="), 3, 3)
         self.tpid_whl_tgt = QLabel("--")
         self.tpid_whl_tgt.setStyleSheet(SS("color: #00aaff;"))
-        tpid_status_layout.addWidget(self.tpid_whl_tgt, 2, 4)
+        tpid_status_layout.addWidget(self.tpid_whl_tgt, 3, 4)
         
         # 第四行: 轮速环(内)
-        tpid_status_layout.addWidget(QLabel("轮速环(内):"), 3, 0)
-        tpid_status_layout.addWidget(QLabel("err="), 3, 1)
+        tpid_status_layout.addWidget(QLabel("轮速环(内):"), 4, 0)
+        tpid_status_layout.addWidget(QLabel("err="), 4, 1)
         self.tpid_whl_err = QLabel("--")
         self.tpid_whl_err.setStyleSheet(SS("color: #ff8800;"))
-        tpid_status_layout.addWidget(self.tpid_whl_err, 3, 2)
-        tpid_status_layout.addWidget(QLabel("→ out="), 3, 3)
+        tpid_status_layout.addWidget(self.tpid_whl_err, 4, 2)
+        tpid_status_layout.addWidget(QLabel("→ out="), 4, 3)
         self.tpid_out = QLabel("--")
         self.tpid_out.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #00ff88;"))
-        tpid_status_layout.addWidget(self.tpid_out, 3, 4)
+        tpid_status_layout.addWidget(self.tpid_out, 4, 4)
         
         status_main_layout.addWidget(tpid_frame)
         
@@ -4634,12 +4647,12 @@ class DualPIDPanel(QWidget):
         spid_group.setLayout(spid_layout)
         layout.addWidget(spid_group)
         
-        # ========== 三环 PID 参数区域 (速度→角度→轮速) ==========
-        tpid_group = QGroupBox("🟣 三环 PID 参数 (速度→角度→轮速)")
+        # ========== 四环 PID 参数区域 (位移→速度→角度→轮速) ==========
+        tpid_group = QGroupBox("🟣 四环 PID 参数 (位移→速度→角度→轮速)")
         tpid_group.setStyleSheet(SS("QGroupBox { color: #9C27B0; }"))
         tpid_main_layout = QVBoxLayout()
         
-        tpid_desc = QLabel("三环串级: 速度环(外)→角度环(中)→轮速环(内)，轮速环可选速度/扭矩输出")
+        tpid_desc = QLabel("四环串级: 位移环(最外,可选)→速度环(外)→角度环(中)→轮速环(内)，轮速环可选速度/扭矩输出")
         tpid_desc.setStyleSheet(SS("color: #888; font-size: 10px;"))
         tpid_main_layout.addWidget(tpid_desc)
         
@@ -4791,6 +4804,61 @@ class DualPIDPanel(QWidget):
         tpid_gyro_layout.addWidget(self.tpid_gyro_send, 0, 9)
         tpid_main_layout.addLayout(tpid_gyro_layout)
         
+        # 位移环 PID (最外环) + 使能开关
+        tpid_dist_layout = QGridLayout()
+        tpid_dist_layout.addWidget(QLabel("位移环(最外):"), 0, 0)
+        tpid_dist_layout.addWidget(QLabel("Kp:"), 0, 1)
+        self.tpid_dist_kp = QDoubleSpinBox()
+        self.tpid_dist_kp.setRange(0, 100)
+        self.tpid_dist_kp.setSingleStep(0.1)
+        self.tpid_dist_kp.setDecimals(4)
+        self.tpid_dist_kp.setValue(2.0)
+        tpid_dist_layout.addWidget(self.tpid_dist_kp, 0, 2)
+        tpid_dist_layout.addWidget(QLabel("Ki:"), 0, 3)
+        self.tpid_dist_ki = QDoubleSpinBox()
+        self.tpid_dist_ki.setRange(0, 10)
+        self.tpid_dist_ki.setSingleStep(0.001)
+        self.tpid_dist_ki.setDecimals(4)
+        self.tpid_dist_ki.setValue(0.001)
+        tpid_dist_layout.addWidget(self.tpid_dist_ki, 0, 4)
+        tpid_dist_layout.addWidget(QLabel("Kd:"), 0, 5)
+        self.tpid_dist_kd = QDoubleSpinBox()
+        self.tpid_dist_kd.setRange(0, 10)
+        self.tpid_dist_kd.setSingleStep(0.001)
+        self.tpid_dist_kd.setDecimals(4)
+        self.tpid_dist_kd.setValue(0.1)
+        tpid_dist_layout.addWidget(self.tpid_dist_kd, 0, 6)
+        tpid_dist_layout.addWidget(QLabel("Limit:"), 0, 7)
+        self.tpid_dist_limit = QDoubleSpinBox()
+        self.tpid_dist_limit.setRange(0.001, 100)
+        self.tpid_dist_limit.setSingleStep(0.1)
+        self.tpid_dist_limit.setDecimals(3)
+        self.tpid_dist_limit.setValue(10.0)
+        self.tpid_dist_limit.setToolTip("位移环输出限幅 (最大速度修正)")
+        tpid_dist_layout.addWidget(self.tpid_dist_limit, 0, 8)
+        self.tpid_dist_send = QPushButton("发送")
+        self.tpid_dist_send.clicked.connect(self.send_tpid_distance)
+        tpid_dist_layout.addWidget(self.tpid_dist_send, 0, 9)
+        tpid_main_layout.addLayout(tpid_dist_layout)
+        
+        # 位移环使能开关
+        dist_en_layout = QHBoxLayout()
+        dist_en_layout.addWidget(QLabel("位移环:"))
+        self.tpid_dist_enable_btn = QPushButton("位移环: ON")
+        self.tpid_dist_enable_btn.setCheckable(True)
+        self.tpid_dist_enable_btn.setChecked(True)
+        self.tpid_dist_enable_btn.setToolTip("开启后位移环生效，松开遥杆时机器人会回到停车位置\n"
+                                              "关闭时位移环不参与控制，等同三环PID")
+        self.tpid_dist_enable_btn.setStyleSheet("""
+            QPushButton { padding: 4px 12px; border-radius: 4px; 
+                          background: #555; color: #ccc; font-weight: bold; }
+            QPushButton:checked { background: #2196F3; color: white; }
+        """)
+        self.tpid_dist_enable_btn.clicked.connect(self.send_tpid_disten)
+        dist_en_layout.addWidget(self.tpid_dist_enable_btn)
+        dist_en_layout.addStretch()
+        tpid_main_layout.addLayout(dist_en_layout)
+        
         # 轮速环模式 + 增益 + 操作
         tpid_ctrl_layout = QHBoxLayout()
         tpid_ctrl_layout.addWidget(QLabel("轮速环模式:"))
@@ -4902,7 +4970,7 @@ class DualPIDPanel(QWidget):
             self.mode_label.setText("当前模式: 单环 PID (速度)")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF9800;"))
         elif mode == "tpid":
-            self.mode_label.setText("当前模式: 三环 PID")
+            self.mode_label.setText("当前模式: 四环 PID")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #9C27B0;"))
         else:
             self.mode_label.setText("当前模式: LQR")
@@ -5010,6 +5078,21 @@ class DualPIDPanel(QWidget):
         self.send_cmd(f"balance tpid gyro {kp} {ki} {kd}")
         self.send_cmd(f"balance tpid limit gyro {limit}")
     
+    def send_tpid_distance(self):
+        """发送四环 PID 位移环参数"""
+        kp = self.tpid_dist_kp.value()
+        ki = self.tpid_dist_ki.value()
+        kd = self.tpid_dist_kd.value()
+        limit = self.tpid_dist_limit.value()
+        self.send_cmd(f"balance tpid distance {kp} {ki} {kd}")
+        self.send_cmd(f"balance tpid limit distance {limit}")
+    
+    def send_tpid_disten(self):
+        """切换位移环使能"""
+        enabled = self.tpid_dist_enable_btn.isChecked()
+        self.send_cmd(f"balance tpid disten {1 if enabled else 0}")
+        self.tpid_dist_enable_btn.setText(f"位移环: {'ON' if enabled else 'OFF'}")
+    
     def send_tpid_wmode(self):
         """发送三环 PID 轮速环模式切换"""
         wmode = self.tpid_wmode_combo.currentData()
@@ -5110,18 +5193,29 @@ class DualPIDPanel(QWidget):
         self.debug_update_label.setText(f"调试数据: 单环 PID ✓")
         self.debug_update_label.setStyleSheet(SS("color: #FF9800; font-size: 10px;"))
     
-    def update_tpid_debug(self, pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode):
-        """更新三环 PID 调试数据 (解析 [TPID] 输出)"""
+    def update_tpid_debug(self, pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode,
+                          dist_err=None, dist_corr=None):
+        """更新四环 PID 调试数据 (解析 [TPID] 输出)"""
         self.tpid_pitch_label.setText(f"pitch: {pitch:.2f}°")
         self.tpid_wspd_label.setText(f"spd: {spd:.2f}")
         self.tpid_wmode_label.setText(f"模式: {'速度' if wmode == 'spd' else '扭矩'}")
+        # 位移环
+        if dist_err is not None and dist_corr is not None:
+            self.tpid_dist_err.setText(f"{dist_err:.3f}")
+            self.tpid_dist_corr.setText(f"{dist_corr:.3f}")
+            self.tpid_dist_row_label.setStyleSheet(SS("color: #00ff88; font-weight: bold;"))
+        else:
+            self.tpid_dist_err.setText("--")
+            self.tpid_dist_corr.setText("--")
+            self.tpid_dist_row_label.setStyleSheet(SS("color: #666;"))
         self.tpid_spd_err.setText(f"{spd_err:.2f}")
         self.tpid_pitch_tgt.setText(f"{pitch_tgt:.2f}°")
         self.tpid_ang_err.setText(f"{ang_err:.2f}")
         self.tpid_whl_tgt.setText(f"{whl_tgt:.2f}")
         self.tpid_whl_err.setText(f"{whl_err:.2f}")
         self.tpid_out.setText(f"{out:.3f}")
-        self.debug_update_label.setText(f"调试数据: 三环 PID [{wmode}] ✓")
+        dist_tag = " +位移" if dist_err is not None else ""
+        self.debug_update_label.setText(f"调试数据: 四环 PID [{wmode}]{dist_tag} ✓")
         self.debug_update_label.setStyleSheet(SS("color: #9C27B0; font-size: 10px;"))
     
     def update_mode(self, mode):
@@ -5133,7 +5227,7 @@ class DualPIDPanel(QWidget):
             self.mode_label.setText("当前模式: 单环 PID (速度)")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #FF9800;"))
         elif mode == "TRIPLE_PID":
-            self.mode_label.setText("当前模式: 三环 PID")
+            self.mode_label.setText("当前模式: 四环 PID")
             self.mode_label.setStyleSheet(SS("font-size: 14px; font-weight: bold; color: #9C27B0;"))
         elif mode == "CAR":
             self.mode_label.setText("当前模式: 小车模式")
@@ -5467,6 +5561,359 @@ class YawDebugPanel(QWidget):
 
 
 # ============================================================================
+# 关节电机监控面板
+# ============================================================================
+class JointMonitorPanel(QWidget):
+    """关节电机实时监控面板 - 显示两条腿的角度/速度/电流波形
+    
+    6个波形区域 (2行3列):
+    - 髋关节角度 (左蓝/右红)  | 膝关节角度 (左蓝/右红)  | 数值显示
+    - 髋关节速度 (左蓝/右红, 虚线=原始/实线=滤波后)  | 膝关节速度 | 数值显示
+    - 髋关节电流 (左蓝/右红)  | 膝关节电流 (左蓝/右红)  | 数值显示
+    """
+    
+    PLOT_BUFFER = 500  # 波形缓存长度
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.plots = {}      # 波形区域
+        self.curves = {}     # 曲线
+        self.data = {}       # 数据缓存
+        self.checkboxes = {} # 显示开关
+        self.value_labels = {} # 数值显示
+        self.init_ui()
+    
+    def send_cmd(self, cmd):
+        if self.parent_window and self.parent_window.is_connected():
+            self.parent_window.send_command(cmd)
+            self.parent_window.log(f"发送: {cmd}")
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # ========== 控制栏 ==========
+        ctrl_layout = QHBoxLayout()
+        
+        self.stream_on_btn = QPushButton("📈 开启关节数据流")
+        self.stream_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 15px; font-size: 13px;"))
+        self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance joint on"))
+        ctrl_layout.addWidget(self.stream_on_btn)
+        
+        self.stream_off_btn = QPushButton("⏹️ 关闭")
+        self.stream_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 8px 15px; font-size: 13px;"))
+        self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance joint off"))
+        ctrl_layout.addWidget(self.stream_off_btn)
+        
+        ctrl_layout.addWidget(QLabel("  "))
+        
+        # 显示开关
+        ctrl_layout.addWidget(QLabel("显示: "))
+        
+        plot_defs = [
+            ('hip_pos',  '髋关节角度'),
+            ('knee_pos', '膝关节角度'),
+            ('hip_spd',  '髋关节速度'),
+            ('knee_spd', '膝关节速度'),
+            ('hip_cur',  '髋关节电流'),
+            ('knee_cur', '膝关节电流'),
+        ]
+        for key, label in plot_defs:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.setStyleSheet(SS("font-size: 11px;"))
+            cb.toggled.connect(lambda checked, k=key: self._toggle_plot(k, checked))
+            self.checkboxes[key] = cb
+            ctrl_layout.addWidget(cb)
+        
+        # 全选/全不选
+        all_btn = QPushButton("全选")
+        all_btn.setFixedWidth(45)
+        all_btn.clicked.connect(lambda: self._set_all_plots(True))
+        ctrl_layout.addWidget(all_btn)
+        
+        none_btn = QPushButton("全不选")
+        none_btn.setFixedWidth(55)
+        none_btn.clicked.connect(lambda: self._set_all_plots(False))
+        ctrl_layout.addWidget(none_btn)
+        
+        clear_btn = QPushButton("🗑️ 清空")
+        clear_btn.setFixedWidth(55)
+        clear_btn.clicked.connect(self._clear_all)
+        ctrl_layout.addWidget(clear_btn)
+        
+        ctrl_layout.addStretch()
+        layout.addLayout(ctrl_layout)
+        
+        # ========== 关节速度滤波控制 (双模式: Median / SlewRate) ==========
+        filter_layout = QHBoxLayout()
+        
+        filter_layout.addWidget(QLabel("⚡ 关节速度滤波:"))
+        
+        self.filter_on_btn = QPushButton("✅ 开启")
+        self.filter_on_btn.setStyleSheet(SS("background-color: #FF9800; color: white; padding: 5px 10px; font-size: 12px;"))
+        self.filter_on_btn.clicked.connect(lambda: self.send_cmd("balance joint filter on"))
+        filter_layout.addWidget(self.filter_on_btn)
+        
+        self.filter_off_btn = QPushButton("❌ 关闭")
+        self.filter_off_btn.setStyleSheet(SS("background-color: #757575; color: white; padding: 5px 10px; font-size: 12px;"))
+        self.filter_off_btn.clicked.connect(lambda: self.send_cmd("balance joint filter off"))
+        filter_layout.addWidget(self.filter_off_btn)
+        
+        filter_layout.addWidget(QLabel("  │ "))
+        
+        # 模式切换按钮 (Median / SlewRate)
+        self.mode_median_btn = QPushButton("📊 中值滤波")
+        self.mode_median_btn.setCheckable(True)
+        self.mode_median_btn.setChecked(False)
+        self.mode_median_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 12px; padding: 5px 12px; border: 2px solid #555; border-radius: 4px; }"
+            "QPushButton:checked { background-color: #2196F3; color: white; border-color: #1976D2; }"
+        ))
+        self.mode_median_btn.clicked.connect(lambda: self._set_filter_mode(0))
+        filter_layout.addWidget(self.mode_median_btn)
+        
+        self.mode_slew_btn = QPushButton("📈 限幅滤波")
+        self.mode_slew_btn.setCheckable(True)
+        self.mode_slew_btn.setChecked(True)
+        self.mode_slew_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 12px; padding: 5px 12px; border: 2px solid #555; border-radius: 4px; }"
+            "QPushButton:checked { background-color: #FF9800; color: white; border-color: #F57C00; }"
+        ))
+        self.mode_slew_btn.clicked.connect(lambda: self._set_filter_mode(1))
+        filter_layout.addWidget(self.mode_slew_btn)
+        
+        filter_layout.addWidget(QLabel("  │ "))
+        
+        # 中值滤波窗口大小 (默认隐藏, 因为默认是限幅模式)
+        self.median_window_label = QLabel("窗口:")
+        self.median_window_label.setVisible(False)
+        filter_layout.addWidget(self.median_window_label)
+        self.median_window_input = QSpinBox()
+        self.median_window_input.setRange(3, 9)
+        self.median_window_input.setSingleStep(2)
+        self.median_window_input.setValue(3)
+        self.median_window_input.setStyleSheet(SS("font-size: 13px; padding: 4px; min-width: 50px;"))
+        self.median_window_input.setVisible(False)
+        filter_layout.addWidget(self.median_window_input)
+        
+        self.median_window_set_btn = QPushButton("📤 设置窗口")
+        self.median_window_set_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 5px 10px; font-size: 12px;"))
+        self.median_window_set_btn.clicked.connect(self._set_median_window)
+        self.median_window_set_btn.setVisible(False)
+        filter_layout.addWidget(self.median_window_set_btn)
+        
+        # 限幅滤波 Rate 参数 (默认可见)
+        self.rate_label = QLabel("Rate(°/s²):")
+        self.rate_label.setVisible(True)
+        filter_layout.addWidget(self.rate_label)
+        self.rate_input = QDoubleSpinBox()
+        self.rate_input.setRange(10, 100000)
+        self.rate_input.setDecimals(0)
+        self.rate_input.setSingleStep(100)
+        self.rate_input.setValue(3000)
+        self.rate_input.setStyleSheet(SS("font-size: 13px; padding: 4px; min-width: 80px;"))
+        self.rate_input.setVisible(True)
+        filter_layout.addWidget(self.rate_input)
+        
+        self.rate_set_btn = QPushButton("📤 设置Rate")
+        self.rate_set_btn.setStyleSheet(SS("background-color: #FF9800; color: white; padding: 5px 10px; font-size: 12px;"))
+        self.rate_set_btn.setVisible(True)
+        self.rate_set_btn.clicked.connect(self._set_rate)
+        filter_layout.addWidget(self.rate_set_btn)
+        
+        self.filter_query_btn = QPushButton("🔍 查询")
+        self.filter_query_btn.clicked.connect(lambda: self.send_cmd("balance joint"))
+        filter_layout.addWidget(self.filter_query_btn)
+        
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+        
+        # ========== 波形区域 (3行2列) ==========
+        plot_grid = QGridLayout()
+        
+        # 波形配置: (key, title, y_label, row, col)
+        plot_configs = [
+            ('hip_pos',  '髋关节角度 (°)',  '角度 (°)',  0, 0),
+            ('knee_pos', '膝关节角度 (°)',  '角度 (°)',  0, 1),
+            ('hip_spd',  '髋关节速度 (°/s)', '速度 (°/s)', 1, 0),
+            ('knee_spd', '膝关节速度 (°/s)', '速度 (°/s)', 1, 1),
+            ('hip_cur',  '髋关节电流 (A)',   '电流 (A)',   2, 0),
+            ('knee_cur', '膝关节电流 (A)',   '电流 (A)',   2, 1),
+        ]
+        
+        for key, title, y_label, row, col in plot_configs:
+            # 创建波形区域
+            pw = pg.PlotWidget()
+            pw.setBackground('#1a1a2e')
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setTitle(title, color='w', size='10pt')
+            pw.setLabel('left', y_label)
+            pw.setLabel('bottom', '采样点')
+            pw.setMinimumHeight(160)
+            pw.addLegend(offset=(60, 5))
+            
+            # 速度类型: 增加滤波后曲线 (实线=滤波后, 虚线=原始)
+            is_spd = key in ('hip_spd', 'knee_spd')
+            
+            if is_spd:
+                # 原始速度: 虚线
+                left_curve = pw.plot(pen=pg.mkPen(color='#4fc3f7', width=1, style=Qt.DashLine), name='左原始')
+                right_curve = pw.plot(pen=pg.mkPen(color='#ef5350', width=1, style=Qt.DashLine), name='右原始')
+                # 滤波后速度: 实线
+                left_filtered_curve = pw.plot(pen=pg.mkPen(color='#4fc3f7', width=2), name='左滤波')
+                right_filtered_curve = pw.plot(pen=pg.mkPen(color='#ef5350', width=2), name='右滤波')
+            else:
+                # 非速度: 只有两条实线
+                left_curve = pw.plot(pen=pg.mkPen(color='#4fc3f7', width=2), name='左腿')
+                right_curve = pw.plot(pen=pg.mkPen(color='#ef5350', width=2), name='右腿')
+            
+            self.plots[key] = pw
+            self.curves[key] = {'left': left_curve, 'right': right_curve}
+            self.data[key] = {'left': [], 'right': []}
+            
+            if is_spd:
+                self.curves[key]['left_filtered'] = left_filtered_curve
+                self.curves[key]['right_filtered'] = right_filtered_curve
+                self.data[key]['left_filtered'] = []
+                self.data[key]['right_filtered'] = []
+            
+            # 包装: 波形 + 数值显示
+            container = QVBoxLayout()
+            container.addWidget(pw)
+            
+            # 数值行
+            val_layout = QHBoxLayout()
+            left_lbl = QLabel("左: --")
+            left_lbl.setStyleSheet(SS("color: #4fc3f7; font-size: 12px; font-weight: bold;"))
+            right_lbl = QLabel("右: --")
+            right_lbl.setStyleSheet(SS("color: #ef5350; font-size: 12px; font-weight: bold;"))
+            val_layout.addWidget(left_lbl)
+            val_layout.addWidget(right_lbl)
+            
+            if is_spd:
+                left_f_lbl = QLabel("左滤波: --")
+                left_f_lbl.setStyleSheet(SS("color: #81d4fa; font-size: 11px;"))
+                right_f_lbl = QLabel("右滤波: --")
+                right_f_lbl.setStyleSheet(SS("color: #ef9a9a; font-size: 11px;"))
+                val_layout.addWidget(left_f_lbl)
+                val_layout.addWidget(right_f_lbl)
+                self.value_labels[key] = {'left': left_lbl, 'right': right_lbl,
+                                          'left_filtered': left_f_lbl, 'right_filtered': right_f_lbl}
+            else:
+                self.value_labels[key] = {'left': left_lbl, 'right': right_lbl}
+            
+            val_layout.addStretch()
+            container.addLayout(val_layout)
+            
+            plot_grid.addLayout(container, row, col)
+        
+        layout.addLayout(plot_grid)
+    
+    def _set_rate(self):
+        """设置关节速度限幅滤波 Rate"""
+        rate = int(self.rate_input.value())
+        self.send_cmd(f"balance joint rate {rate}")
+    
+    def _set_filter_mode(self, mode):
+        """切换关节速度滤波模式: 0=Median, 1=SlewRate"""
+        self.mode_median_btn.setChecked(mode == 0)
+        self.mode_slew_btn.setChecked(mode == 1)
+        # 显示/隐藏对应参数控件
+        self.median_window_label.setVisible(mode == 0)
+        self.median_window_input.setVisible(mode == 0)
+        self.median_window_set_btn.setVisible(mode == 0)
+        self.rate_label.setVisible(mode == 1)
+        self.rate_input.setVisible(mode == 1)
+        self.rate_set_btn.setVisible(mode == 1)
+        # 发送命令
+        self.send_cmd(f"balance joint mode {mode}")
+    
+    def _set_median_window(self):
+        """设置中值滤波窗口大小"""
+        w = self.median_window_input.value()
+        # 强制奇数
+        if w % 2 == 0:
+            w += 1
+            self.median_window_input.setValue(w)
+        self.send_cmd(f"balance joint window {w}")
+    
+    def _toggle_plot(self, key, visible):
+        """切换波形显示/隐藏"""
+        if key in self.plots:
+            self.plots[key].setVisible(visible)
+    
+    def _set_all_plots(self, checked):
+        """全选/全不选"""
+        for cb in self.checkboxes.values():
+            cb.setChecked(checked)
+    
+    def _clear_all(self):
+        """清空所有波形数据"""
+        for key in self.data:
+            for sub_key in self.data[key]:
+                self.data[key][sub_key].clear()
+            for curve_key in self.curves[key]:
+                self.curves[key][curve_key].setData([])
+            self.value_labels[key]['left'].setText("左: --")
+            self.value_labels[key]['right'].setText("右: --")
+            if 'left_filtered' in self.value_labels[key]:
+                self.value_labels[key]['left_filtered'].setText("左滤波: --")
+                self.value_labels[key]['right_filtered'].setText("右滤波: --")
+    
+    def update_joint_data(self, lh_pos, lh_spd, lh_cur, lh_spd_f,
+                          lk_pos, lk_spd, lk_cur, lk_spd_f,
+                          rh_pos, rh_spd, rh_cur, rh_spd_f,
+                          rk_pos, rk_spd, rk_cur, rk_spd_f):
+        """更新关节电机数据 (由 process_serial_data 调用)
+        
+        每个关节4个值: pos, spd(raw), cur, spd_filtered
+        """
+        # 数据映射: (key, left_val, right_val, fmt, left_f, right_f)
+        updates = [
+            ('hip_pos',  lh_pos, rh_pos, '%.1f°',  None, None),
+            ('knee_pos', lk_pos, rk_pos, '%.1f°',  None, None),
+            ('hip_spd',  lh_spd, rh_spd, '%.0f',   lh_spd_f, rh_spd_f),
+            ('knee_spd', lk_spd, rk_spd, '%.0f',   lk_spd_f, rk_spd_f),
+            ('hip_cur',  lh_cur, rh_cur, '%.3fA',  None, None),
+            ('knee_cur', lk_cur, rk_cur, '%.3fA',  None, None),
+        ]
+        
+        for key, lval, rval, fmt, lval_f, rval_f in updates:
+            buf = self.data[key]
+            buf['left'].append(lval)
+            buf['right'].append(rval)
+            
+            has_filtered = lval_f is not None
+            if has_filtered:
+                buf['left_filtered'].append(lval_f)
+                buf['right_filtered'].append(rval_f)
+            
+            # 限制缓存长度
+            if len(buf['left']) > self.PLOT_BUFFER:
+                buf['left'] = buf['left'][-self.PLOT_BUFFER:]
+                buf['right'] = buf['right'][-self.PLOT_BUFFER:]
+                if has_filtered:
+                    buf['left_filtered'] = buf['left_filtered'][-self.PLOT_BUFFER:]
+                    buf['right_filtered'] = buf['right_filtered'][-self.PLOT_BUFFER:]
+            
+            # 更新波形 (仅在可见时)
+            if self.checkboxes[key].isChecked():
+                self.curves[key]['left'].setData(buf['left'])
+                self.curves[key]['right'].setData(buf['right'])
+                if has_filtered:
+                    self.curves[key]['left_filtered'].setData(buf['left_filtered'])
+                    self.curves[key]['right_filtered'].setData(buf['right_filtered'])
+            
+            # 更新数值
+            self.value_labels[key]['left'].setText(f"左: {fmt % lval}")
+            self.value_labels[key]['right'].setText(f"右: {fmt % rval}")
+            if has_filtered:
+                self.value_labels[key]['left_filtered'].setText(f"左滤波: {fmt % lval_f}")
+                self.value_labels[key]['right_filtered'].setText(f"右滤波: {fmt % rval_f}")
+
+
+# ============================================================================
 # VMC 调试面板
 # ============================================================================
 class VMCDebugPanel(QWidget):
@@ -5538,6 +5985,42 @@ class VMCDebugPanel(QWidget):
         coord_group.setLayout(coord_layout)
         layout.addWidget(coord_group)
         
+        # ========== 速度估计方法选择 ==========
+        diff_group = QGroupBox("🔬 速度估计方法 (VMC Kd 项)")
+        diff_layout = QHBoxLayout()
+        
+        diff_layout.addWidget(QLabel("dL/dα 速度来源:"))
+        
+        self.diff_jacobian_btn = QPushButton("📊 雅可比 × 关节速度 (Jacobian)")
+        self.diff_jacobian_btn.setCheckable(True)
+        self.diff_jacobian_btn.setChecked(True)
+        self.diff_jacobian_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 13px; padding: 8px 14px; border: 2px solid #555; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #2196F3; color: white; border-color: #1976D2; }"
+        ))
+        self.diff_jacobian_btn.setToolTip("通过雅可比矩阵将关节角速度映射到工作空间速度\n零延迟、解析精确，但受关节速度噪声影响")
+        self.diff_jacobian_btn.clicked.connect(lambda: self._set_diff_method('jacobian'))
+        diff_layout.addWidget(self.diff_jacobian_btn)
+        
+        self.diff_numeric_btn = QPushButton("📈 位置数值微分 (Numeric)")
+        self.diff_numeric_btn.setCheckable(True)
+        self.diff_numeric_btn.setChecked(False)
+        self.diff_numeric_btn.setStyleSheet(SS(
+            "QPushButton { font-size: 13px; padding: 8px 14px; border: 2px solid #555; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #FF9800; color: white; border-color: #F57C00; }"
+        ))
+        self.diff_numeric_btn.setToolTip("通过 FK 位置差分计算速度\n一帧延迟，但不受关节速度噪声影响，信号更干净")
+        self.diff_numeric_btn.clicked.connect(lambda: self._set_diff_method('numeric'))
+        diff_layout.addWidget(self.diff_numeric_btn)
+        
+        self.diff_status_label = QLabel("当前: Jacobian")
+        self.diff_status_label.setStyleSheet(SS("font-weight: bold; color: #2196F3;"))
+        diff_layout.addWidget(self.diff_status_label)
+        
+        diff_layout.addStretch()
+        diff_group.setLayout(diff_layout)
+        layout.addWidget(diff_group)
+        
         # ========== 世界坐标系参数 (K_vx, K_y, D_y) ==========
         world_group = QGroupBox("🌍 世界坐标系参数 (World Coord)")
         world_layout = QGridLayout()
@@ -5558,8 +6041,8 @@ class VMCDebugPanel(QWidget):
         world_layout.addWidget(QLabel("K_y (高度刚度 N/m):"), 1, 0)
         self.ky_input = QDoubleSpinBox()
         self.ky_input.setRange(0, 5000)
-        self.ky_input.setDecimals(1)
-        self.ky_input.setSingleStep(50)
+        self.ky_input.setDecimals(3)
+        self.ky_input.setSingleStep(10)
         self.ky_input.setValue(0.0)  # 默认 0
         world_layout.addWidget(self.ky_input, 1, 1)
         self.ky_set_btn = QPushButton("设置")
@@ -5570,8 +6053,8 @@ class VMCDebugPanel(QWidget):
         world_layout.addWidget(QLabel("D_y (高度阻尼 Ns/m):"), 2, 0)
         self.dy_input = QDoubleSpinBox()
         self.dy_input.setRange(0, 500)
-        self.dy_input.setDecimals(1)
-        self.dy_input.setSingleStep(5)
+        self.dy_input.setDecimals(3)
+        self.dy_input.setSingleStep(1)
         self.dy_input.setValue(0.0)  # 默认 0
         world_layout.addWidget(self.dy_input, 2, 1)
         self.dy_set_btn = QPushButton("设置")
@@ -5589,8 +6072,8 @@ class VMCDebugPanel(QWidget):
         body_layout.addWidget(QLabel("K_L (腿长刚度 N/m):"), 0, 0)
         self.kl_input = QDoubleSpinBox()
         self.kl_input.setRange(0, 5000)
-        self.kl_input.setDecimals(1)
-        self.kl_input.setSingleStep(50)
+        self.kl_input.setDecimals(3)
+        self.kl_input.setSingleStep(10)
         self.kl_input.setValue(0.0)  # 默认 0
         body_layout.addWidget(self.kl_input, 0, 1)
         self.kl_set_btn = QPushButton("设置")
@@ -5601,8 +6084,8 @@ class VMCDebugPanel(QWidget):
         body_layout.addWidget(QLabel("D_L (腿长阻尼 Ns/m):"), 1, 0)
         self.dl_input = QDoubleSpinBox()
         self.dl_input.setRange(0, 500)
-        self.dl_input.setDecimals(1)
-        self.dl_input.setSingleStep(5)
+        self.dl_input.setDecimals(3)
+        self.dl_input.setSingleStep(1)
         self.dl_input.setValue(0.0)  # 默认 0
         body_layout.addWidget(self.dl_input, 1, 1)
         self.dl_set_btn = QPushButton("设置")
@@ -5613,8 +6096,8 @@ class VMCDebugPanel(QWidget):
         body_layout.addWidget(QLabel("K_α (摆角刚度 Nm/rad):"), 2, 0)
         self.ka_input = QDoubleSpinBox()
         self.ka_input.setRange(0, 500)
-        self.ka_input.setDecimals(2)
-        self.ka_input.setSingleStep(1)
+        self.ka_input.setDecimals(4)
+        self.ka_input.setSingleStep(0.1)
         self.ka_input.setValue(0.0)  # 默认 0
         body_layout.addWidget(self.ka_input, 2, 1)
         self.ka_set_btn = QPushButton("设置")
@@ -5625,8 +6108,8 @@ class VMCDebugPanel(QWidget):
         body_layout.addWidget(QLabel("D_α (摆角阻尼 Nm·s/rad):"), 3, 0)
         self.da_input = QDoubleSpinBox()
         self.da_input.setRange(0, 50)
-        self.da_input.setDecimals(2)
-        self.da_input.setSingleStep(0.5)
+        self.da_input.setDecimals(4)
+        self.da_input.setSingleStep(0.05)
         self.da_input.setValue(0.0)  # 默认 0
         body_layout.addWidget(self.da_input, 3, 1)
         self.da_set_btn = QPushButton("设置")
@@ -5718,8 +6201,8 @@ class VMCDebugPanel(QWidget):
         pitch_param_layout.addWidget(QLabel("Pitch Kp:"), 0, 0)
         self.pitch_kp_input = QDoubleSpinBox()
         self.pitch_kp_input.setRange(0, 100)
-        self.pitch_kp_input.setDecimals(3)
-        self.pitch_kp_input.setSingleStep(0.05)
+        self.pitch_kp_input.setDecimals(4)
+        self.pitch_kp_input.setSingleStep(0.01)
         self.pitch_kp_input.setValue(0.0)  # 默认 0
         pitch_param_layout.addWidget(self.pitch_kp_input, 0, 1)
         self.pitch_kp_set_btn = QPushButton("设置")
@@ -5730,8 +6213,8 @@ class VMCDebugPanel(QWidget):
         pitch_param_layout.addWidget(QLabel("Pitch Kd:"), 1, 0)
         self.pitch_kd_input = QDoubleSpinBox()
         self.pitch_kd_input.setRange(0, 50)
-        self.pitch_kd_input.setDecimals(3)
-        self.pitch_kd_input.setSingleStep(0.01)
+        self.pitch_kd_input.setDecimals(4)
+        self.pitch_kd_input.setSingleStep(0.005)
         self.pitch_kd_input.setValue(0.0)  # 默认 0
         pitch_param_layout.addWidget(self.pitch_kd_input, 1, 1)
         self.pitch_kd_set_btn = QPushButton("设置")
@@ -5787,7 +6270,7 @@ class VMCDebugPanel(QWidget):
         self.sync_kp_input = QDoubleSpinBox()
         self.sync_kp_input.setRange(0, 50)
         self.sync_kp_input.setDecimals(4)
-        self.sync_kp_input.setSingleStep(0.01)
+        self.sync_kp_input.setSingleStep(0.005)
         self.sync_kp_input.setValue(0.0)  # 默认 0
         self.sync_kp_input.setToolTip("角度差比例增益：越大响应越快，但可能震荡")
         sync_param_layout.addWidget(self.sync_kp_input, 0, 1)
@@ -5799,8 +6282,8 @@ class VMCDebugPanel(QWidget):
         sync_param_layout.addWidget(QLabel("D_sync (D增益 Nm·s/rad):"), 1, 0)
         self.sync_kd_input = QDoubleSpinBox()
         self.sync_kd_input.setRange(0, 5)
-        self.sync_kd_input.setDecimals(3)
-        self.sync_kd_input.setSingleStep(0.01)
+        self.sync_kd_input.setDecimals(4)
+        self.sync_kd_input.setSingleStep(0.005)
         self.sync_kd_input.setValue(0.0)  # 默认 0
         self.sync_kd_input.setToolTip("角速度差阻尼增益：抑制振荡")
         sync_param_layout.addWidget(self.sync_kd_input, 1, 1)
@@ -5913,6 +6396,19 @@ class VMCDebugPanel(QWidget):
         """发送命令到串口"""
         if self.parent_window:
             self.parent_window.send_command(cmd)
+    
+    def _set_diff_method(self, method):
+        """切换 VMC 速度估计方法: jacobian 或 numeric"""
+        is_jacobian = (method == 'jacobian')
+        self.diff_jacobian_btn.setChecked(is_jacobian)
+        self.diff_numeric_btn.setChecked(not is_jacobian)
+        if is_jacobian:
+            self.diff_status_label.setText("当前: Jacobian")
+            self.diff_status_label.setStyleSheet(SS("font-weight: bold; color: #2196F3;"))
+        else:
+            self.diff_status_label.setText("当前: Numeric")
+            self.diff_status_label.setStyleSheet(SS("font-weight: bold; color: #FF9800;"))
+        self.send_cmd(f"balance vmc diff {method}")
     
     def update_coord_status(self, coord_type):
         """更新坐标系状态显示"""
@@ -6326,6 +6822,10 @@ class PIDTunerUI(QMainWindow):
         self.vmc_panel = VMCDebugPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.vmc_panel), "🦿 VMC调试")
         
+        # 关节电机监控面板
+        self.joint_panel = JointMonitorPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.joint_panel), "🔩 关节监控")
+        
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.motor_panel), "⚙️ 电机控制")
@@ -6659,30 +7159,59 @@ class PIDTunerUI(QMainWindow):
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         
-        # 三环 PID 调试输出 (实时)
-        # 格式: [TPID] pitch=X° spd=X | Speed(外): err=X → pitch_tgt=X° | Angle(中): err=X → whl_tgt=X | Wheel(内): err=X → out=X [spd|trq]
+        # 四环 PID 调试输出 (实时)
+        # 格式(无位移环): [TPID] pitch=X° spd=X | Speed(外): err=X → pitch_tgt=X° | Angle(中): err=X → whl_tgt=X | Wheel(内): err=X → out=X [spd|trq]
+        # 格式(有位移环): [TPID] pitch=X° spd=X | Dist(最外): err=X → spd_corr=X | Speed(外): err=X → pitch_tgt=X° | Angle(中): err=X → whl_tgt=X | Wheel(内): err=X → out=X [spd|trq]
         if line.startswith("[TPID]"):
-            tpid_debug_match = re.search(
+            # 先尝试带位移环的格式
+            tpid_dist_match = re.search(
                 r'\[TPID\] pitch=([-\d.]+)° spd=([-\d.]+) \| '
+                r'Dist\(最外\): err=([-\d.]+) → spd_corr=([-\d.]+) \| '
                 r'Speed\(外\): err=([-\d.]+) → pitch_tgt=([-\d.]+)° \| '
                 r'Angle\(中\): err=([-\d.]+) → whl_tgt=([-\d.]+) \| '
                 r'Wheel\(内\): err=([-\d.]+) → out=([-\d.]+) \[(spd|trq)\]', line)
-            if tpid_debug_match:
+            if tpid_dist_match:
                 try:
-                    pitch = float(tpid_debug_match.group(1))
-                    spd = float(tpid_debug_match.group(2))
-                    spd_err = float(tpid_debug_match.group(3))
-                    pitch_tgt = float(tpid_debug_match.group(4))
-                    ang_err = float(tpid_debug_match.group(5))
-                    whl_tgt = float(tpid_debug_match.group(6))
-                    whl_err = float(tpid_debug_match.group(7))
-                    out = float(tpid_debug_match.group(8))
-                    wmode = tpid_debug_match.group(9)
+                    pitch = float(tpid_dist_match.group(1))
+                    spd = float(tpid_dist_match.group(2))
+                    dist_err = float(tpid_dist_match.group(3))
+                    dist_corr = float(tpid_dist_match.group(4))
+                    spd_err = float(tpid_dist_match.group(5))
+                    pitch_tgt = float(tpid_dist_match.group(6))
+                    ang_err = float(tpid_dist_match.group(7))
+                    whl_tgt = float(tpid_dist_match.group(8))
+                    whl_err = float(tpid_dist_match.group(9))
+                    out = float(tpid_dist_match.group(10))
+                    wmode = tpid_dist_match.group(11)
                     if hasattr(self, 'dual_pid_panel'):
                         self.dual_pid_panel.update_tpid_debug(
-                            pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode)
+                            pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode,
+                            dist_err=dist_err, dist_corr=dist_corr)
                 except:
                     pass
+            else:
+                # 不带位移环的格式
+                tpid_debug_match = re.search(
+                    r'\[TPID\] pitch=([-\d.]+)° spd=([-\d.]+) \| '
+                    r'Speed\(外\): err=([-\d.]+) → pitch_tgt=([-\d.]+)° \| '
+                    r'Angle\(中\): err=([-\d.]+) → whl_tgt=([-\d.]+) \| '
+                    r'Wheel\(内\): err=([-\d.]+) → out=([-\d.]+) \[(spd|trq)\]', line)
+                if tpid_debug_match:
+                    try:
+                        pitch = float(tpid_debug_match.group(1))
+                        spd = float(tpid_debug_match.group(2))
+                        spd_err = float(tpid_debug_match.group(3))
+                        pitch_tgt = float(tpid_debug_match.group(4))
+                        ang_err = float(tpid_debug_match.group(5))
+                        whl_tgt = float(tpid_debug_match.group(6))
+                        whl_err = float(tpid_debug_match.group(7))
+                        out = float(tpid_debug_match.group(8))
+                        wmode = tpid_debug_match.group(9)
+                        if hasattr(self, 'dual_pid_panel'):
+                            self.dual_pid_panel.update_tpid_debug(
+                                pitch, spd, spd_err, pitch_tgt, ang_err, whl_tgt, whl_err, out, wmode)
+                    except:
+                        pass
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         
@@ -6805,6 +7334,23 @@ class PIDTunerUI(QMainWindow):
                 except (ValueError, IndexError) as e:
                     if self.debug_mode:
                         self.log(f"VMC data parse error: {e}", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 关节电机数据流 (高频): #JOINT,LH_pos,LH_spd,LH_cur,LH_spd_f,LK_pos,LK_spd,LK_cur,LK_spd_f,RH_pos,RH_spd,RH_cur,RH_spd_f,RK_pos,RK_spd,RK_cur,RK_spd_f
+        if line.startswith("#JOINT,"):
+            parts = line.split(',')
+            if len(parts) == 17:  # #JOINT + 16 个数据 (每关节4个: pos,spd,cur,spd_filtered)
+                try:
+                    if hasattr(self, 'joint_panel'):
+                        self.joint_panel.update_joint_data(
+                            float(parts[1]),  float(parts[2]),  float(parts[3]),  float(parts[4]),   # LH pos,spd,cur,spd_f
+                            float(parts[5]),  float(parts[6]),  float(parts[7]),  float(parts[8]),   # LK pos,spd,cur,spd_f
+                            float(parts[9]),  float(parts[10]), float(parts[11]), float(parts[12]),  # RH pos,spd,cur,spd_f
+                            float(parts[13]), float(parts[14]), float(parts[15]), float(parts[16]))  # RK pos,spd,cur,spd_f
+                except (ValueError, IndexError) as e:
+                    if self.debug_mode:
+                        self.log(f"Joint data parse error: {e}", is_error=True)
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         

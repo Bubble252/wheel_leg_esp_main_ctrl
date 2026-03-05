@@ -38,6 +38,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <string.h>
+#include <strings.h>     // strcasecmp
 #include <stdlib.h>
 #include <math.h>
 
@@ -209,7 +210,7 @@ static triple_pid_output_t g_triple_pid_output;   // 保存输出用于调试
 
 // 轮速加权滑动平均滤波器 (用于双环/三环 PID 模式)
 static weighted_ma_filter_t g_wheel_speed_wma;
-static bool g_wma_enabled = false;   // 默认关闭, 由 CLI / UI 开启
+static bool g_wma_enabled = true;    // 默认开启 WMA 滤波
 
 // 单环 PID 控制器 (输出速度，适合电机速度模式)
 static single_pid_controller_t g_single_pid_ctrl;
@@ -402,6 +403,30 @@ static float g_vmc_target_y = 0.09f;         // 目标机身高度 (m), 默认 0
 static vmc_dual_output_t g_vmc_dual_output = {0};  // 双腿 VMC 输出 (包含协调控制)
 static bool g_vmc_input_valid = false;             // VMC 输入是否有效
 static bool g_vmc_stream_enable = false;           // VMC 数据流输出使能 (用于 UI 调试)
+static bool g_joint_stream_enable = false;         // 关节电机数据流使能 (角度/速度/电流)
+
+// ============================================================================
+// 关节电机速度滤波 (支持中值滤波 / 限幅滤波切换)
+// ============================================================================
+static bool g_joint_speed_filter_enable = true;    // 关节速度滤波使能 (默认开启)
+static int  g_joint_speed_filter_mode = 1;         // 0=中值滤波(Median), 1=限幅滤波(SlewRate)
+// Slew-Rate 参数
+static float g_joint_speed_slew_rate = 3000.0f;    // 最大变化率 (°/s²), 默认3000
+static slewrate_filter_t g_sr_joint_lh;             // 左髋速度限幅滤波器
+static slewrate_filter_t g_sr_joint_lk;             // 左膝速度限幅滤波器
+static slewrate_filter_t g_sr_joint_rh;             // 右髋速度限幅滤波器
+static slewrate_filter_t g_sr_joint_rk;             // 右膝速度限幅滤波器
+// Median 参数
+static int g_joint_median_window = 3;               // 中值滤波窗口大小 (3/5/7/9)
+static median_filter_t g_mf_joint_lh;               // 左髋速度中值滤波器
+static median_filter_t g_mf_joint_lk;               // 左膝速度中值滤波器
+static median_filter_t g_mf_joint_rh;               // 右髋速度中值滤波器
+static median_filter_t g_mf_joint_rk;               // 右膝速度中值滤波器
+// 滤波后的速度值 (用于波形输出和 VMC 输入)
+static float g_joint_lh_spd_filtered = 0.0f;
+static float g_joint_lk_spd_filtered = 0.0f;
+static float g_joint_rh_spd_filtered = 0.0f;
+static float g_joint_rk_spd_filtered = 0.0f;
 
 // 树莓派通信开关 (调试时可禁用以减少串口占用)
 static bool g_pi_comm_enabled = false;  // 默认禁用
@@ -441,7 +466,7 @@ static void commander_param_callback(char controller_id, char param_char, float 
             }
             break;
             
-        case CTRL_ID_DISTANCE:  // C - 位移控制
+        case CTRL_ID_DISTANCE:  // C - 位移控制 (仅LQR, Triple PID位移环独立)
             switch (param_char) {
                 case 'P': params.distance_kp = value; updated = true; break;
                 case 'I': params.distance_ki = value; updated = true; break;
@@ -603,7 +628,7 @@ static bool commander_query_callback(char controller_id, commander_pid_params_t 
             params->limit = p->gyro_limit;
             return true;
             
-        case CTRL_ID_DISTANCE:  // C - 位移控制
+        case CTRL_ID_DISTANCE:  // C - 位移控制 (LQR)
             params->p = p->distance_kp;
             params->i = p->distance_ki;
             params->d = p->distance_kd;
@@ -810,7 +835,11 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
     if (PLOT_CH_ENABLED('P')) printf("#DATA,P,%.2f,%.2f\n", g_right_wheel_speed_rad, g_right_wheel_accel);
     if (PLOT_CH_ENABLED('Q')) printf("#DATA,Q,0.0,%.4f\n", output->angle_control);
     if (PLOT_CH_ENABLED('R')) printf("#DATA,R,0.0,%.4f\n", output->gyro_control);
-    if (PLOT_CH_ENABLED('S')) printf("#DATA,S,0.0,%.4f\n", output->distance_control);
+    if (PLOT_CH_ENABLED('S')) {
+        float dist_ctrl = (g_control_mode == CTRL_MODE_TRIPLE_PID) ? 
+                           g_triple_pid_output.distance_control : output->distance_control;
+        printf("#DATA,S,0.0,%.4f\n", dist_ctrl);
+    }
     if (PLOT_CH_ENABLED('T')) printf("#DATA,T,0.0,%.4f\n", output->speed_control);
     if (PLOT_CH_ENABLED('U')) printf("#DATA,U,0.0,%.4f\n", g_yaw_output);
     if (PLOT_CH_ENABLED('V')) printf("#DATA,V,%.4f,%.4f\n", output->lqr_u_raw, output->lqr_u);
@@ -824,6 +853,36 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
                input->yaw_rate);
     }
     if (PLOT_CH_ENABLED('Z')) printf("#DATA,Z,%.3f,%.1f\n", g_zp_angle_error, g_zp_active ? 1.0f : 0.0f);
+    
+    // 关节电机数据流 (独立使能, 复用 plot 分频)
+    // 每次输出时独立读取并滤波，不依赖 VMC 是否启用
+    // 格式: #JOINT,LH_pos,LH_spd,LH_cur,LH_spd_f,LK_pos,LK_spd,LK_cur,LK_spd_f,RH_pos,RH_spd,RH_cur,RH_spd_f,RK_pos,RK_spd,RK_cur,RK_spd_f
+    if (g_joint_stream_enable) {
+        // 原始速度也乘以 6.0 转为 °/s, 与滤波后值单位一致, 方便 UI 波形对比
+        float lh_spd = g_motor_left_hip   ? can_motor_read_speed(g_motor_left_hip)   * 6.0f : 0.0f;
+        float lk_spd = g_motor_left_knee  ? can_motor_read_speed(g_motor_left_knee)  * 6.0f : 0.0f;
+        float rh_spd = g_motor_right_hip   ? can_motor_read_speed(g_motor_right_hip)   * 6.0f : 0.0f;
+        float rk_spd = g_motor_right_knee  ? can_motor_read_speed(g_motor_right_knee)  * 6.0f : 0.0f;
+        
+        // 使用全局滤波后的值 (由 compute_balance_output 每帧更新)
+        printf("#JOINT,%.2f,%.1f,%.3f,%.1f,%.2f,%.1f,%.3f,%.1f,%.2f,%.1f,%.3f,%.1f,%.2f,%.1f,%.3f,%.1f\n",
+               g_motor_left_hip  ? can_motor_read_position(g_motor_left_hip)  : 0.0f,
+               lh_spd,
+               g_motor_left_hip  ? can_motor_read_current(g_motor_left_hip)   : 0.0f,
+               g_joint_lh_spd_filtered,
+               g_motor_left_knee ? can_motor_read_position(g_motor_left_knee) : 0.0f,
+               lk_spd,
+               g_motor_left_knee ? can_motor_read_current(g_motor_left_knee)  : 0.0f,
+               g_joint_lk_spd_filtered,
+               g_motor_right_hip  ? can_motor_read_position(g_motor_right_hip)  : 0.0f,
+               rh_spd,
+               g_motor_right_hip  ? can_motor_read_current(g_motor_right_hip)   : 0.0f,
+               g_joint_rh_spd_filtered,
+               g_motor_right_knee ? can_motor_read_position(g_motor_right_knee) : 0.0f,
+               rk_spd,
+               g_motor_right_knee ? can_motor_read_current(g_motor_right_knee)  : 0.0f,
+               g_joint_rk_spd_filtered);
+    }
 }
 
 /**
@@ -892,19 +951,37 @@ static void output_pid_debug(const lqr_input_t *input) {
                speed_rpm);
                
     } else if (g_control_mode == CTRL_MODE_TRIPLE_PID) {
-        // 三环 PID 调试输出
-        printf("[TPID] pitch=%.2f° spd=%.2f | "
-               "Speed(外): err=%.2f → pitch_tgt=%.2f° | "
-               "Angle(中): err=%.2f → whl_tgt=%.2f | "
-               "Wheel(内): err=%.2f → out=%.3f [%s]\n",
-               pitch, wheel_speed,
-               g_triple_pid_output.speed_error,
-               g_triple_pid_output.pitch_target,
-               g_triple_pid_output.angle_error,
-               g_triple_pid_output.wheel_speed_target,
-               g_triple_pid_output.wheel_speed_error,
-               g_triple_pid_output.torque,
-               g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "spd" : "trq");
+        // 四环 PID 调试输出
+        if (g_triple_pid_ctrl.params.distance_enable) {
+            printf("[TPID] pitch=%.2f° spd=%.2f | "
+                   "Dist(最外): err=%.3f → spd_corr=%.3f | "
+                   "Speed(外): err=%.2f → pitch_tgt=%.2f° | "
+                   "Angle(中): err=%.2f → whl_tgt=%.2f | "
+                   "Wheel(内): err=%.2f → out=%.3f [%s]\n",
+                   pitch, wheel_speed,
+                   g_triple_pid_output.distance_error,
+                   g_triple_pid_output.distance_control,
+                   g_triple_pid_output.speed_error,
+                   g_triple_pid_output.pitch_target,
+                   g_triple_pid_output.angle_error,
+                   g_triple_pid_output.wheel_speed_target,
+                   g_triple_pid_output.wheel_speed_error,
+                   g_triple_pid_output.torque,
+                   g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "spd" : "trq");
+        } else {
+            printf("[TPID] pitch=%.2f° spd=%.2f | "
+                   "Speed(外): err=%.2f → pitch_tgt=%.2f° | "
+                   "Angle(中): err=%.2f → whl_tgt=%.2f | "
+                   "Wheel(内): err=%.2f → out=%.3f [%s]\n",
+                   pitch, wheel_speed,
+                   g_triple_pid_output.speed_error,
+                   g_triple_pid_output.pitch_target,
+                   g_triple_pid_output.angle_error,
+                   g_triple_pid_output.wheel_speed_target,
+                   g_triple_pid_output.wheel_speed_error,
+                   g_triple_pid_output.torque,
+                   g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED ? "spd" : "trq");
+        }
                
     } else {
         // LQR 模式调试输出
@@ -1208,6 +1285,13 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
         // 数值微分模式下不需要读取电机速度 (减少 CAN 通信)
         bool need_velocity = (g_vmc_params.vmc_diff_method == VMC_DIFF_JACOBIAN);
         
+        // 关节速度使用全局滤波后的值 (由 compute_balance_output 每帧更新)
+        // 若非 Jacobian 模式则不需要速度
+        float lh_vel = need_velocity ? g_joint_lh_spd_filtered : 0.0f;
+        float lk_vel = need_velocity ? g_joint_lk_spd_filtered : 0.0f;
+        float rh_vel = need_velocity ? g_joint_rh_spd_filtered : 0.0f;
+        float rk_vel = need_velocity ? g_joint_rk_spd_filtered : 0.0f;
+        
         vmc_dual_input_t dual_input = {
             .pitch_deg = pitch_deg,
             .pitch_rate_deg = pitch_rate_deg,
@@ -1219,8 +1303,8 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                 .sensor = {
                     .hip_angle = left_valid ? can_motor_read_position(g_motor_left_hip) : 0,
                     .knee_angle = left_valid ? can_motor_read_position(g_motor_left_knee) : 0,
-                    .hip_velocity = (left_valid && need_velocity) ? can_motor_read_speed(g_motor_left_hip) * 6.0f : 0,
-                    .knee_velocity = (left_valid && need_velocity) ? can_motor_read_speed(g_motor_left_knee) * 6.0f : 0
+                    .hip_velocity = lh_vel,
+                    .knee_velocity = lk_vel
                 }
             },
             .right = {
@@ -1229,8 +1313,8 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                 .sensor = {
                     .hip_angle = right_valid ? can_motor_read_position(g_motor_right_hip) : 0,
                     .knee_angle = right_valid ? can_motor_read_position(g_motor_right_knee) : 0,
-                    .hip_velocity = (right_valid && need_velocity) ? can_motor_read_speed(g_motor_right_hip) * 6.0f : 0,
-                    .knee_velocity = (right_valid && need_velocity) ? can_motor_read_speed(g_motor_right_knee) * 6.0f : 0
+                    .hip_velocity = rh_vel,
+                    .knee_velocity = rk_vel
                 }
             }
         };
@@ -1679,6 +1763,20 @@ esp_err_t balance_test_init(void) {
     // 初始化腿部控制 (计算初始电机角度)
     leg_ctrl_init();
     
+    // 初始化关节电机速度滤波器 (两种模式)
+    slewrate_init(&g_sr_joint_lh, g_joint_speed_slew_rate);
+    slewrate_init(&g_sr_joint_lk, g_joint_speed_slew_rate);
+    slewrate_init(&g_sr_joint_rh, g_joint_speed_slew_rate);
+    slewrate_init(&g_sr_joint_rk, g_joint_speed_slew_rate);
+    median_init(&g_mf_joint_lh, g_joint_median_window);
+    median_init(&g_mf_joint_lk, g_joint_median_window);
+    median_init(&g_mf_joint_rh, g_joint_median_window);
+    median_init(&g_mf_joint_rk, g_joint_median_window);
+    ESP_LOGI(TAG, "Joint speed filter: %s, mode=%s, slew_rate=%.0f, median_win=%d",
+             g_joint_speed_filter_enable ? "ON" : "OFF",
+             g_joint_speed_filter_mode == 0 ? "Median" : "SlewRate",
+             g_joint_speed_slew_rate, g_joint_median_window);
+
     // 初始化 VMC 参数
     vmc_get_default_params(&g_vmc_params);
     ESP_LOGI(TAG, "VMC params: K_vx=%.1f, K_y=%.1f, D_y=%.1f, gc=%.2f, mass=%.1fkg",
@@ -1847,6 +1945,7 @@ void balance_test_enable(void) {
     lqr_reset(&g_lqr_ctrl);
     g_distance_zeropoint = g_lqr_distance;
     lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);  // 同步到 LQR 控制器
+    triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);  // 同步到四环PID
     
     // 重置 YAW 累积角度，并初始化为当前方向 (避免启动跳变)
     g_yaw_angle_total = 0.0f;
@@ -2544,6 +2643,22 @@ static void update_remote_from_wifi(void) {
         last_joy_yaw_gain = wifi_data->joy_yaw_gain;
     }
     
+    // ======== 处理位移环开关 ========
+    static bool last_dist_enable = true;  // 默认开启
+    if (wifi_data->dist_enable != last_dist_enable) {
+        g_triple_pid_ctrl.params.distance_enable = wifi_data->dist_enable ? 1 : 0;
+        if (wifi_data->dist_enable) {
+            // 启用时重置位移零点为当前位置，避免跳变
+            triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_lqr_distance);
+            g_distance_zeropoint = g_lqr_distance;
+            pid_reset(&g_triple_pid_ctrl.pid_distance);
+        }
+        ESP_LOGI(TAG, "WiFi: Distance loop %s", wifi_data->dist_enable ? "ENABLED" : "DISABLED");
+        printf("Triple PID distance loop %s\n", wifi_data->dist_enable ? "ENABLED" : "DISABLED");
+        printf("TPID:DISTEN,%d\n", wifi_data->dist_enable ? 1 : 0);
+        last_dist_enable = wifi_data->dist_enable;
+    }
+    
     // ======== 处理腿部使能 ========
     static bool last_leg_enable = false;
     if (wifi_data->leg_enable != last_leg_enable && !wifi_data->estop) {
@@ -2872,16 +2987,19 @@ static void compute_balance_output(float dt) {
     // 有前后方向运动指令时，重置位移零点 (仅在刚开始移动时)
     static bool was_moving = false;
     bool is_moving = (remote.joy_y != 0);
+    bool is_turning = (remote.joy_x != 0);
     if (is_moving && !was_moving) {
         // joy_y 从 0 变为非 0，开始移动
         g_distance_zeropoint = g_lqr_distance;
         lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
         lqr_reset(&g_lqr_ctrl);  // 仅重置一次
     }
-    if (is_moving) {
-        // 移动过程中持续更新位移零点 (防止位移环干扰)
+    if (is_moving || is_turning) {
+        // 移动或转向过程中持续更新位移零点 (防止位移环干扰)
         g_distance_zeropoint = g_lqr_distance;
         lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
     }
     was_moving = is_moving;
     
@@ -2892,14 +3010,16 @@ static void compute_balance_output(float dt) {
     }
     if ((g_move_stop_flag == 1) && (fabsf(g_lqr_speed) < 0.5f)) {
         g_distance_zeropoint = g_lqr_distance;
-        lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);  // 同步到 LQR 控制器
+        lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
         g_move_stop_flag = 0;
     }
     
     // 被快速推动时的原地停车处理
     if (fabsf(g_lqr_speed) > 15.0f) {
         g_distance_zeropoint = g_lqr_distance;
-        lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);  // 同步到 LQR 控制器
+        lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+        triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
     }
     
     // ======== 根据控制模式选择算法 ========
@@ -2951,6 +3071,7 @@ static void compute_balance_output(float dt) {
         if (g_wheel_off_ground) {
             g_distance_zeropoint = g_lqr_distance;
             lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+            triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
         }
         
         // 填充兼容字段用于波形显示
@@ -2999,6 +3120,7 @@ static void compute_balance_output(float dt) {
         if (g_wheel_off_ground) {
             g_distance_zeropoint = g_lqr_distance;
             lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+            triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
         }
         
         // 填充兼容字段用于波形显示
@@ -3059,6 +3181,7 @@ static void compute_balance_output(float dt) {
         esp_err_t ret = triple_pid_balance_loop(&g_triple_pid_ctrl,
                                                  pitch_for_control, imu.pitch_rate,
                                                  wheel_speed_avg, input.target_speed,
+                                                 g_lqr_distance,
                                                  dt,
                                                  &g_triple_pid_output);
         
@@ -3089,6 +3212,7 @@ static void compute_balance_output(float dt) {
         if (g_wheel_off_ground) {
             g_distance_zeropoint = g_lqr_distance;
             lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+            triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
         }
         
         // 填充兼容字段用于波形显示
@@ -3133,6 +3257,7 @@ static void compute_balance_output(float dt) {
         if (g_wheel_off_ground) {
             g_distance_zeropoint = g_lqr_distance;
             lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+            triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
             // 只保留角度+角速度控制，去掉位移和速度分量
             output.lqr_u = output.angle_control + output.gyro_control;
             pid_reset(&g_lqr_ctrl.pid_lqr_u);
@@ -3435,6 +3560,42 @@ static void compute_balance_output(float dt) {
                 g_leg_right_hip_angle = right_joint.hip_angle;
                 g_leg_right_knee_angle = right_joint.knee_angle;
             }
+        }
+    }
+    
+    // ======== 关节电机速度滤波 (每帧更新, 不依赖 VMC) ========
+    // 读取关节电机原始速度并滤波, 结果存入全局变量供 VMC 和 #JOINT 数据流使用
+    // 支持两种模式: 0=中值滤波(Median), 1=限幅滤波(SlewRate)
+    {
+        bool lh_ok = (g_motor_left_hip != NULL);
+        bool lk_ok = (g_motor_left_knee != NULL);
+        bool rh_ok = (g_motor_right_hip != NULL);
+        bool rk_ok = (g_motor_right_knee != NULL);
+        
+        float lh_raw = lh_ok ? can_motor_read_speed(g_motor_left_hip)   * 6.0f : 0.0f;
+        float lk_raw = lk_ok ? can_motor_read_speed(g_motor_left_knee)  * 6.0f : 0.0f;
+        float rh_raw = rh_ok ? can_motor_read_speed(g_motor_right_hip)  * 6.0f : 0.0f;
+        float rk_raw = rk_ok ? can_motor_read_speed(g_motor_right_knee) * 6.0f : 0.0f;
+        
+        if (g_joint_speed_filter_enable) {
+            if (g_joint_speed_filter_mode == 0) {
+                // 中值滤波
+                g_joint_lh_spd_filtered = median_compute(&g_mf_joint_lh, lh_raw);
+                g_joint_lk_spd_filtered = median_compute(&g_mf_joint_lk, lk_raw);
+                g_joint_rh_spd_filtered = median_compute(&g_mf_joint_rh, rh_raw);
+                g_joint_rk_spd_filtered = median_compute(&g_mf_joint_rk, rk_raw);
+            } else {
+                // 限幅滤波
+                g_joint_lh_spd_filtered = slewrate_compute_dt(&g_sr_joint_lh, lh_raw, dt);
+                g_joint_lk_spd_filtered = slewrate_compute_dt(&g_sr_joint_lk, lk_raw, dt);
+                g_joint_rh_spd_filtered = slewrate_compute_dt(&g_sr_joint_rh, rh_raw, dt);
+                g_joint_rk_spd_filtered = slewrate_compute_dt(&g_sr_joint_rk, rk_raw, dt);
+            }
+        } else {
+            g_joint_lh_spd_filtered = lh_raw;
+            g_joint_lk_spd_filtered = lk_raw;
+            g_joint_rh_spd_filtered = rh_raw;
+            g_joint_rk_spd_filtered = rk_raw;
         }
     }
     
@@ -4244,6 +4405,7 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("=== VMC Detailed Status ===\n");
             printf("Mode: %s\n", g_vmc_enabled ? "FORCE CONTROL" : "POSITION CONTROL");
             printf("Coordinate: %s\n", g_vmc_params.coord_type == VMC_COORD_WORLD ? "WORLD (x-y)" : "BODY (L-α)");
+            printf("Diff method: %s\n", g_vmc_params.vmc_diff_method == VMC_DIFF_JACOBIAN ? "Jacobian (关节速度)" : "Numeric (数值微分)");
             printf("Target: height=%.3fm, vx=%.3fm/s\n", g_vmc_target_y, g_vmc_target_vx);
             printf("Params (World Coord):\n");
             printf("  K_vx = %.1f Ns/m (horizontal velocity gain)\n", g_vmc_params.K_vx);
@@ -4466,14 +4628,159 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Unknown vmc stream command: %s\n", token);
                 printf("Usage: balance vmc stream [on|off]\n");
             }
+        } else if (strcmp(token, "diff") == 0) {
+            // VMC 速度估计方法切换
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("VMC diff method: %s\n",
+                       g_vmc_params.vmc_diff_method == VMC_DIFF_JACOBIAN ? "Jacobian (关节速度)" : "Numeric (数值微分)");
+                printf("Sync diff method: %s\n",
+                       g_vmc_params.sync_diff_method == VMC_DIFF_JACOBIAN ? "Jacobian" : "Numeric");
+                printf("Usage: balance vmc diff [jacobian|numeric]\n");
+            } else if (strcasecmp(token, "jacobian") == 0 || strcmp(token, "0") == 0) {
+                g_vmc_params.vmc_diff_method = VMC_DIFF_JACOBIAN;
+                g_vmc_params.sync_diff_method = VMC_DIFF_JACOBIAN;
+                printf("VMC diff method = Jacobian (关节速度 → 雅可比映射)\n");
+            } else if (strcasecmp(token, "numeric") == 0 || strcmp(token, "1") == 0) {
+                g_vmc_params.vmc_diff_method = VMC_DIFF_NUMERIC;
+                g_vmc_params.sync_diff_method = VMC_DIFF_NUMERIC;
+                printf("VMC diff method = Numeric (位置数值微分, 使用实际dt)\n");
+            } else {
+                printf("Unknown diff method: %s\n", token);
+                printf("Usage: balance vmc diff [jacobian|numeric]\n");
+            }
         } else {
             printf("Unknown vmc command: %s\n", token);
-            printf("Usage: balance vmc [on|off|status|coord|soft|stiff|pitch|sync|stream]\n");
+            printf("Usage: balance vmc [on|off|status|coord|soft|stiff|pitch|sync|stream|diff]\n");
             printf("  World coord: kvx|ky|dy\n");
             printf("  Body coord:  kl|dl|ka|da\n");
             printf("  Common:      gc|mass|height|vx\n");
             printf("  Leg sync:    sync [on|off|kp|kd]\n");
             printf("  Stream:      stream [on|off]  (for UI debug)\n");
+            printf("  Diff method: diff [jacobian|numeric]  (speed estimation)\n");
+        }
+    }
+    // ===== 关节电机数据流 & 速度滤波 =====
+    else if (strcmp(token, "joint") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Joint stream: %s\n", g_joint_stream_enable ? "ENABLED" : "DISABLED");
+            printf("Joint speed filter: %s, mode=%s\n",
+                   g_joint_speed_filter_enable ? "ON" : "OFF",
+                   g_joint_speed_filter_mode == 0 ? "Median" : "SlewRate");
+            if (g_joint_speed_filter_mode == 0) {
+                printf("  Median window: %d\n", g_joint_median_window);
+            } else {
+                printf("  Slew rate: %.0f deg/s^2\n", g_joint_speed_slew_rate);
+            }
+            printf("Filtered speeds (deg/s): LH=%.1f LK=%.1f RH=%.1f RK=%.1f\n",
+                   g_joint_lh_spd_filtered, g_joint_lk_spd_filtered,
+                   g_joint_rh_spd_filtered, g_joint_rk_spd_filtered);
+            printf("Usage: balance joint [on|off|filter|mode|rate|window]\n");
+        } else if (strcmp(token, "stream") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Joint stream: %s\n", g_joint_stream_enable ? "ENABLED" : "DISABLED");
+                printf("Format: #JOINT,LH_pos,LH_spd,LH_cur,LH_spd_f,...(x4)\n");
+                printf("Usage: balance joint stream [on|off]\n");
+            } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+                g_joint_stream_enable = true;
+                printf("Joint stream ENABLED\n");
+            } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+                g_joint_stream_enable = false;
+                printf("Joint stream DISABLED\n");
+            } else {
+                printf("Usage: balance joint stream [on|off]\n");
+            }
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+            g_joint_stream_enable = true;
+            printf("Joint stream ENABLED\n");
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+            g_joint_stream_enable = false;
+            printf("Joint stream DISABLED\n");
+        } else if (strcmp(token, "filter") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Joint speed filter: %s, mode=%s\n",
+                       g_joint_speed_filter_enable ? "ON" : "OFF",
+                       g_joint_speed_filter_mode == 0 ? "Median" : "SlewRate");
+                printf("Usage: balance joint filter [on|off]\n");
+            } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+                g_joint_speed_filter_enable = true;
+                // 重置所有滤波器以避免首次跳变
+                slewrate_init(&g_sr_joint_lh, g_joint_speed_slew_rate);
+                slewrate_init(&g_sr_joint_lk, g_joint_speed_slew_rate);
+                slewrate_init(&g_sr_joint_rh, g_joint_speed_slew_rate);
+                slewrate_init(&g_sr_joint_rk, g_joint_speed_slew_rate);
+                median_reset(&g_mf_joint_lh);
+                median_reset(&g_mf_joint_lk);
+                median_reset(&g_mf_joint_rh);
+                median_reset(&g_mf_joint_rk);
+                printf("Joint speed filter ENABLED (mode=%s)\n",
+                       g_joint_speed_filter_mode == 0 ? "Median" : "SlewRate");
+            } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+                g_joint_speed_filter_enable = false;
+                printf("Joint speed filter DISABLED\n");
+            } else {
+                printf("Usage: balance joint filter [on|off]\n");
+            }
+        } else if (strcmp(token, "rate") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Joint speed slew rate: %.0f deg/s^2\n", g_joint_speed_slew_rate);
+                printf("Usage: balance joint rate <value>\n");
+            } else {
+                g_joint_speed_slew_rate = atof(token);
+                slewrate_set_max_rate(&g_sr_joint_lh, g_joint_speed_slew_rate);
+                slewrate_set_max_rate(&g_sr_joint_lk, g_joint_speed_slew_rate);
+                slewrate_set_max_rate(&g_sr_joint_rh, g_joint_speed_slew_rate);
+                slewrate_set_max_rate(&g_sr_joint_rk, g_joint_speed_slew_rate);
+                printf("Joint speed slew rate = %.0f deg/s^2\n", g_joint_speed_slew_rate);
+            }
+        } else if (strcmp(token, "mode") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Joint filter mode: %d (%s)\n", g_joint_speed_filter_mode,
+                       g_joint_speed_filter_mode == 0 ? "Median" : "SlewRate");
+                printf("Usage: balance joint mode [0|1|median|slew]\n");
+            } else if (strcmp(token, "0") == 0 || strcasecmp(token, "median") == 0) {
+                g_joint_speed_filter_mode = 0;
+                median_reset(&g_mf_joint_lh);
+                median_reset(&g_mf_joint_lk);
+                median_reset(&g_mf_joint_rh);
+                median_reset(&g_mf_joint_rk);
+                printf("Joint filter mode = Median (window=%d)\n", g_joint_median_window);
+            } else if (strcmp(token, "1") == 0 || strcasecmp(token, "slew") == 0) {
+                g_joint_speed_filter_mode = 1;
+                slewrate_init(&g_sr_joint_lh, g_joint_speed_slew_rate);
+                slewrate_init(&g_sr_joint_lk, g_joint_speed_slew_rate);
+                slewrate_init(&g_sr_joint_rh, g_joint_speed_slew_rate);
+                slewrate_init(&g_sr_joint_rk, g_joint_speed_slew_rate);
+                printf("Joint filter mode = SlewRate (rate=%.0f)\n", g_joint_speed_slew_rate);
+            } else {
+                printf("Usage: balance joint mode [0|1|median|slew]\n");
+            }
+        } else if (strcmp(token, "window") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Median window: %d\n", g_joint_median_window);
+                printf("Usage: balance joint window <3|5|7|9>\n");
+            } else {
+                int w = atoi(token);
+                if (w >= 3 && w <= MEDIAN_FILTER_MAX_WINDOW) {
+                    g_joint_median_window = w;
+                    median_set_window(&g_mf_joint_lh, w);
+                    median_set_window(&g_mf_joint_lk, w);
+                    median_set_window(&g_mf_joint_rh, w);
+                    median_set_window(&g_mf_joint_rk, w);
+                    printf("Median window = %d\n", g_joint_median_window);
+                } else {
+                    printf("Invalid window size (must be odd, 3~%d)\n", MEDIAN_FILTER_MAX_WINDOW);
+                }
+            }
+        } else {
+            printf("Unknown joint command: %s\n", token);
+            printf("Usage: balance joint [on|off|stream|filter|mode|rate|window]\n");
         }
     }
     // ===== 树莓派通信开关 =====
@@ -4813,6 +5120,9 @@ void balance_test_process_cmd(const char *cmd_str) {
             } else {
                 g_control_mode = CTRL_MODE_TRIPLE_PID;
                 triple_pid_reset(&g_triple_pid_ctrl);
+                // 初始化位移零点为当前位置
+                triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_lqr_distance);
+                g_distance_zeropoint = g_lqr_distance;
                 // 根据轮速环模式设置电机模式
                 if (g_state == BALANCE_TEST_RUNNING) {
                     if (g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED) {
@@ -5139,11 +5449,17 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Angle zeropoint: %.2f deg\n", g_triple_pid_ctrl.params.angle_zeropoint);
             printf("Speed cmd gain: %.1f\n", g_triple_pid_ctrl.params.speed_cmd_gain);
             printf("Max torque: %.1f Nm\n", g_triple_pid_ctrl.params.max_torque);
+            printf("Distance PID: kp=%.4f ki=%.4f kd=%.4f (limit=%.1f) [%s]\n",
+                   g_triple_pid_ctrl.params.distance_kp, g_triple_pid_ctrl.params.distance_ki,
+                   g_triple_pid_ctrl.params.distance_kd, g_triple_pid_ctrl.params.distance_limit,
+                   g_triple_pid_ctrl.params.distance_enable ? "启用" : "关闭");
             printf("\nUsage: balance tpid angle <kp> <ki> <kd>\n");
             printf("       balance tpid speed <kp> <ki> <kd>\n");
             printf("       balance tpid wheel <kp> <ki> <kd>\n");
             printf("       balance tpid gyro <kp> <ki> <kd>  (角速度阻尼PID)\n");
-            printf("       balance tpid limit <speed|angle|wheel|gyro> <value>\n");
+            printf("       balance tpid distance <kp> <ki> <kd>  (位移环PID)\n");
+            printf("       balance tpid disten <0|1>  (位移环开关)\n");
+            printf("       balance tpid limit <speed|angle|wheel|gyro|distance> <value>\n");
             printf("       balance tpid gain <value>  (speed_cmd_gain)\n");
             printf("       balance tpid wmode <0|1>  (0=SPEED_CMD, 1=TORQUE_PID)\n");
             printf("       balance tpid zero <degrees>\n");
@@ -5211,10 +5527,12 @@ void balance_test_process_cmd(const char *cmd_str) {
                 printf("Angle limit:  %.1f (max wheel_speed_target, rad/s)\n", g_triple_pid_ctrl.params.angle_limit);
                 printf("Wheel limit:  %.1f (max torque, Nm)\n", g_triple_pid_ctrl.params.wheel_limit);
                 printf("Gyro limit:   %.1f\n", g_triple_pid_ctrl.params.gyro_limit);
-                printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f\n",
+                printf("Distance limit: %.1f (max speed correction, rad/s)\n", g_triple_pid_ctrl.params.distance_limit);
+                printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f,%.1f\n",
                        g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
-                       g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
-                printf("Usage: balance tpid limit <speed|angle|wheel|gyro> <value>\n");
+                       g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit,
+                       g_triple_pid_ctrl.params.distance_limit);
+                printf("Usage: balance tpid limit <speed|angle|wheel|gyro|distance> <value>\n");
             } else if (strcmp(token, "speed") == 0) {
                 token = strtok(NULL, " \t\n\r");
                 if (token) {
@@ -5259,9 +5577,21 @@ void balance_test_process_cmd(const char *cmd_str) {
                            g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
                            g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit);
                 }
+            } else if (strcmp(token, "distance") == 0 || strcmp(token, "dist") == 0) {
+                token = strtok(NULL, " \t\n\r");
+                if (token) {
+                    float limit = atof(token);
+                    g_triple_pid_ctrl.params.distance_limit = limit;
+                    pid_set_output_limits(&g_triple_pid_ctrl.pid_distance, -limit, limit);
+                    printf("Triple PID distance limit set to %.1f\n", limit);
+                    printf("TPID:LIMIT,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+                           g_triple_pid_ctrl.params.speed_limit, g_triple_pid_ctrl.params.angle_limit,
+                           g_triple_pid_ctrl.params.wheel_limit, g_triple_pid_ctrl.params.gyro_limit,
+                           g_triple_pid_ctrl.params.distance_limit);
+                }
             } else {
                 printf("Unknown limit target: %s\n", token);
-                printf("Usage: balance tpid limit <speed|angle|wheel|gyro> <value>\n");
+                printf("Usage: balance tpid limit <speed|angle|wheel|gyro|distance> <value>\n");
             }
         } else if (strcmp(token, "gain") == 0) {
             token = strtok(NULL, " \t\n\r");
@@ -5339,9 +5669,49 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("TPID_STATUS:PITCH_TGT=%.2f,WHL_TGT=%.2f,TORQUE=%.2f,WMODE=%d\n",
                    g_triple_pid_output.pitch_target, g_triple_pid_output.wheel_speed_target,
                    g_triple_pid_output.torque, g_triple_pid_ctrl.params.wheel_mode);
+            printf("Distance PID: kp=%.4f ki=%.4f kd=%.4f (limit=%.1f) [%s]\n",
+                   g_triple_pid_ctrl.params.distance_kp, g_triple_pid_ctrl.params.distance_ki,
+                   g_triple_pid_ctrl.params.distance_kd, g_triple_pid_ctrl.params.distance_limit,
+                   g_triple_pid_ctrl.params.distance_enable ? "启用" : "关闭");
+            printf("Distance zeropoint: %.3f, current: %.3f, error: %.3f\n",
+                   g_triple_pid_ctrl.distance_zeropoint, g_lqr_distance,
+                   g_triple_pid_output.distance_error);
+            printf("Distance control: %.4f\n", g_triple_pid_output.distance_control);
+        } else if (strcmp(token, "distance") == 0 || strcmp(token, "dist") == 0) {
+            // 设置位移环PID参数
+            float kp = g_triple_pid_ctrl.params.distance_kp;
+            float ki = g_triple_pid_ctrl.params.distance_ki;
+            float kd = g_triple_pid_ctrl.params.distance_kd;
+            token = strtok(NULL, " \t\n\r");
+            if (token) kp = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) ki = atof(token);
+            token = strtok(NULL, " \t\n\r");
+            if (token) kd = atof(token);
+            triple_pid_set_distance_gains(&g_triple_pid_ctrl, kp, ki, kd);
+            printf("Triple PID Distance set: kp=%.4f ki=%.4f kd=%.4f\n", kp, ki, kd);
+            printf("TPID:DIST,%.4f,%.4f,%.4f\n", kp, ki, kd);
+        } else if (strcmp(token, "disten") == 0) {
+            // 位移环使能/禁用
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                int en = atoi(token);
+                g_triple_pid_ctrl.params.distance_enable = (uint8_t)(en ? 1 : 0);
+                if (en) {
+                    // 启用时重置位移零点为当前位置，避免跳变
+                    triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_lqr_distance);
+                    g_distance_zeropoint = g_lqr_distance;
+                    pid_reset(&g_triple_pid_ctrl.pid_distance);
+                }
+                printf("Triple PID distance loop %s\n", en ? "ENABLED" : "DISABLED");
+                printf("TPID:DISTEN,%d\n", en ? 1 : 0);
+            } else {
+                printf("Distance loop: %s\n", g_triple_pid_ctrl.params.distance_enable ? "ENABLED" : "DISABLED");
+                printf("TPID:DISTEN,%d\n", g_triple_pid_ctrl.params.distance_enable);
+            }
         } else {
             printf("Unknown tpid command: %s\n", token);
-            printf("Usage: balance tpid [angle|speed|wheel|gyro|gain|wmode|zero|reset|status]\n");
+            printf("Usage: balance tpid [angle|speed|wheel|gyro|distance|disten|gain|wmode|zero|reset|status]\n");
         }
     }
     // ===== 轮速加权滑动平均滤波器 =====

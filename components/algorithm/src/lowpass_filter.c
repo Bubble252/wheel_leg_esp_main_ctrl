@@ -173,3 +173,78 @@ float wma_compute(weighted_ma_filter_t *wma, float x) {
     const float weight_sum = (float)(WMA_WINDOW_SIZE * (WMA_WINDOW_SIZE + 1)) / 2.0f;
     return weighted_sum / weight_sum;
 }
+
+// ============================================================================
+// 中值滤波器 (Median Filter)
+// 取窗口内中间值，对脉冲噪声 (编码器突跳) 有极好的抑制效果
+// ============================================================================
+
+void median_init(median_filter_t *mf, int window_size) {
+    if (mf == NULL) return;
+    // 限制窗口大小: 3~9, 必须奇数
+    if (window_size < 3) window_size = 3;
+    if (window_size > MEDIAN_FILTER_MAX_WINDOW) window_size = MEDIAN_FILTER_MAX_WINDOW;
+    if (window_size % 2 == 0) window_size++;  // 偶数→奇数
+    mf->window_size = window_size;
+    mf->head = 0;
+    mf->count = 0;
+    for (int i = 0; i < MEDIAN_FILTER_MAX_WINDOW; i++) {
+        mf->buf[i] = 0.0f;
+    }
+}
+
+void median_reset(median_filter_t *mf) {
+    if (mf == NULL) return;
+    mf->head = 0;
+    mf->count = 0;
+    for (int i = 0; i < MEDIAN_FILTER_MAX_WINDOW; i++) {
+        mf->buf[i] = 0.0f;
+    }
+}
+
+void median_set_window(median_filter_t *mf, int window_size) {
+    if (mf == NULL) return;
+    if (window_size < 3) window_size = 3;
+    if (window_size > MEDIAN_FILTER_MAX_WINDOW) window_size = MEDIAN_FILTER_MAX_WINDOW;
+    if (window_size % 2 == 0) window_size++;
+    mf->window_size = window_size;
+    // 重置缓冲区 (窗口大小变化后旧数据无意义)
+    mf->head = 0;
+    mf->count = 0;
+}
+
+float median_compute(median_filter_t *mf, float x) {
+    if (mf == NULL) return x;
+    
+    // 写入环形缓冲区
+    mf->buf[mf->head] = x;
+    mf->head = (mf->head + 1) % mf->window_size;
+    if (mf->count < mf->window_size) {
+        mf->count++;
+    }
+    
+    // 窗口未填满时直通
+    if (mf->count < mf->window_size) {
+        return x;
+    }
+    
+    // 复制窗口数据到临时数组进行排序
+    float tmp[MEDIAN_FILTER_MAX_WINDOW];
+    for (int i = 0; i < mf->window_size; i++) {
+        tmp[i] = mf->buf[i];
+    }
+    
+    // 简单插入排序 (窗口最大9，效率足够)
+    for (int i = 1; i < mf->window_size; i++) {
+        float key = tmp[i];
+        int j = i - 1;
+        while (j >= 0 && tmp[j] > key) {
+            tmp[j + 1] = tmp[j];
+            j--;
+        }
+        tmp[j + 1] = key;
+    }
+    
+    // 返回中间值
+    return tmp[mf->window_size / 2];
+}

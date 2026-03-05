@@ -826,10 +826,11 @@ bool single_pid_check_emergency(single_pid_controller_t *ctrl, float pitch);
 #define TRIPLE_PID_WHEEL_TORQUE 1   // 软件PID输出扭矩 (MODE_TORQUE)
 
 /**
- * @brief 三环PID参数结构体
+ * @brief 四环PID参数结构体
  * 
- * 控制架构 (固定 SPEED_FIRST):
- *   速度环(外): target_speed - wheel_speed → pitch_target
+ * 控制架构 (四环):
+ *   位移环(最外): distance_zeropoint - lqr_distance → speed_correction (kp=0时关闭)
+ *   速度环(外): (target_speed + speed_correction) - wheel_speed → pitch_target
  *   角度环(中): pitch_target - pitch → wheel_speed_target
  *   轮速环(内): wheel_speed_target → torque (软件PID) 或 speed_cmd (电机速度模式)
  * 
@@ -837,6 +838,7 @@ bool single_pid_check_emergency(single_pid_controller_t *ctrl, float pitch);
  * 第三环 (轮速环) 有两种工作方式:
  *   TRIPLE_PID_WHEEL_SPEED:  角度环输出+yaw → 直接作为速度命令发给电机 (MODE_SPEED)
  *   TRIPLE_PID_WHEEL_TORQUE: 角度环输出+yaw → 轮速PID → 扭矩命令 (MODE_TORQUE)
+ * 第四环 (位移环) kp=0 时自动关闭, 不影响原有三环行为
  */
 typedef struct {
     // ---- 前两环: 复用双环PID参数 (固定 SPEED_FIRST) ----
@@ -871,6 +873,13 @@ typedef struct {
     float gyro_kd;          // 角速度D (默认 0.0)
     float gyro_limit;       // 角速度环输出限幅 (默认 10.0)
     
+    // ---- 位移环 PID (最外环, enable=0 时关闭) ----
+    float distance_kp;      // 位移P (默认 0.0)
+    float distance_ki;      // 位移I (默认 0.0)
+    float distance_kd;      // 位移D (默认 0.0)
+    float distance_limit;   // 位移环输出限幅 (max speed correction, rad/s)
+    uint8_t distance_enable; // 位移环使能 (0=关闭, 1=开启, 默认0)
+    
     // ---- 轮速环工作模式 ----
     uint8_t wheel_mode;     // TRIPLE_PID_WHEEL_SPEED(0) 或 TRIPLE_PID_WHEEL_TORQUE(1)
 } triple_pid_params_t;
@@ -879,6 +888,13 @@ typedef struct {
  * @brief 三环PID控制器输出结构体
  */
 typedef struct {
+    // 位移环 (最外环)
+    float distance_error;   // 位移误差
+    float distance_control; // 位移环输出: 速度修正量
+    float distance_p_out;
+    float distance_i_out;
+    float distance_d_out;
+    
     // 速度环 (外环)
     float speed_error;      // 速度误差
     float pitch_target;     // 速度环输出: 目标倾角
@@ -917,7 +933,10 @@ typedef struct {
     pid_controller_t pid_speed;     // 速度环 (外环)
     pid_controller_t pid_wheel;     // 轮速环 (内环, 仅 WHEEL_TORQUE 模式)
     pid_controller_t pid_gyro;      // 角速度阻尼环 (叠加到角度环输出)
+    pid_controller_t pid_distance;  // 位移环 (最外环)
     lowpass_filter_t lpf_joyy;      // 遥杆目标速度低通滤波
+    
+    float distance_zeropoint;       // 位移零点 (目标位置)
     
     triple_pid_params_t params;
     
@@ -945,6 +964,12 @@ void triple_pid_set_wheel_gains(triple_pid_controller_t *ctrl, float kp, float k
 /** @brief 设置角速度阻尼环PID增益 */
 void triple_pid_set_gyro_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd);
 
+/** @brief 设置位移环PID增益 */
+void triple_pid_set_distance_gains(triple_pid_controller_t *ctrl, float kp, float ki, float kd);
+
+/** @brief 设置位移零点 (目标位置) */
+void triple_pid_set_distance_zeropoint(triple_pid_controller_t *ctrl, float zeropoint);
+
 /** @brief 设置角度零点 */
 void triple_pid_set_angle_zeropoint(triple_pid_controller_t *ctrl, float zeropoint);
 
@@ -955,18 +980,20 @@ void triple_pid_set_wheel_mode(triple_pid_controller_t *ctrl, uint8_t wheel_mode
 bool triple_pid_check_emergency(triple_pid_controller_t *ctrl, float pitch);
 
 /**
- * @brief 三环PID平衡控制循环
+ * @brief 四环PID平衡控制循环
  * @param ctrl 控制器实例
  * @param pitch 当前俯仰角 (度)
  * @param pitch_rate 当前俯仰角速度 (度/秒)
  * @param wheel_speed 当前轮子速度 (rad/s)
  * @param target_speed 目标速度 (rad/s), 来自遥杆
+ * @param lqr_distance 当前累积位移
  * @param dt 时间步长 (秒)
  * @param output 控制输出
  * @return ESP_OK 成功
  * 
- * @note 控制流程 (固定 SPEED_FIRST):
- *   1. 速度环(外): target_speed - wheel_speed → pitch_target
+ * @note 控制流程 (四环):
+ *   0. 位移环(最外): distance_zeropoint - lqr_distance → speed_correction (kp=0时关闭)
+ *   1. 速度环(外): (target_speed + speed_correction) - wheel_speed → pitch_target
  *   2. 角度环(中): pitch_target - pitch → wheel_speed_target
  *   3. 轮速环(内): 
  *      WHEEL_SPEED 模式: 直接输出 wheel_speed_target (送电机速度模式)
@@ -975,6 +1002,7 @@ bool triple_pid_check_emergency(triple_pid_controller_t *ctrl, float pitch);
 esp_err_t triple_pid_balance_loop(triple_pid_controller_t *ctrl,
                                    float pitch, float pitch_rate,
                                    float wheel_speed, float target_speed,
+                                   float lqr_distance,
                                    float dt,
                                    triple_pid_output_t *output);
 
