@@ -669,6 +669,11 @@ float can_motor_read_voltage(can_motor_handle_t motor) {
     return motor ? motor->state.voltage : 0.0f;
 }
 
+esp_err_t can_motor_request_voltage(can_motor_handle_t motor) {
+    if (motor == NULL) return ESP_ERR_INVALID_ARG;
+    return read_reg_1_request(motor, REG_VOLTAGE);
+}
+
 uint32_t can_motor_read_error(can_motor_handle_t motor) {
     return motor ? motor->state.error_code : 0;
 }

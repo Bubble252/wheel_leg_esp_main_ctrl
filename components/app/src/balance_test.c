@@ -404,6 +404,9 @@ static vmc_dual_output_t g_vmc_dual_output = {0};  // 双腿 VMC 输出 (包含�
 static bool g_vmc_input_valid = false;             // VMC 输入是否有效
 static bool g_vmc_stream_enable = false;           // VMC 数据流输出使能 (用于 UI 调试)
 static bool g_joint_stream_enable = false;         // 关节电机数据流使能 (角度/速度/电流)
+static bool g_mpow_stream_enable = false;          // 电机功率数据流使能 (电压/电流)
+static uint8_t g_mpow_volt_poll_idx = 0;           // 电压轮询索引 (0-5, 轮流请求6个电机)
+static uint8_t g_mpow_volt_poll_div = 0;            // 电压轮询分频计数器
 
 // ============================================================================
 // 关节电机速度滤波 (支持中值滤波 / 限幅滤波切换)
@@ -883,6 +886,40 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
                g_motor_right_knee ? can_motor_read_current(g_motor_right_knee)  : 0.0f,
                g_joint_rk_spd_filtered);
     }
+    
+    // 电机功率数据流 (独立使能, 复用 plot 分频)
+    // 格式: #MPOW,LH_cur,LK_cur,LW_cur,RH_cur,RK_cur,RW_cur,LH_vol,LK_vol,LW_vol,RH_vol,RK_vol,RW_vol
+    if (g_mpow_stream_enable) {
+        // --- 低频电压轮询: 每 25 次 plot 周期请求 1 个电机的电压 (约 2Hz, 6个电机一轮 3 秒) ---
+        g_mpow_volt_poll_div++;
+        if (g_mpow_volt_poll_div >= 25) {
+            g_mpow_volt_poll_div = 0;
+            can_motor_handle_t motors[6] = {
+                g_motor_left_hip, g_motor_left_knee, g_motor_left,
+                g_motor_right_hip, g_motor_right_knee, g_motor_right
+            };
+            if (motors[g_mpow_volt_poll_idx]) {
+                can_motor_request_voltage(motors[g_mpow_volt_poll_idx]);
+            }
+            g_mpow_volt_poll_idx = (g_mpow_volt_poll_idx + 1) % 6;
+        }
+
+        float lh_cur = g_motor_left_hip   ? can_motor_read_current(g_motor_left_hip)   : 0.0f;
+        float lk_cur = g_motor_left_knee  ? can_motor_read_current(g_motor_left_knee)  : 0.0f;
+        float lw_cur = g_motor_left       ? can_motor_read_current(g_motor_left)       : 0.0f;
+        float rh_cur = g_motor_right_hip  ? can_motor_read_current(g_motor_right_hip)  : 0.0f;
+        float rk_cur = g_motor_right_knee ? can_motor_read_current(g_motor_right_knee) : 0.0f;
+        float rw_cur = g_motor_right      ? can_motor_read_current(g_motor_right)      : 0.0f;
+        float lh_vol = g_motor_left_hip   ? can_motor_read_voltage(g_motor_left_hip)   : 0.0f;
+        float lk_vol = g_motor_left_knee  ? can_motor_read_voltage(g_motor_left_knee)  : 0.0f;
+        float lw_vol = g_motor_left       ? can_motor_read_voltage(g_motor_left)       : 0.0f;
+        float rh_vol = g_motor_right_hip  ? can_motor_read_voltage(g_motor_right_hip)  : 0.0f;
+        float rk_vol = g_motor_right_knee ? can_motor_read_voltage(g_motor_right_knee) : 0.0f;
+        float rw_vol = g_motor_right      ? can_motor_read_voltage(g_motor_right)      : 0.0f;
+        printf("#MPOW,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+               lh_cur, lk_cur, lw_cur, rh_cur, rk_cur, rw_cur,
+               lh_vol, lk_vol, lw_vol, rh_vol, rk_vol, rw_vol);
+    }
 }
 
 /**
@@ -1323,9 +1360,51 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
             g_vmc_input_valid = true;
             
             // VMC 数据流输出 (用于 UI 调试)
-            // 格式: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync
+            // 格式: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync,L_aFL,L_aFa,R_aFL,R_aFa
+            // 后4个字段: 从电机电流反解的实际 F_L 和 F_alpha (通过 J^{-T} × τ_actual)
             if (g_vmc_stream_enable) {
-                printf("#VMC,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f\n",
+                // 从电机电流反解实际扭矩 (1A = 0.25Nm)
+                float l_hip_actual_Nm  = left_valid  ? vmc_current_to_torque(can_motor_read_current(g_motor_left_hip))  : 0;
+                float l_knee_actual_Nm = left_valid  ? vmc_current_to_torque(can_motor_read_current(g_motor_left_knee)) : 0;
+                float r_hip_actual_Nm  = right_valid ? vmc_current_to_torque(can_motor_read_current(g_motor_right_hip))  : 0;
+                float r_knee_actual_Nm = right_valid ? vmc_current_to_torque(can_motor_read_current(g_motor_right_knee)) : 0;
+                
+                // 右腿扭矩方向修正 (与 vmc_ctrl_compute 中的取反对应)
+                r_hip_actual_Nm  = -r_hip_actual_Nm;
+                r_knee_actual_Nm = -r_knee_actual_Nm;
+                
+                // 通过雅可比逆矩阵反解虚拟力: [F_L; F_α] = (J^T)^{-1} × [τ_hip; τ_knee]
+                // J^{-T} = (1/det) × [J[3], -J[2]; -J[1], J[0]]
+                // det(J) = J[0]*J[3] - J[1]*J[2]
+                float l_actual_FL = 0, l_actual_Fa = 0;
+                float r_actual_FL = 0, r_actual_Fa = 0;
+                
+                if (left_valid) {
+                    leg_joint_state_t lj = { .hip_angle = can_motor_read_position(g_motor_left_hip),
+                                             .knee_angle = can_motor_read_position(g_motor_left_knee) };
+                    float J[4];
+                    leg_kin_jacobian(&lj, true, NULL, J);
+                    float det = J[0] * J[3] - J[1] * J[2];
+                    if (fabsf(det) > 1e-6f) {
+                        float inv_det = 1.0f / det;
+                        l_actual_FL = inv_det * ( J[3] * l_hip_actual_Nm - J[2] * l_knee_actual_Nm);
+                        l_actual_Fa = inv_det * (-J[1] * l_hip_actual_Nm + J[0] * l_knee_actual_Nm);
+                    }
+                }
+                if (right_valid) {
+                    leg_joint_state_t rj = { .hip_angle = can_motor_read_position(g_motor_right_hip),
+                                             .knee_angle = can_motor_read_position(g_motor_right_knee) };
+                    float J[4];
+                    leg_kin_jacobian(&rj, false, NULL, J);
+                    float det = J[0] * J[3] - J[1] * J[2];
+                    if (fabsf(det) > 1e-6f) {
+                        float inv_det = 1.0f / det;
+                        r_actual_FL = inv_det * ( J[3] * r_hip_actual_Nm - J[2] * r_knee_actual_Nm);
+                        r_actual_Fa = inv_det * (-J[1] * r_hip_actual_Nm + J[0] * r_knee_actual_Nm);
+                    }
+                }
+                
+                printf("#VMC,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f,%.3f\n",
                        g_vmc_dual_output.left.current_leg_length,
                        g_vmc_dual_output.left.current_body_angle,
                        g_vmc_dual_output.left.debug.F_L,
@@ -1339,7 +1418,9 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                        g_vmc_dual_output.right.hip_torque,
                        g_vmc_dual_output.right.knee_torque,
                        g_vmc_dual_output.angle_diff_deg,
-                       g_vmc_dual_output.F_sync);
+                       g_vmc_dual_output.F_sync,
+                       l_actual_FL, l_actual_Fa,
+                       r_actual_FL, r_actual_Fa);
             }
         }
     }
@@ -1359,17 +1440,18 @@ static void apply_leg_motor_commands(void) {
     
     if (g_vmc_enabled && g_vmc_input_valid) {
         // ===== VMC 力控模式: 发送已计算好的扭矩 =====
+        // VMC 输出为期望实际 Nm, 通过非线性补偿反解为电机命令 Nm 后发送
         if (g_motor_left_hip) {
-            can_motor_set_torque(g_motor_left_hip, g_vmc_dual_output.left.hip_torque);
+            can_motor_set_torque(g_motor_left_hip, vmc_torque_compensate(g_vmc_dual_output.left.hip_torque));
         }
         if (g_motor_left_knee) {
-            can_motor_set_torque(g_motor_left_knee, g_vmc_dual_output.left.knee_torque);
+            can_motor_set_torque(g_motor_left_knee, vmc_torque_compensate(g_vmc_dual_output.left.knee_torque));
         }
         if (g_motor_right_hip) {
-            can_motor_set_torque(g_motor_right_hip, g_vmc_dual_output.right.hip_torque);
+            can_motor_set_torque(g_motor_right_hip, vmc_torque_compensate(g_vmc_dual_output.right.hip_torque));
         }
         if (g_motor_right_knee) {
-            can_motor_set_torque(g_motor_right_knee, g_vmc_dual_output.right.knee_torque);
+            can_motor_set_torque(g_motor_right_knee, vmc_torque_compensate(g_vmc_dual_output.right.knee_torque));
         }
     } else if (!g_vmc_enabled) {
         // ===== 位置控制模式 =====
@@ -4781,6 +4863,23 @@ void balance_test_process_cmd(const char *cmd_str) {
         } else {
             printf("Unknown joint command: %s\n", token);
             printf("Usage: balance joint [on|off|stream|filter|mode|rate|window]\n");
+        }
+    }
+    // ===== 电机功率数据流 =====
+    else if (strcmp(token, "mpow") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("Motor power stream: %s\n", g_mpow_stream_enable ? "ENABLED" : "DISABLED");
+            printf("Format: #MPOW,LH_cur,LK_cur,LW_cur,RH_cur,RK_cur,RW_cur,LH_vol,LK_vol,LW_vol,RH_vol,RK_vol,RW_vol\n");
+            printf("Usage: balance mpow [on|off]\n");
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+            g_mpow_stream_enable = true;
+            printf("Motor power stream ENABLED\n");
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+            g_mpow_stream_enable = false;
+            printf("Motor power stream DISABLED\n");
+        } else {
+            printf("Usage: balance mpow [on|off]\n");
         }
     }
     // ===== 树莓派通信开关 =====

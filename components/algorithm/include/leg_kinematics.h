@@ -494,6 +494,32 @@ esp_err_t vmc_compute_torque(const vmc_params_t *params,
 void vmc_get_default_params(vmc_params_t *params);
 
 /**
+ * @brief 扭矩补偿: 将期望实际扭矩(Nm)反解为需要发送的电机命令扭矩(Nm)
+ * 
+ * 电机实测非线性特性 (命令扭矩 x → 实际扭矩 y, 单位均为 Nm):
+ *   y = 1.7485 * x^2 + 0.0085 * x - 0.0002
+ * 
+ * @param desired_torque_Nm 期望的实际输出扭矩 (Nm), 可正可负
+ * @return 需要发送给电机的命令扭矩 (Nm)
+ */
+float vmc_torque_compensate(float desired_torque_Nm);
+
+/**
+ * @brief 扭矩正解: 命令扭矩 → 实际扭矩 (用于显示/调试)
+ * @param cmd_torque_Nm 命令扭矩 (Nm)
+ * @return 预测的实际输出扭矩 (Nm)
+ */
+float vmc_torque_forward(float cmd_torque_Nm);
+
+/**
+ * @brief 从电机电流反解实际扭矩 (Nm)
+ * @note 1A 电流 ≈ 0.25 Nm 扭矩
+ * @param current_A 电机反馈电流 (A)
+ * @return 实际扭矩 (Nm)
+ */
+float vmc_current_to_torque(float current_A);
+
+/**
  * @brief 打印腿部参数信息
  * @param params 参数 (NULL 打印默认参数)
  * @param is_left 是否为左腿
@@ -510,8 +536,8 @@ void leg_kin_print_params(const leg_kin_params_t *params, bool is_left);
 typedef struct {
     float hip_angle;        // 髋关节电机角度 (度)
     float knee_angle;       // 膝关节电机角度 (度)
-    float hip_velocity;     // 髋关节电机速度 (rpm)
-    float knee_velocity;    // 膝关节电机速度 (rpm)
+    float hip_velocity;     // 髋关节电机速度 (°/s)
+    float knee_velocity;    // 膝关节电机速度 (°/s)
 } vmc_leg_sensor_t;
 
 /**

@@ -423,6 +423,66 @@ static inline float clamp_f(float value, float min_val, float max_val) {
     return value;
 }
 
+// ============================================================================
+// 电机扭矩补偿 (非线性正解)
+// ============================================================================
+
+/**
+ * @brief 扭矩补偿: 将期望实际扭矩(Nm)反解为需要发送的电机命令扭矩(Nm)
+ * 
+ * 使用拟合的三次多项式直接从期望扭矩(y)计算命令扭矩(x):
+ *   x = 6.4068 * y^3 - 5.8745 * y^2 + 2.3684 * y + 0.0529
+ * 
+ * 比之前的二次方程求根法更快 (无 sqrtf，仅乘加运算)。
+ * 
+ * @param desired_torque_Nm 期望的实际输出扭矩 (Nm), 可正可负
+ * @return 需要发送给电机的命令扭矩 (Nm)
+ */
+float vmc_torque_compensate(float desired_torque_Nm) {
+    // 处理接近零的情况
+    if (fabsf(desired_torque_Nm) < 0.001f) {
+        return 0.0f;
+    }
+    
+    // 取绝对值计算，保持关于原点中心对称
+    float y = fabsf(desired_torque_Nm);
+    
+    // 三次多项式: x = a3*y^3 + a2*y^2 + a1*y + a0
+    // Horner 形式: x = ((a3*y + a2)*y + a1)*y + a0
+    float cmd_Nm = ((6.4068f * y - 5.8745f) * y + 2.3684f) * y + 0.0529f;
+    if (cmd_Nm < 0.0f) cmd_Nm = 0.0f;
+    
+    return (desired_torque_Nm >= 0) ? cmd_Nm : -cmd_Nm;
+}
+
+/**
+ * @brief 扭矩正解: 命令扭矩 → 实际扭矩 (用于显示/调试)
+ * 
+ * 逆多项式的正解: 给定命令扭矩 x, 计算实际扭矩 y
+ * y = 1.7485 * x^2 + 0.0085 * x - 0.0002
+ * 
+ * @param cmd_torque_Nm 命令扭矩 (Nm)
+ * @return 预测的实际输出扭矩 (Nm)
+ */
+float vmc_torque_forward(float cmd_torque_Nm) {
+    float x = fabsf(cmd_torque_Nm);
+    float y = 1.7485f * x * x + 0.0085f * x - 0.0002f;
+    if (y < 0.0f) y = 0.0f;
+    return (cmd_torque_Nm >= 0) ? y : -y;
+}
+
+/**
+ * @brief 从电机电流反解实际扭矩 (Nm)
+ * 
+ * 1A 电流 ≈ 0.25 Nm 扭矩
+ * 
+ * @param current_A 电机反馈电流 (A)
+ * @return 实际扭矩 (Nm)
+ */
+float vmc_current_to_torque(float current_A) {
+    return current_A * 0.25f;
+}
+
 /**
  * @brief 获取默认 VMC 参数
  */
@@ -685,10 +745,9 @@ static esp_err_t vmc_compute_torque_body(const vmc_params_t *params,
     
     // 重力补偿 (沿腿方向的分量)
     // 重力 mg 垂直向下，沿腿方向的分量 = -mg × cos(pitch + α + 90°)
-    // 当机身水平 (pitch=0) 且腿垂直 (α=0) 时，全部重力沿腿方向
-    //float total_angle = pitch_rad + input->current_alpha + (M_PI / 2.0f);//沿着竖直方向
-    
-    float total_angle = DEG2RAD(input->current_alpha) + (M_PI / 2.0f);
+    // 当机身水平 (pitch=0) 且腿垂直 (α=-π/2) 时，全部重力沿腿方向
+    // 注: input->current_alpha 已经是 rad (由上层 DEG2RAD(workspace.body_angle) 转换)
+    float total_angle = input->current_alpha + (M_PI / 2.0f);
     float F_gravity = params->gravity_comp * params->robot_mass * 9.81f * cosf(total_angle + pitch_rad);
     float F_L = F_spring_damper + F_gravity;  // 伸展力 (支撑重力)
     
@@ -846,9 +905,10 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
         // 注: current_vy 留 0, 世界坐标系模式下精度会降低
     } else {
         // === 雅可比方法 (默认): 需要电机速度反馈 ===
-        const float rpm_to_rad_s = M_PI / 30.0f;
-        float hip_vel_rad = input->sensor.hip_velocity * rpm_to_rad_s;
-        float knee_vel_rad = input->sensor.knee_velocity * rpm_to_rad_s;
+        // 关节速度单位: °/s → rad/s
+        const float deg_to_rad = M_PI / 180.0f;
+        float hip_vel_rad = input->sensor.hip_velocity * deg_to_rad;
+        float knee_vel_rad = input->sensor.knee_velocity * deg_to_rad;
         
         float J_body[4];
         leg_kin_jacobian(&joint, is_left, NULL, J_body);

@@ -6390,6 +6390,99 @@ class VMCDebugPanel(QWidget):
         monitor_group.setLayout(monitor_layout)
         layout.addWidget(monitor_group)
         
+        # ========== VMC 波形显示 (4个波形: 左右 F_α, 左右 F_L) ==========
+        waveform_group = QGroupBox("📊 VMC 虚拟力波形 (期望 vs 实际)")
+        waveform_layout = QVBoxLayout()
+        
+        # 波形数据缓冲区
+        self.vmc_wave_max_points = 500
+        self.vmc_wave_data = {
+            'left_F_alpha': [], 'right_F_alpha': [],
+            'left_F_L': [], 'right_F_L': [],
+            'left_actual_F_alpha': [], 'right_actual_F_alpha': [],
+            'left_actual_F_L': [], 'right_actual_F_L': [],
+            'time': []
+        }
+        self.vmc_wave_counter = 0
+        
+        # 波形网格: 2行2列
+        wave_grid = QGridLayout()
+        
+        # --- 左腿 F_α 波形 ---
+        self.pw_left_fa = pg.PlotWidget()
+        self.pw_left_fa.setBackground('#1a1a2e')
+        self.pw_left_fa.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_left_fa.setTitle('左腿 F_α (角度力矩)', color='w', size='10pt')
+        self.pw_left_fa.setLabel('left', 'Nm')
+        self.pw_left_fa.setLabel('bottom', '采样点')
+        self.pw_left_fa.setMinimumHeight(150)
+        self.pw_left_fa.addLegend(offset=(60, 5))
+        self.curve_left_fa = self.pw_left_fa.plot(pen=pg.mkPen(color='#4fc3f7', width=2), name='期望')
+        self.curve_left_fa_actual = self.pw_left_fa.plot(pen=pg.mkPen(color='#ff9800', width=2, style=Qt.DashLine), name='实际')
+        wave_grid.addWidget(self.pw_left_fa, 0, 0)
+        
+        # --- 右腿 F_α 波形 ---
+        self.pw_right_fa = pg.PlotWidget()
+        self.pw_right_fa.setBackground('#1a1a2e')
+        self.pw_right_fa.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_right_fa.setTitle('右腿 F_α (角度力矩)', color='w', size='10pt')
+        self.pw_right_fa.setLabel('left', 'Nm')
+        self.pw_right_fa.setLabel('bottom', '采样点')
+        self.pw_right_fa.setMinimumHeight(150)
+        self.pw_right_fa.addLegend(offset=(60, 5))
+        self.curve_right_fa = self.pw_right_fa.plot(pen=pg.mkPen(color='#ef5350', width=2), name='期望')
+        self.curve_right_fa_actual = self.pw_right_fa.plot(pen=pg.mkPen(color='#ff9800', width=2, style=Qt.DashLine), name='实际')
+        wave_grid.addWidget(self.pw_right_fa, 0, 1)
+        
+        # --- 左腿 F_L 波形 (足端支持力) ---
+        self.pw_left_fl = pg.PlotWidget()
+        self.pw_left_fl.setBackground('#1a1a2e')
+        self.pw_left_fl.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_left_fl.setTitle('左腿 F_L (足端支持力)', color='w', size='10pt')
+        self.pw_left_fl.setLabel('left', 'N')
+        self.pw_left_fl.setLabel('bottom', '采样点')
+        self.pw_left_fl.setMinimumHeight(150)
+        self.pw_left_fl.addLegend(offset=(60, 5))
+        self.curve_left_fl = self.pw_left_fl.plot(pen=pg.mkPen(color='#4fc3f7', width=2), name='期望')
+        self.curve_left_fl_actual = self.pw_left_fl.plot(pen=pg.mkPen(color='#ff9800', width=2, style=Qt.DashLine), name='实际')
+        wave_grid.addWidget(self.pw_left_fl, 1, 0)
+        
+        # --- 右腿 F_L 波形 (足端支持力) ---
+        self.pw_right_fl = pg.PlotWidget()
+        self.pw_right_fl.setBackground('#1a1a2e')
+        self.pw_right_fl.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_right_fl.setTitle('右腿 F_L (足端支持力)', color='w', size='10pt')
+        self.pw_right_fl.setLabel('left', 'N')
+        self.pw_right_fl.setLabel('bottom', '采样点')
+        self.pw_right_fl.setMinimumHeight(150)
+        self.pw_right_fl.addLegend(offset=(60, 5))
+        self.curve_right_fl = self.pw_right_fl.plot(pen=pg.mkPen(color='#ef5350', width=2), name='期望')
+        self.curve_right_fl_actual = self.pw_right_fl.plot(pen=pg.mkPen(color='#ff9800', width=2, style=Qt.DashLine), name='实际')
+        wave_grid.addWidget(self.pw_right_fl, 1, 1)
+        
+        waveform_layout.addLayout(wave_grid)
+        
+        # 波形控制栏
+        wave_ctrl_layout = QHBoxLayout()
+        
+        self.wave_clear_btn = QPushButton("🗑️ 清空波形")
+        self.wave_clear_btn.clicked.connect(self._clear_vmc_waveforms)
+        wave_ctrl_layout.addWidget(self.wave_clear_btn)
+        
+        wave_ctrl_layout.addWidget(QLabel("缓冲点数:"))
+        self.wave_points_input = QSpinBox()
+        self.wave_points_input.setRange(100, 5000)
+        self.wave_points_input.setSingleStep(100)
+        self.wave_points_input.setValue(500)
+        self.wave_points_input.valueChanged.connect(lambda v: setattr(self, 'vmc_wave_max_points', v))
+        wave_ctrl_layout.addWidget(self.wave_points_input)
+        
+        wave_ctrl_layout.addStretch()
+        waveform_layout.addLayout(wave_ctrl_layout)
+        
+        waveform_group.setLayout(waveform_layout)
+        layout.addWidget(waveform_group)
+        
         layout.addStretch()
     
     def send_cmd(self, cmd):
@@ -6476,6 +6569,235 @@ class VMCDebugPanel(QWidget):
                 data.get('angle_diff', 0),
                 data.get('f_sync', 0)
             )
+        
+        # 更新波形数据
+        self.vmc_wave_counter += 1
+        self.vmc_wave_data['time'].append(self.vmc_wave_counter)
+        self.vmc_wave_data['left_F_alpha'].append(data.get('left_F_alpha', 0.0))
+        self.vmc_wave_data['right_F_alpha'].append(data.get('right_F_alpha', 0.0))
+        self.vmc_wave_data['left_F_L'].append(data.get('left_F_L', 0.0))
+        self.vmc_wave_data['right_F_L'].append(data.get('right_F_L', 0.0))
+        self.vmc_wave_data['left_actual_F_alpha'].append(data.get('left_actual_F_alpha', 0.0))
+        self.vmc_wave_data['right_actual_F_alpha'].append(data.get('right_actual_F_alpha', 0.0))
+        self.vmc_wave_data['left_actual_F_L'].append(data.get('left_actual_F_L', 0.0))
+        self.vmc_wave_data['right_actual_F_L'].append(data.get('right_actual_F_L', 0.0))
+        
+        # 限制缓冲区大小
+        max_pts = self.vmc_wave_max_points
+        for key in self.vmc_wave_data:
+            if len(self.vmc_wave_data[key]) > max_pts:
+                self.vmc_wave_data[key] = self.vmc_wave_data[key][-max_pts:]
+        
+        # 刷新波形曲线 (期望 + 实际)
+        t = self.vmc_wave_data['time']
+        self.curve_left_fa.setData(t, self.vmc_wave_data['left_F_alpha'])
+        self.curve_left_fa_actual.setData(t, self.vmc_wave_data['left_actual_F_alpha'])
+        self.curve_right_fa.setData(t, self.vmc_wave_data['right_F_alpha'])
+        self.curve_right_fa_actual.setData(t, self.vmc_wave_data['right_actual_F_alpha'])
+        self.curve_left_fl.setData(t, self.vmc_wave_data['left_F_L'])
+        self.curve_left_fl_actual.setData(t, self.vmc_wave_data['left_actual_F_L'])
+        self.curve_right_fl.setData(t, self.vmc_wave_data['right_F_L'])
+        self.curve_right_fl_actual.setData(t, self.vmc_wave_data['right_actual_F_L'])
+    
+    def _clear_vmc_waveforms(self):
+        """清空 VMC 波形数据"""
+        self.vmc_wave_counter = 0
+        for key in self.vmc_wave_data:
+            self.vmc_wave_data[key] = []
+        self.curve_left_fa.setData([], [])
+        self.curve_left_fa_actual.setData([], [])
+        self.curve_right_fa.setData([], [])
+        self.curve_right_fa_actual.setData([], [])
+        self.curve_left_fl.setData([], [])
+        self.curve_left_fl_actual.setData([], [])
+        self.curve_right_fl.setData([], [])
+        self.curve_right_fl_actual.setData([], [])
+
+
+# ============================================================================
+# 电机功率监控面板
+# ============================================================================
+class MotorPowerPanel(QWidget):
+    """电机功率监控面板 - 显示6个电机的电压/电流, 总电流波形和平均电压"""
+    
+    MOTOR_NAMES = ['左髋', '左膝', '左轮', '右髋', '右膝', '右轮']
+    MOTOR_KEYS = ['lh', 'lk', 'lw', 'rh', 'rk', 'rw']
+    MOTOR_COLORS = ['#4fc3f7', '#81c784', '#ffb74d', '#ef5350', '#ce93d8', '#fff176']
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.mpow_wave_max_points = 500
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # ========== 数据流开关 ==========
+        ctrl_group = QGroupBox("⚡ 电机功率监控")
+        ctrl_layout = QHBoxLayout()
+        
+        self.stream_on_btn = QPushButton("📈 开启数据流")
+        self.stream_on_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 10px 15px; font-size: 14px;"))
+        self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance mpow on"))
+        ctrl_layout.addWidget(self.stream_on_btn)
+        
+        self.stream_off_btn = QPushButton("⏹️ 关闭数据流")
+        self.stream_off_btn.setStyleSheet(SS("padding: 10px 15px; font-size: 14px;"))
+        self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance mpow off"))
+        ctrl_layout.addWidget(self.stream_off_btn)
+        
+        ctrl_layout.addStretch()
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+        
+        # ========== 电压数字显示 (7个: 平均 + 6个电机) ==========
+        volt_group = QGroupBox("🔋 电压 (V)")
+        volt_layout = QGridLayout()
+        
+        # 平均电压 (大字体, 高亮)
+        volt_layout.addWidget(QLabel("平均电压:"), 0, 0)
+        self.avg_volt_label = QLabel("-- V")
+        self.avg_volt_label.setStyleSheet(SS("font-size: 22px; font-weight: bold; color: #ffd740; padding: 4px;"))
+        volt_layout.addWidget(self.avg_volt_label, 0, 1)
+        
+        # 6个电机电压
+        self.volt_labels = {}
+        for i, (name, key) in enumerate(zip(self.MOTOR_NAMES, self.MOTOR_KEYS)):
+            col_base = (i % 3) * 2 + 2
+            row = i // 3
+            lbl = QLabel(f"{name}:")
+            lbl.setStyleSheet(SS(f"color: {self.MOTOR_COLORS[i]};"))
+            volt_layout.addWidget(lbl, row, col_base)
+            val = QLabel("-- V")
+            val.setStyleSheet(SS(f"font-size: 14px; font-weight: bold; color: {self.MOTOR_COLORS[i]};"))
+            volt_layout.addWidget(val, row, col_base + 1)
+            self.volt_labels[key] = val
+        
+        volt_group.setLayout(volt_layout)
+        layout.addWidget(volt_group)
+        
+        # ========== 总电流数字显示 ==========
+        total_group = QGroupBox("⚡ 总电流")
+        total_layout = QHBoxLayout()
+        total_layout.addWidget(QLabel("电流之和:"))
+        self.total_cur_label = QLabel("-- A")
+        self.total_cur_label.setStyleSheet(SS("font-size: 22px; font-weight: bold; color: #ff5252; padding: 4px;"))
+        total_layout.addWidget(self.total_cur_label)
+        total_layout.addStretch()
+        total_group.setLayout(total_layout)
+        layout.addWidget(total_group)
+        
+        # ========== 电流波形区域 (7个: 总电流 + 6个电机) ==========
+        wave_group = QGroupBox("📊 电流波形 (A)")
+        wave_layout = QVBoxLayout()
+        
+        # 初始化波形数据
+        self.mpow_wave_data = {k: [] for k in self.MOTOR_KEYS}
+        self.mpow_wave_data['total'] = []
+        self.mpow_wave_data['time'] = []
+        self.mpow_wave_counter = 0
+        
+        # 总电流波形 (单独一行, 突出显示)
+        self.pw_total_cur = pg.PlotWidget()
+        self.pw_total_cur.setBackground('#1a1a2e')
+        self.pw_total_cur.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_total_cur.setTitle('总电流 (6电机之和)', color='w', size='10pt')
+        self.pw_total_cur.setLabel('left', 'A')
+        self.pw_total_cur.setLabel('bottom', '采样点')
+        self.pw_total_cur.setMinimumHeight(130)
+        self.curve_total = self.pw_total_cur.plot(pen=pg.mkPen(color='#ff5252', width=2))
+        wave_layout.addWidget(self.pw_total_cur)
+        
+        # 6个电机电流波形 (2行3列网格)
+        motor_grid = QGridLayout()
+        self.pw_motors = {}
+        self.curve_motors = {}
+        for i, (name, key, color) in enumerate(zip(self.MOTOR_NAMES, self.MOTOR_KEYS, self.MOTOR_COLORS)):
+            pw = pg.PlotWidget()
+            pw.setBackground('#1a1a2e')
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setTitle(f'{name} 电流', color='w', size='9pt')
+            pw.setLabel('left', 'A')
+            pw.setMinimumHeight(110)
+            curve = pw.plot(pen=pg.mkPen(color=color, width=2))
+            motor_grid.addWidget(pw, i // 3, i % 3)
+            self.pw_motors[key] = pw
+            self.curve_motors[key] = curve
+        
+        wave_layout.addLayout(motor_grid)
+        
+        # 波形控制栏
+        wave_ctrl = QHBoxLayout()
+        self.wave_clear_btn = QPushButton("🗑️ 清空波形")
+        self.wave_clear_btn.clicked.connect(self._clear_waveforms)
+        wave_ctrl.addWidget(self.wave_clear_btn)
+        
+        wave_ctrl.addWidget(QLabel("缓冲点数:"))
+        self.wave_points_input = QSpinBox()
+        self.wave_points_input.setRange(100, 5000)
+        self.wave_points_input.setSingleStep(100)
+        self.wave_points_input.setValue(500)
+        self.wave_points_input.valueChanged.connect(lambda v: setattr(self, 'mpow_wave_max_points', v))
+        wave_ctrl.addWidget(self.wave_points_input)
+        
+        wave_ctrl.addStretch()
+        wave_layout.addLayout(wave_ctrl)
+        
+        wave_group.setLayout(wave_layout)
+        layout.addWidget(wave_group)
+        
+        layout.addStretch()
+    
+    def send_cmd(self, cmd):
+        if self.parent_window:
+            self.parent_window.send_command(cmd)
+    
+    def update_mpow_data(self, currents, voltages):
+        """更新电机功率数据
+        
+        Args:
+            currents: list of 6 floats [LH, LK, LW, RH, RK, RW] in A
+            voltages: list of 6 floats [LH, LK, LW, RH, RK, RW] in V
+        """
+        # 更新电压数字
+        valid_volts = [v for v in voltages if v > 0.1]
+        avg_volt = sum(valid_volts) / len(valid_volts) if valid_volts else 0.0
+        self.avg_volt_label.setText(f"{avg_volt:.2f} V")
+        
+        for i, key in enumerate(self.MOTOR_KEYS):
+            self.volt_labels[key].setText(f"{voltages[i]:.2f} V")
+        
+        # 更新总电流数字
+        total_cur = sum(abs(c) for c in currents)
+        self.total_cur_label.setText(f"{total_cur:.3f} A")
+        
+        # 更新波形数据
+        self.mpow_wave_counter += 1
+        self.mpow_wave_data['time'].append(self.mpow_wave_counter)
+        self.mpow_wave_data['total'].append(total_cur)
+        for i, key in enumerate(self.MOTOR_KEYS):
+            self.mpow_wave_data[key].append(currents[i])
+        
+        # 限制缓冲区
+        max_pts = self.mpow_wave_max_points
+        for k in self.mpow_wave_data:
+            if len(self.mpow_wave_data[k]) > max_pts:
+                self.mpow_wave_data[k] = self.mpow_wave_data[k][-max_pts:]
+        
+        # 刷新波形
+        t = self.mpow_wave_data['time']
+        self.curve_total.setData(t, self.mpow_wave_data['total'])
+        for key in self.MOTOR_KEYS:
+            self.curve_motors[key].setData(t, self.mpow_wave_data[key])
+    
+    def _clear_waveforms(self):
+        self.mpow_wave_counter = 0
+        for k in self.mpow_wave_data:
+            self.mpow_wave_data[k] = []
+        self.curve_total.setData([], [])
+        for key in self.MOTOR_KEYS:
+            self.curve_motors[key].setData([], [])
 
 
 # ============================================================================
@@ -6825,6 +7147,10 @@ class PIDTunerUI(QMainWindow):
         # 关节电机监控面板
         self.joint_panel = JointMonitorPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.joint_panel), "🔩 关节监控")
+        
+        # 电机功率监控面板
+        self.mpow_panel = MotorPowerPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.mpow_panel), "⚡ 电机功率")
         
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
@@ -7308,10 +7634,10 @@ class PIDTunerUI(QMainWindow):
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         
-        # VMC 数据流 (高频): #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync
+        # VMC 数据流 (高频): #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync,L_aFL,L_aFa,R_aFL,R_aFa
         if line.startswith("#VMC,"):
             parts = line.split(',')
-            if len(parts) == 15:  # #VMC + 14 个数据
+            if len(parts) >= 15:  # #VMC + 至少 14 个数据 (兼容旧格式)
                 try:
                     vmc_data = {
                         'left_leg_length': float(parts[1]),
@@ -7329,6 +7655,12 @@ class PIDTunerUI(QMainWindow):
                         'angle_diff': float(parts[13]),
                         'f_sync': float(parts[14])
                     }
+                    # 新增: 从电机电流反解的实际 F_L 和 F_alpha (后4个字段)
+                    if len(parts) >= 19:
+                        vmc_data['left_actual_F_L'] = float(parts[15])
+                        vmc_data['left_actual_F_alpha'] = float(parts[16])
+                        vmc_data['right_actual_F_L'] = float(parts[17])
+                        vmc_data['right_actual_F_alpha'] = float(parts[18])
                     if hasattr(self, 'vmc_panel'):
                         self.vmc_panel.update_vmc_monitor(vmc_data)
                 except (ValueError, IndexError) as e:
@@ -7351,6 +7683,21 @@ class PIDTunerUI(QMainWindow):
                 except (ValueError, IndexError) as e:
                     if self.debug_mode:
                         self.log(f"Joint data parse error: {e}", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 电机功率数据流 (高频): #MPOW,LH_cur,LK_cur,LW_cur,RH_cur,RK_cur,RW_cur,LH_vol,LK_vol,LW_vol,RH_vol,RK_vol,RW_vol
+        if line.startswith("#MPOW,"):
+            parts = line.split(',')
+            if len(parts) == 13:  # #MPOW + 12 values (6 currents + 6 voltages)
+                try:
+                    currents = [float(parts[i]) for i in range(1, 7)]
+                    voltages = [float(parts[i]) for i in range(7, 13)]
+                    if hasattr(self, 'mpow_panel'):
+                        self.mpow_panel.update_mpow_data(currents, voltages)
+                except (ValueError, IndexError) as e:
+                    if self.debug_mode:
+                        self.log(f"MPOW data parse error: {e}", is_error=True)
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         

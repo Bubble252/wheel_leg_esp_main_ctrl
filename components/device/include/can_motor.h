@@ -120,6 +120,14 @@ float can_motor_read_speed(can_motor_handle_t motor);
 float can_motor_read_current(can_motor_handle_t motor);
 
 /**
+ * @brief 请求读取电源电压寄存器 (非阻塞, 轻量)
+ * @note 只发送一次 CAN 读请求, 结果通过 process_rx 更新到 state.voltage
+ * @param motor 电机句柄
+ * @return ESP_OK 成功
+ */
+esp_err_t can_motor_request_voltage(can_motor_handle_t motor);
+
+/**
  * @brief 读取电源电压
  * @param motor 电机句柄
  * @return 电压 (V)
