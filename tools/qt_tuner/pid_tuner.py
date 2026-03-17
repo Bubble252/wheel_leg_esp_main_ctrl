@@ -30,7 +30,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox, QGridLayout,
     QTabWidget, QDoubleSpinBox, QSpinBox, QMessageBox, QSplitter,
-    QSlider, QCheckBox, QFrame, QProgressBar, QLineEdit, QScrollArea
+    QSlider, QCheckBox, QFrame, QProgressBar, QLineEdit, QScrollArea,
+    QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QThread
 from PyQt5.QtGui import QFont, QPalette, QColor
@@ -6801,6 +6802,814 @@ class MotorPowerPanel(QWidget):
 
 
 # ============================================================================
+# 速度/位移观测器面板
+# ============================================================================
+class ObserverPanel(QWidget):
+    """速度/位移观测器面板 - 卡尔曼滤波融合速度观测"""
+
+    WAVE_KEYS = ['v_raw', 'v_enc', 'v_filt', 'x_filt', 'a_imu']
+    WAVE_NAMES = ['原始轮速 (m/s)', '补偿轮速 (m/s)', 'KF速度 (m/s)', 'KF位移 (m)', 'IMU加速度 (m/s²)']
+    WAVE_COLORS = ['#ffb74d', '#4fc3f7', '#66bb6a', '#ce93d8', '#ef5350']
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.obsv_wave_max_points = 500
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ========== 控制区 ==========
+        ctrl_group = QGroupBox("📊 速度/位移观测器 (KF)")
+        ctrl_layout = QHBoxLayout()
+
+        self.stream_on_btn = QPushButton("📈 开启数据流")
+        self.stream_on_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 10px 15px; font-size: 14px;"))
+        self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance obsv stream on"))
+        ctrl_layout.addWidget(self.stream_on_btn)
+
+        self.stream_off_btn = QPushButton("⏹️ 关闭数据流")
+        self.stream_off_btn.setStyleSheet(SS("padding: 10px 15px; font-size: 14px;"))
+        self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance obsv stream off"))
+        ctrl_layout.addWidget(self.stream_off_btn)
+
+        ctrl_layout.addSpacing(20)
+
+        self.obsv_on_btn = QPushButton("✅ 启用观测器")
+        self.obsv_on_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 10px 15px; font-size: 14px;"))
+        self.obsv_on_btn.clicked.connect(lambda: self.send_cmd("balance obsv on"))
+        ctrl_layout.addWidget(self.obsv_on_btn)
+
+        self.obsv_off_btn = QPushButton("❌ 禁用观测器")
+        self.obsv_off_btn.setStyleSheet(SS("background-color: #f44336; color: white; padding: 10px 15px; font-size: 14px;"))
+        self.obsv_off_btn.clicked.connect(lambda: self.send_cmd("balance obsv off"))
+        ctrl_layout.addWidget(self.obsv_off_btn)
+
+        self.obsv_reset_btn = QPushButton("🔄 复位")
+        self.obsv_reset_btn.setStyleSheet(SS("padding: 10px 15px; font-size: 14px;"))
+        self.obsv_reset_btn.clicked.connect(lambda: self.send_cmd("balance obsv reset"))
+        ctrl_layout.addWidget(self.obsv_reset_btn)
+
+        ctrl_layout.addStretch()
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+
+        # ========== KF参数调节 ==========
+        param_group = QGroupBox("🎛️ 卡尔曼参数")
+        param_layout = QGridLayout()
+
+        param_layout.addWidget(QLabel("过程噪声 Q_v:"), 0, 0)
+        self.qv_input = QDoubleSpinBox()
+        self.qv_input.setRange(0.0001, 100.0)
+        self.qv_input.setDecimals(4)
+        self.qv_input.setSingleStep(0.01)
+        self.qv_input.setValue(0.1)
+        param_layout.addWidget(self.qv_input, 0, 1)
+        self.qv_btn = QPushButton("设置")
+        self.qv_btn.clicked.connect(lambda: self.send_cmd(f"balance obsv qv {self.qv_input.value():.4f}"))
+        param_layout.addWidget(self.qv_btn, 0, 2)
+
+        param_layout.addWidget(QLabel("过程噪声 Q_a:"), 0, 3)
+        self.qa_input = QDoubleSpinBox()
+        self.qa_input.setRange(0.0001, 100.0)
+        self.qa_input.setDecimals(4)
+        self.qa_input.setSingleStep(0.01)
+        self.qa_input.setValue(0.1)
+        param_layout.addWidget(self.qa_input, 0, 4)
+        self.qa_btn = QPushButton("设置")
+        self.qa_btn.clicked.connect(lambda: self.send_cmd(f"balance obsv qa {self.qa_input.value():.4f}"))
+        param_layout.addWidget(self.qa_btn, 0, 5)
+
+        param_layout.addWidget(QLabel("观测噪声 R_v:"), 1, 0)
+        self.rv_input = QDoubleSpinBox()
+        self.rv_input.setRange(0.01, 1000.0)
+        self.rv_input.setDecimals(2)
+        self.rv_input.setSingleStep(1.0)
+        self.rv_input.setValue(50.0)
+        param_layout.addWidget(self.rv_input, 1, 1)
+        self.rv_btn = QPushButton("设置")
+        self.rv_btn.clicked.connect(lambda: self.send_cmd(f"balance obsv rv {self.rv_input.value():.2f}"))
+        param_layout.addWidget(self.rv_btn, 1, 2)
+
+        param_layout.addWidget(QLabel("观测噪声 R_a:"), 1, 3)
+        self.ra_input = QDoubleSpinBox()
+        self.ra_input.setRange(0.01, 1000.0)
+        self.ra_input.setDecimals(2)
+        self.ra_input.setSingleStep(1.0)
+        self.ra_input.setValue(100.0)
+        param_layout.addWidget(self.ra_input, 1, 4)
+        self.ra_btn = QPushButton("设置")
+        self.ra_btn.clicked.connect(lambda: self.send_cmd(f"balance obsv ra {self.ra_input.value():.2f}"))
+        param_layout.addWidget(self.ra_btn, 1, 5)
+
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
+        # ========== 数值显示 ==========
+        val_group = QGroupBox("🔢 当前值")
+        val_layout = QHBoxLayout()
+
+        self.val_labels = {}
+        for key, name, color in zip(self.WAVE_KEYS, self.WAVE_NAMES, self.WAVE_COLORS):
+            frame = QVBoxLayout()
+            lbl_name = QLabel(name.split(' ')[0])
+            lbl_name.setStyleSheet(SS(f"color: {color}; font-size: 11px;"))
+            lbl_name.setAlignment(Qt.AlignCenter)
+            frame.addWidget(lbl_name)
+            lbl_val = QLabel("--")
+            lbl_val.setStyleSheet(SS(f"font-size: 18px; font-weight: bold; color: {color}; padding: 2px;"))
+            lbl_val.setAlignment(Qt.AlignCenter)
+            frame.addWidget(lbl_val)
+            val_layout.addLayout(frame)
+            self.val_labels[key] = lbl_val
+
+        val_group.setLayout(val_layout)
+        layout.addWidget(val_group)
+
+        # ========== 波形区域 (5个小波形) ==========
+        wave_group = QGroupBox("📈 波形")
+        wave_layout = QVBoxLayout()
+
+        # 初始化波形数据
+        self.obsv_wave_data = {k: [] for k in self.WAVE_KEYS}
+        self.obsv_wave_data['time'] = []
+        self.obsv_wave_counter = 0
+
+        # 5个波形: 上面3个(速度相关), 下面2个(位移+加速度)
+        self.pw_plots = {}
+        self.curves = {}
+
+        # 上排: 3个速度波形
+        top_grid = QGridLayout()
+        for i, (key, name, color) in enumerate(zip(
+                self.WAVE_KEYS[:3], self.WAVE_NAMES[:3], self.WAVE_COLORS[:3])):
+            pw = pg.PlotWidget()
+            pw.setBackground('#1a1a2e')
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setTitle(name, color='w', size='9pt')
+            pw.setLabel('left', name.split('(')[1].rstrip(')') if '(' in name else '')
+            pw.setMinimumHeight(120)
+            curve = pw.plot(pen=pg.mkPen(color=color, width=2))
+            top_grid.addWidget(pw, 0, i)
+            self.pw_plots[key] = pw
+            self.curves[key] = curve
+
+        wave_layout.addLayout(top_grid)
+
+        # 下排: 2个波形 (位移 + 加速度)
+        bot_grid = QGridLayout()
+        for i, (key, name, color) in enumerate(zip(
+                self.WAVE_KEYS[3:], self.WAVE_NAMES[3:], self.WAVE_COLORS[3:])):
+            pw = pg.PlotWidget()
+            pw.setBackground('#1a1a2e')
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setTitle(name, color='w', size='9pt')
+            pw.setLabel('left', name.split('(')[1].rstrip(')') if '(' in name else '')
+            pw.setMinimumHeight(120)
+            curve = pw.plot(pen=pg.mkPen(color=color, width=2))
+            bot_grid.addWidget(pw, 0, i)
+            self.pw_plots[key] = pw
+            self.curves[key] = curve
+
+        wave_layout.addLayout(bot_grid)
+
+        # 波形控制栏
+        wave_ctrl = QHBoxLayout()
+        self.wave_clear_btn = QPushButton("🗑️ 清空波形")
+        self.wave_clear_btn.clicked.connect(self._clear_waveforms)
+        wave_ctrl.addWidget(self.wave_clear_btn)
+
+        wave_ctrl.addWidget(QLabel("缓冲点数:"))
+        self.wave_points_input = QSpinBox()
+        self.wave_points_input.setRange(100, 5000)
+        self.wave_points_input.setSingleStep(100)
+        self.wave_points_input.setValue(500)
+        self.wave_points_input.valueChanged.connect(lambda v: setattr(self, 'obsv_wave_max_points', v))
+        wave_ctrl.addWidget(self.wave_points_input)
+
+        wave_ctrl.addStretch()
+        wave_layout.addLayout(wave_ctrl)
+
+        wave_group.setLayout(wave_layout)
+        layout.addWidget(wave_group)
+
+        layout.addStretch()
+
+    def send_cmd(self, cmd):
+        if self.parent_window:
+            self.parent_window.send_command(cmd)
+
+    def update_obsv_data(self, v_raw, v_enc, v_filt, x_filt, a_imu):
+        """更新观测器数据 (5个浮点值)"""
+        vals = {'v_raw': v_raw, 'v_enc': v_enc, 'v_filt': v_filt, 'x_filt': x_filt, 'a_imu': a_imu}
+
+        # 数值标签
+        self.val_labels['v_raw'].setText(f"{v_raw:.4f}")
+        self.val_labels['v_enc'].setText(f"{v_enc:.4f}")
+        self.val_labels['v_filt'].setText(f"{v_filt:.4f}")
+        self.val_labels['x_filt'].setText(f"{x_filt:.4f}")
+        self.val_labels['a_imu'].setText(f"{a_imu:.3f}")
+
+        # 波形
+        self.obsv_wave_counter += 1
+        self.obsv_wave_data['time'].append(self.obsv_wave_counter)
+        for key in self.WAVE_KEYS:
+            self.obsv_wave_data[key].append(vals[key])
+
+        max_pts = self.obsv_wave_max_points
+        for k in self.obsv_wave_data:
+            if len(self.obsv_wave_data[k]) > max_pts:
+                self.obsv_wave_data[k] = self.obsv_wave_data[k][-max_pts:]
+
+        t = self.obsv_wave_data['time']
+        for key in self.WAVE_KEYS:
+            self.curves[key].setData(t, self.obsv_wave_data[key])
+
+    def _clear_waveforms(self):
+        self.obsv_wave_counter = 0
+        for k in self.obsv_wave_data:
+            self.obsv_wave_data[k] = []
+        for key in self.WAVE_KEYS:
+            self.curves[key].setData([], [])
+
+
+# ============================================================================
+# Full LQR 调试面板
+# ============================================================================
+class FullLqrPanel(QWidget):
+    """Full LQR 控制器调试面板 - 参数调节、MATLAB系数导入、实时波形"""
+
+    # MATLAB变量名到 K 索引的映射
+    # a1x -> T (轮子扭矩), a2x -> Tp (腿部扭矩)
+    # x = 1..6 -> theta, d_theta, x, v, pitch, pitch_rate
+    MATLAB_VAR_MAP = {
+        'a11': 0,  'a12': 1,  'a13': 2,  'a14': 3,  'a15': 4,  'a16': 5,
+        'a21': 6,  'a22': 7,  'a23': 8,  'a24': 9,  'a25': 10, 'a26': 11,
+    }
+
+    K_LABELS = [
+        'K[0]  θ→T',   'K[1]  dθ→T',  'K[2]  x→T',
+        'K[3]  v→T',   'K[4]  φ→T',   'K[5]  dφ→T',
+        'K[6]  θ→Tp',  'K[7]  dθ→Tp', 'K[8]  x→Tp',
+        'K[9]  v→Tp',  'K[10] φ→Tp',  'K[11] dφ→Tp',
+    ]
+
+    WAVE_KEYS = ['T_left', 'T_right', 'Tp_left', 'Tp_right', 'L0', 'theta', 'v', 'pitch']
+    WAVE_NAMES = ['左轮T (Nm)', '右轮T (Nm)', '左腿Tp (Nm)', '右腿Tp (Nm)',
+                  '腿长L0 (m)', 'theta (°)', '速度v (m/s)', 'pitch (°)']
+    WAVE_COLORS = ['#4fc3f7', '#ffb74d', '#66bb6a', '#ce93d8',
+                   '#ffffff', '#ef5350', '#26c6da', '#ffa726']
+
+    # 默认仿真文件路径
+    DEFAULT_SIM_DIR = '/home/bubble/wheel-legged/打印件版/仿真/simulation'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.wave_max_points = 500
+        self.wave_counter = 0
+        self.wave_data = {k: [] for k in self.WAVE_KEYS}
+        self.wave_data['time'] = []
+        # 当前系数表 (本地缓存, 12×4)
+        self.local_coeff = [[0.0]*4 for _ in range(12)]
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ==================== 顶部: 模式/数据流控制 ====================
+        ctrl_group = QGroupBox("🎛️ Full LQR 控制")
+        ctrl_layout = QHBoxLayout()
+
+        self.mode_btn = QPushButton("🔄 切换Full LQR模式")
+        self.mode_btn.setStyleSheet(SS("background-color: #9C27B0; color: white; padding: 8px 12px; font-size: 13px;"))
+        self.mode_btn.clicked.connect(lambda: self.send_cmd("balance mode flqr"))
+        ctrl_layout.addWidget(self.mode_btn)
+
+        self.stream_on_btn = QPushButton("📈 开启数据流")
+        self.stream_on_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 8px 12px;"))
+        self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance flqr stream on"))
+        ctrl_layout.addWidget(self.stream_on_btn)
+
+        self.stream_off_btn = QPushButton("⏹️ 关闭数据流")
+        self.stream_off_btn.setStyleSheet(SS("padding: 8px 12px;"))
+        self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance flqr stream off"))
+        ctrl_layout.addWidget(self.stream_off_btn)
+
+        self.query_btn = QPushButton("🔍 查询参数")
+        self.query_btn.setStyleSheet(SS("padding: 8px 12px;"))
+        self.query_btn.clicked.connect(lambda: self.send_cmd("balance flqr"))
+        ctrl_layout.addWidget(self.query_btn)
+
+        ctrl_layout.addStretch()
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+
+        # ==================== 参数调节区 ====================
+        param_group = QGroupBox("⚙️ 参数调节")
+        param_layout = QGridLayout()
+
+        # 行0: pitch_offset, v_scale
+        param_layout.addWidget(QLabel("Pitch偏移 (rad):"), 0, 0)
+        self.pitch_offset_input = QDoubleSpinBox()
+        self.pitch_offset_input.setRange(-0.5, 0.5)
+        self.pitch_offset_input.setDecimals(4)
+        self.pitch_offset_input.setSingleStep(0.005)
+        self.pitch_offset_input.setValue(0.04)
+        param_layout.addWidget(self.pitch_offset_input, 0, 1)
+        po_btn = QPushButton("设置")
+        po_btn.clicked.connect(lambda: self.send_cmd(f"balance flqr pitch_offset {self.pitch_offset_input.value():.4f}"))
+        param_layout.addWidget(po_btn, 0, 2)
+
+        param_layout.addWidget(QLabel("速度缩放:"), 0, 3)
+        self.v_scale_input = QDoubleSpinBox()
+        self.v_scale_input.setRange(0.01, 5.0)
+        self.v_scale_input.setDecimals(2)
+        self.v_scale_input.setSingleStep(0.1)
+        self.v_scale_input.setValue(0.4)
+        param_layout.addWidget(self.v_scale_input, 0, 4)
+        vs_btn = QPushButton("设置")
+        vs_btn.clicked.connect(lambda: self.send_cmd(f"balance flqr v_scale {self.v_scale_input.value():.2f}"))
+        param_layout.addWidget(vs_btn, 0, 5)
+
+        # 行1: max_t, max_tp
+        param_layout.addWidget(QLabel("轮扭矩限幅 (Nm):"), 1, 0)
+        self.max_t_input = QDoubleSpinBox()
+        self.max_t_input.setRange(0.1, 10.0)
+        self.max_t_input.setDecimals(2)
+        self.max_t_input.setSingleStep(0.5)
+        self.max_t_input.setValue(2.0)
+        param_layout.addWidget(self.max_t_input, 1, 1)
+        mt_btn = QPushButton("设置")
+        mt_btn.clicked.connect(lambda: self.send_cmd(f"balance flqr max_t {self.max_t_input.value():.2f}"))
+        param_layout.addWidget(mt_btn, 1, 2)
+
+        param_layout.addWidget(QLabel("Tp限幅 (Nm):"), 1, 3)
+        self.max_tp_input = QDoubleSpinBox()
+        self.max_tp_input.setRange(0.1, 20.0)
+        self.max_tp_input.setDecimals(2)
+        self.max_tp_input.setSingleStep(1.0)
+        self.max_tp_input.setValue(8.0)
+        param_layout.addWidget(self.max_tp_input, 1, 4)
+        mtp_btn = QPushButton("设置")
+        mtp_btn.clicked.connect(lambda: self.send_cmd(f"balance flqr max_tp {self.max_tp_input.value():.2f}"))
+        param_layout.addWidget(mtp_btn, 1, 5)
+
+        # 行2: 防劈叉 PD
+        param_layout.addWidget(QLabel("防劈叉 Kp:"), 2, 0)
+        self.split_kp_input = QDoubleSpinBox()
+        self.split_kp_input.setRange(0.0, 50.0)
+        self.split_kp_input.setDecimals(2)
+        self.split_kp_input.setSingleStep(1.0)
+        self.split_kp_input.setValue(5.0)
+        param_layout.addWidget(self.split_kp_input, 2, 1)
+
+        param_layout.addWidget(QLabel("Kd:"), 2, 2)
+        self.split_kd_input = QDoubleSpinBox()
+        self.split_kd_input.setRange(0.0, 10.0)
+        self.split_kd_input.setDecimals(3)
+        self.split_kd_input.setSingleStep(0.1)
+        self.split_kd_input.setValue(0.2)
+        param_layout.addWidget(self.split_kd_input, 2, 3)
+
+        param_layout.addWidget(QLabel("limit:"), 2, 4)
+        self.split_limit_input = QDoubleSpinBox()
+        self.split_limit_input.setRange(0.0, 20.0)
+        self.split_limit_input.setDecimals(2)
+        self.split_limit_input.setSingleStep(0.5)
+        self.split_limit_input.setValue(2.0)
+        param_layout.addWidget(self.split_limit_input, 2, 5)
+
+        split_btn = QPushButton("设置防劈叉")
+        split_btn.clicked.connect(lambda: self.send_cmd(
+            f"balance flqr split {self.split_kp_input.value():.2f} "
+            f"{self.split_kd_input.value():.3f} {self.split_limit_input.value():.2f}"))
+        param_layout.addWidget(split_btn, 2, 6)
+
+        # 行3: 转向 PD
+        param_layout.addWidget(QLabel("转向 Kp:"), 3, 0)
+        self.turn_kp_input = QDoubleSpinBox()
+        self.turn_kp_input.setRange(0.0, 50.0)
+        self.turn_kp_input.setDecimals(2)
+        self.turn_kp_input.setSingleStep(1.0)
+        self.turn_kp_input.setValue(5.0)
+        param_layout.addWidget(self.turn_kp_input, 3, 1)
+
+        param_layout.addWidget(QLabel("Kd:"), 3, 2)
+        self.turn_kd_input = QDoubleSpinBox()
+        self.turn_kd_input.setRange(0.0, 10.0)
+        self.turn_kd_input.setDecimals(4)
+        self.turn_kd_input.setSingleStep(0.01)
+        self.turn_kd_input.setValue(0.1)
+        param_layout.addWidget(self.turn_kd_input, 3, 3)
+
+        param_layout.addWidget(QLabel("limit:"), 3, 4)
+        self.turn_limit_input = QDoubleSpinBox()
+        self.turn_limit_input.setRange(0.0, 20.0)
+        self.turn_limit_input.setDecimals(2)
+        self.turn_limit_input.setSingleStep(0.5)
+        self.turn_limit_input.setValue(2.0)
+        param_layout.addWidget(self.turn_limit_input, 3, 5)
+
+        turn_btn = QPushButton("设置转向")
+        turn_btn.clicked.connect(lambda: self.send_cmd(
+            f"balance flqr turn {self.turn_kp_input.value():.2f} "
+            f"{self.turn_kd_input.value():.4f} {self.turn_limit_input.value():.2f}"))
+        param_layout.addWidget(turn_btn, 3, 6)
+
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
+        # ==================== MATLAB 系数导入区 ====================
+        import_group = QGroupBox("📥 MATLAB 仿真系数导入")
+        import_layout = QVBoxLayout()
+
+        # 说明
+        desc_label = QLabel(
+            "粘贴 MATLAB get_k.m 输出的 fp32 格式文本, 或从文件加载。\n"
+            "格式: fp32 a11[6] = {0,-85.9446,51.8245,-16.0279,0.0171};\n"
+            "映射: a1x → T(轮扭矩) K[0-5],  a2x → Tp(腿扭矩) K[6-11]\n"
+            "系数: {0, c0, c1, c2, c3} → poly_coeff[i] = [c0, c1, c2, c3]"
+        )
+        desc_label.setStyleSheet(SS("color: #aaa; font-size: 11px; padding: 4px;"))
+        desc_label.setWordWrap(True)
+        import_layout.addWidget(desc_label)
+
+        # 文本输入区
+        self.matlab_text = QTextEdit()
+        self.matlab_text.setPlaceholderText(
+            "在此粘贴 MATLAB 输出，例如:\n"
+            "fp32 a11[6] = {0,-85.9446,51.8245,-16.0279,0.0171};\n"
+            "fp32 a12[6] = {0,-0.7067,0.2248,-1.2956,0.0074};\n"
+            "...\n"
+            "fp32 a26[6] = {0,112.8738,-59.0739,11.0640,0.0073};"
+        )
+        self.matlab_text.setMaximumHeight(sf(150))
+        self.matlab_text.setStyleSheet(SS(
+            "background-color: #1a1a2e; color: #e0e0e0; "
+            "font-family: Consolas, monospace; font-size: 12px;"
+        ))
+        import_layout.addWidget(self.matlab_text)
+
+        # 按钮行
+        btn_layout = QHBoxLayout()
+
+        self.load_file_btn = QPushButton("📂 从文件加载")
+        self.load_file_btn.setStyleSheet(SS("padding: 8px 15px;"))
+        self.load_file_btn.clicked.connect(self._load_from_file)
+        btn_layout.addWidget(self.load_file_btn)
+
+        self.parse_btn = QPushButton("🔍 解析预览")
+        self.parse_btn.setStyleSheet(SS("background-color: #FF9800; color: white; padding: 8px 15px; font-weight: bold;"))
+        self.parse_btn.clicked.connect(self._parse_matlab_text)
+        btn_layout.addWidget(self.parse_btn)
+
+        self.apply_btn = QPushButton("📤 应用到ESP32")
+        self.apply_btn.setStyleSheet(SS("background-color: #4CAF50; color: white; padding: 8px 15px; font-weight: bold;"))
+        self.apply_btn.clicked.connect(self._apply_coefficients)
+        self.apply_btn.setEnabled(False)
+        btn_layout.addWidget(self.apply_btn)
+
+        self.query_coeff_btn = QPushButton("🔍 查询当前系数")
+        self.query_coeff_btn.setStyleSheet(SS("padding: 8px 15px;"))
+        self.query_coeff_btn.clicked.connect(lambda: self.send_cmd("balance flqr coeff"))
+        btn_layout.addWidget(self.query_coeff_btn)
+
+        btn_layout.addStretch()
+
+        self.parse_status = QLabel("")
+        self.parse_status.setStyleSheet(SS("font-size: 12px; padding: 4px;"))
+        btn_layout.addWidget(self.parse_status)
+
+        import_layout.addLayout(btn_layout)
+
+        # 系数预览表格 (12行 × 4列)
+        self.coeff_table = QTableWidget(12, 4)
+        self.coeff_table.setHorizontalHeaderLabels(['c0 (L0³)', 'c1 (L0²)', 'c2 (L0)', 'c3 (常数)'])
+        self.coeff_table.setVerticalHeaderLabels(self.K_LABELS)
+        self.coeff_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.coeff_table.setMaximumHeight(sf(320))
+        self.coeff_table.setStyleSheet(SS(
+            "QTableWidget { background-color: #1a1a2e; color: #e0e0e0; "
+            "font-family: Consolas; font-size: 12px; gridline-color: #333; }"
+            "QHeaderView::section { background-color: #2d2d44; color: #ccc; padding: 4px; }"
+        ))
+        # 初始填充空值
+        for r in range(12):
+            for c in range(4):
+                item = QTableWidgetItem("--")
+                item.setTextAlignment(Qt.AlignCenter)
+                self.coeff_table.setItem(r, c, item)
+        import_layout.addWidget(self.coeff_table)
+
+        import_group.setLayout(import_layout)
+        layout.addWidget(import_group)
+
+        # ==================== 数值显示 ====================
+        val_group = QGroupBox("🔢 实时数据")
+        val_layout = QHBoxLayout()
+        self.val_labels = {}
+        for key, name, color in zip(self.WAVE_KEYS, self.WAVE_NAMES, self.WAVE_COLORS):
+            frame = QVBoxLayout()
+            lbl_name = QLabel(name.split(' ')[0])
+            lbl_name.setStyleSheet(SS(f"color: {color}; font-size: 10px;"))
+            lbl_name.setAlignment(Qt.AlignCenter)
+            frame.addWidget(lbl_name)
+            lbl_val = QLabel("--")
+            lbl_val.setStyleSheet(SS(f"font-size: 16px; font-weight: bold; color: {color}; padding: 2px;"))
+            lbl_val.setAlignment(Qt.AlignCenter)
+            frame.addWidget(lbl_val)
+            val_layout.addLayout(frame)
+            self.val_labels[key] = lbl_val
+        val_group.setLayout(val_layout)
+        layout.addWidget(val_group)
+
+        # ==================== 波形区域 ====================
+        wave_group = QGroupBox("📈 Full LQR 波形")
+        wave_layout = QVBoxLayout()
+
+        self.pw_plots = {}
+        self.curves = {}
+
+        # 上排: T_left, T_right, Tp_left, Tp_right (4个扭矩)
+        top_grid = QGridLayout()
+        for i, (key, name, color) in enumerate(zip(
+                self.WAVE_KEYS[:4], self.WAVE_NAMES[:4], self.WAVE_COLORS[:4])):
+            pw = pg.PlotWidget()
+            pw.setBackground('#1a1a2e')
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setTitle(name, color='w', size='9pt')
+            pw.setMinimumHeight(sf(100))
+            curve = pw.plot(pen=pg.mkPen(color=color, width=2))
+            top_grid.addWidget(pw, 0, i)
+            self.pw_plots[key] = pw
+            self.curves[key] = curve
+        wave_layout.addLayout(top_grid)
+
+        # 下排: L0, theta, v, pitch (4个状态)
+        bot_grid = QGridLayout()
+        for i, (key, name, color) in enumerate(zip(
+                self.WAVE_KEYS[4:], self.WAVE_NAMES[4:], self.WAVE_COLORS[4:])):
+            pw = pg.PlotWidget()
+            pw.setBackground('#1a1a2e')
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setTitle(name, color='w', size='9pt')
+            pw.setMinimumHeight(sf(100))
+            curve = pw.plot(pen=pg.mkPen(color=color, width=2))
+            bot_grid.addWidget(pw, 0, i)
+            self.pw_plots[key] = pw
+            self.curves[key] = curve
+        wave_layout.addLayout(bot_grid)
+
+        # 波形控制
+        wave_ctrl = QHBoxLayout()
+        clear_btn = QPushButton("🗑️ 清空波形")
+        clear_btn.clicked.connect(self._clear_waveforms)
+        wave_ctrl.addWidget(clear_btn)
+
+        wave_ctrl.addWidget(QLabel("缓冲点数:"))
+        pts_input = QSpinBox()
+        pts_input.setRange(100, 5000)
+        pts_input.setSingleStep(100)
+        pts_input.setValue(500)
+        pts_input.valueChanged.connect(lambda v: setattr(self, 'wave_max_points', v))
+        wave_ctrl.addWidget(pts_input)
+        wave_ctrl.addStretch()
+        wave_layout.addLayout(wave_ctrl)
+
+        wave_group.setLayout(wave_layout)
+        layout.addWidget(wave_group)
+
+        layout.addStretch()
+
+    # ----------------------------------------------------------------
+    # MATLAB 系数解析
+    # ----------------------------------------------------------------
+    def _parse_matlab_line(self, line):
+        """解析一行 MATLAB fp32 输出, 返回 (var_name, [c0,c1,c2,c3]) 或 None"""
+        # 格式: fp32 a11[6] = {0,-85.9446,51.8245,-16.0279,0.0171};
+        # 也支持不带 fp32 前缀的格式
+        m = re.match(
+            r'(?:fp32\s+)?(a[12][1-6])\s*\[\d+\]\s*=\s*\{([^}]+)\}',
+            line.strip()
+        )
+        if not m:
+            return None
+        var_name = m.group(1)
+        values_str = m.group(2)
+        try:
+            values = [float(v.strip()) for v in values_str.split(',')]
+        except ValueError:
+            return None
+
+        # MATLAB 输出格式: {0, c0, c1, c2, c3} (共5个值, 首个0是占位)
+        if len(values) == 5:
+            coeffs = values[1:]  # 跳过第一个 0
+        elif len(values) == 4:
+            coeffs = values      # 直接是 c0,c1,c2,c3
+        else:
+            return None
+
+        if var_name not in self.MATLAB_VAR_MAP:
+            return None
+
+        return (var_name, coeffs)
+
+    def _parse_matlab_text(self):
+        """解析文本框中的 MATLAB 输出"""
+        text = self.matlab_text.toPlainText().strip()
+        if not text:
+            self.parse_status.setText("⚠️ 请粘贴 MATLAB 输出文本")
+            self.parse_status.setStyleSheet(SS("color: #FF9800; font-size: 12px;"))
+            return
+
+        parsed = {}
+        errors = []
+        for i, line in enumerate(text.strip().split('\n'), 1):
+            line = line.strip()
+            if not line or line.startswith('%') or line.startswith('//'):
+                continue
+            result = self._parse_matlab_line(line)
+            if result:
+                var_name, coeffs = result
+                k_idx = self.MATLAB_VAR_MAP[var_name]
+                parsed[k_idx] = coeffs
+            else:
+                if 'a1' in line or 'a2' in line or 'fp32' in line:
+                    errors.append(f"行{i}: 无法解析")
+
+        if not parsed:
+            self.parse_status.setText("❌ 未找到有效的系数行")
+            self.parse_status.setStyleSheet(SS("color: #f44336; font-size: 12px;"))
+            self.apply_btn.setEnabled(False)
+            return
+
+        # 更新本地缓存和表格
+        for k_idx, coeffs in parsed.items():
+            self.local_coeff[k_idx] = coeffs[:]
+            for c in range(4):
+                item = self.coeff_table.item(k_idx, c)
+                if item:
+                    item.setText(f"{coeffs[c]:+.4f}")
+                    item.setBackground(QColor('#1b3a1b'))  # 绿色高亮已更新
+
+        missing = [i for i in range(12) if i not in parsed]
+        status_parts = [f"✅ 已解析 {len(parsed)}/12 行"]
+        if missing:
+            status_parts.append(f"缺少: {', '.join(self.K_LABELS[i].split()[0] for i in missing)}")
+        if errors:
+            status_parts.append(f"⚠️ {len(errors)}行解析失败")
+        self.parse_status.setText(' | '.join(status_parts))
+        self.parse_status.setStyleSheet(SS(
+            f"color: {'#4CAF50' if len(parsed) == 12 else '#FF9800'}; font-size: 12px;"
+        ))
+
+        self.apply_btn.setEnabled(len(parsed) > 0)
+
+    def _load_from_file(self):
+        """从文件加载 MATLAB 输出"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "加载 MATLAB 系数文件",
+            self.DEFAULT_SIM_DIR,
+            "MATLAB 文件 (*.m *.txt);;所有文件 (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            QMessageBox.warning(self, "读取失败", f"无法读取文件:\n{e}")
+            return
+
+        # 提取含 fp32 a[12][1-6] 的行
+        lines = []
+        for line in content.split('\n'):
+            line_stripped = line.strip()
+            # 跳过注释行
+            if line_stripped.startswith('%') or line_stripped.startswith('//'):
+                # 但检查注释中是否有 fprintf 输出格式
+                continue
+            # 检查 fprintf 语句 → 提取格式字符串中的变量名
+            if 'fprintf' in line_stripped:
+                # 从 fprintf 的格式字符串中提取: fprintf('fp32 a11[6] = {0,%.4f,...};\n', ...)
+                m_fprintf = re.search(r"fprintf\s*\(\s*'([^']+)'", line_stripped)
+                if m_fprintf:
+                    fmt_str = m_fprintf.group(1)
+                    # 这只是模板，不是实际数据，跳过
+                    continue
+            # 直接含 fp32 aXX 的行
+            if re.search(r'(?:fp32\s+)?a[12][1-6]\s*\[', line_stripped):
+                lines.append(line_stripped)
+
+        if lines:
+            self.matlab_text.setPlainText('\n'.join(lines))
+            self.parse_status.setText(f"📂 从文件提取了 {len(lines)} 行，请点击'解析预览'")
+            self.parse_status.setStyleSheet(SS("color: #2196F3; font-size: 12px;"))
+        else:
+            # 文件可能是 .m 脚本，不含实际系数行
+            # 尝试将整个内容放入文本框
+            self.matlab_text.setPlainText(content)
+            self.parse_status.setText("📂 文件已加载 (未自动识别系数行，请手动粘贴 MATLAB 命令行输出)")
+            self.parse_status.setStyleSheet(SS("color: #FF9800; font-size: 12px;"))
+
+    def _apply_coefficients(self):
+        """将解析的系数通过串口发送到 ESP32"""
+        # 先重新解析确保最新
+        text = self.matlab_text.toPlainText().strip()
+        if not text:
+            return
+
+        parsed = {}
+        for line in text.strip().split('\n'):
+            result = self._parse_matlab_line(line.strip())
+            if result:
+                var_name, coeffs = result
+                k_idx = self.MATLAB_VAR_MAP[var_name]
+                parsed[k_idx] = coeffs
+
+        if not parsed:
+            QMessageBox.warning(self, "应用失败", "没有已解析的系数可以应用")
+            return
+
+        # 确认对话框
+        reply = QMessageBox.question(
+            self, "确认应用",
+            f"即将向 ESP32 发送 {len(parsed)} 行系数更新。\n"
+            f"这将修改 Full LQR 的多项式拟合系数。\n\n继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # 逐行发送 balance flqr coeff <row> <c0> <c1> <c2> <c3>
+        sent = 0
+        for k_idx in sorted(parsed.keys()):
+            coeffs = parsed[k_idx]
+            cmd = f"balance flqr coeff {k_idx} {coeffs[0]:.4f} {coeffs[1]:.4f} {coeffs[2]:.4f} {coeffs[3]:.4f}"
+            self.send_cmd(cmd)
+            sent += 1
+            # 在表格中标记为已发送
+            for c in range(4):
+                item = self.coeff_table.item(k_idx, c)
+                if item:
+                    item.setBackground(QColor('#0d3b66'))  # 蓝色表示已发送
+
+        self.parse_status.setText(f"📤 已发送 {sent} 行系数到 ESP32")
+        self.parse_status.setStyleSheet(SS("color: #4CAF50; font-size: 12px;"))
+
+    # ----------------------------------------------------------------
+    # 波形更新
+    # ----------------------------------------------------------------
+    def update_flqr_data(self, T_left, T_right, Tp_left, Tp_right,
+                         L0, theta, d_theta, x, v, pitch, pitch_rate, split_comp):
+        """更新 Full LQR 数据 (12个浮点值, 来自 #FLQR 数据流)"""
+        vals = {
+            'T_left': T_left, 'T_right': T_right,
+            'Tp_left': Tp_left, 'Tp_right': Tp_right,
+            'L0': L0, 'theta': theta, 'v': v, 'pitch': pitch,
+        }
+
+        # 数值标签
+        self.val_labels['T_left'].setText(f"{T_left:.3f}")
+        self.val_labels['T_right'].setText(f"{T_right:.3f}")
+        self.val_labels['Tp_left'].setText(f"{Tp_left:.4f}")
+        self.val_labels['Tp_right'].setText(f"{Tp_right:.4f}")
+        self.val_labels['L0'].setText(f"{L0:.3f}")
+        self.val_labels['theta'].setText(f"{theta:.1f}")
+        self.val_labels['v'].setText(f"{v:.3f}")
+        self.val_labels['pitch'].setText(f"{pitch:.1f}")
+
+        # 波形
+        self.wave_counter += 1
+        self.wave_data['time'].append(self.wave_counter)
+        for key in self.WAVE_KEYS:
+            self.wave_data[key].append(vals[key])
+
+        max_pts = self.wave_max_points
+        for k in self.wave_data:
+            if len(self.wave_data[k]) > max_pts:
+                self.wave_data[k] = self.wave_data[k][-max_pts:]
+
+        t = self.wave_data['time']
+        for key in self.WAVE_KEYS:
+            self.curves[key].setData(t, self.wave_data[key])
+
+    def _clear_waveforms(self):
+        self.wave_counter = 0
+        for k in self.wave_data:
+            self.wave_data[k] = []
+        for key in self.WAVE_KEYS:
+            self.curves[key].setData([], [])
+
+    def send_cmd(self, cmd):
+        if self.parent_window:
+            self.parent_window.send_command(cmd)
+
+
+# ============================================================================
 # 传感器面板
 # ============================================================================
 class SensorPanel(QWidget):
@@ -7151,6 +7960,14 @@ class PIDTunerUI(QMainWindow):
         # 电机功率监控面板
         self.mpow_panel = MotorPowerPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.mpow_panel), "⚡ 电机功率")
+        
+        # 速度/位移观测器面板
+        self.obsv_panel = ObserverPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.obsv_panel), "📊 速度观测")
+        
+        # Full LQR 调试面板
+        self.flqr_panel = FullLqrPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.flqr_panel), "🧮 Full LQR")
         
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
@@ -7698,6 +8515,34 @@ class PIDTunerUI(QMainWindow):
                 except (ValueError, IndexError) as e:
                     if self.debug_mode:
                         self.log(f"MPOW data parse error: {e}", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 速度/位移观测器数据流 (高频): #OBSV,v_raw,v_encoder,v_filter,x_filter,a_imu
+        if line.startswith("#OBSV,"):
+            parts = line.split(',')
+            if len(parts) == 6:  # #OBSV + 5 values
+                try:
+                    vals = [float(parts[i]) for i in range(1, 6)]
+                    if hasattr(self, 'obsv_panel'):
+                        self.obsv_panel.update_obsv_data(*vals)
+                except (ValueError, IndexError) as e:
+                    if self.debug_mode:
+                        self.log(f"OBSV data parse error: {e}", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # Full LQR 数据流 (高频): #FLQR,T_L,T_R,Tp_L,Tp_R,L0,theta,d_theta,x,v,pitch,pitch_rate,split
+        if line.startswith("#FLQR,"):
+            parts = line.split(',')
+            if len(parts) == 13:  # #FLQR + 12 values
+                try:
+                    vals = [float(parts[i]) for i in range(1, 13)]
+                    if hasattr(self, 'flqr_panel'):
+                        self.flqr_panel.update_flqr_data(*vals)
+                except (ValueError, IndexError) as e:
+                    if self.debug_mode:
+                        self.log(f"FLQR data parse error: {e}", is_error=True)
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         

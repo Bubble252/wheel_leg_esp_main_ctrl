@@ -910,6 +910,14 @@ esp_err_t vmc_ctrl_compute(const vmc_params_t *params,
         float hip_vel_rad = input->sensor.hip_velocity * deg_to_rad;
         float knee_vel_rad = input->sensor.knee_velocity * deg_to_rad;
         
+        // 右腿镜像: FK 内部对 θ1,θ2 取反 (θ_kin = -θ_motor),
+        // 所以 dθ_kin/dt = -dθ_motor/dt, 关节速度也需要取反
+        // 才能与镜像坐标系下的雅可比矩阵匹配
+        if (!is_left) {
+            hip_vel_rad = -hip_vel_rad;
+            knee_vel_rad = -knee_vel_rad;
+        }
+        
         float J_body[4];
         leg_kin_jacobian(&joint, is_left, NULL, J_body);
         current_dL = J_body[0] * hip_vel_rad + J_body[1] * knee_vel_rad;

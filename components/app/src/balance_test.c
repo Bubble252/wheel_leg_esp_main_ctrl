@@ -13,6 +13,7 @@
  * ├─────────────────────────────────────────────────────────────┤
  * │ Core 1 (高优先级, 实时)                                      │
  * │   task_imu_read       - IMU 数据读取 (优先级 22, 2ms)       │
+ * │   task_observer       - 速度观测器 (优先级 21, 3ms)          │
  * │   task_balance_ctrl   - LQR 平衡控制 (优先级 24, 5ms)       │
  * │   task_motor_comm     - CAN 电机通信 (优先级 20, 2ms)       │
  * └─────────────────────────────────────────────────────────────┘
@@ -26,6 +27,7 @@
 #include "wit_reg.h"      // RRATE_200HZ 定义
 #include "wifi_remote.h"
 #include "lqr_balance.h"
+#include "full_lqr.h"
 #include "lowpass_filter.h"
 #include "leg_kinematics.h"
 #include "power_detect.h"
@@ -65,6 +67,7 @@ static const char *TAG = "BAL_TEST";
 #define MOTOR_COMM_PERIOD_MS        2       // 500Hz 电机通信 (与控制同步)
 #define LEG_MOTOR_DIVIDER           5       // 腿电机分频 (500Hz / 5 = 100Hz, 大幅减轻CAN负担)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
+#define OBSERVER_PERIOD_MS          3       // 333Hz 速度观测器 (独立任务)
 
 // ===== 合并任务配置 =====
 // 将 IMU读取 + 控制算法 + 电机通信 合并到一个任务中运行
@@ -82,12 +85,14 @@ static const char *TAG = "BAL_TEST";
 #define TASK_STACK_BALANCE          8192
 #define TASK_STACK_MOTOR            4096
 #define TASK_STACK_WATCHDOG         4096    // 增加到 4KB，避免栈溢出
+#define TASK_STACK_OBSERVER         4096    // 观测器任务栈
 
 // 任务优先级
 #define TASK_PRIO_IMU               22
 #define TASK_PRIO_BALANCE           24
 #define TASK_PRIO_MOTOR             20
 #define TASK_PRIO_WATCHDOG          8
+#define TASK_PRIO_OBSERVER          21      // 低于 IMU(22) 和控制(24), 高于电机(20)
 
 // 遥控超时 (ms)
 #define REMOTE_TIMEOUT_MS           1000
@@ -107,6 +112,9 @@ typedef struct {
     float roll_rate;        // 横滚角速度 (度/秒)
     float yaw;              // 偏航角 (度)
     float yaw_rate;         // 偏航角速度 (度/秒)
+    float accel_x;          // 加速度 X (g)
+    float accel_y;          // 加速度 Y (g)
+    float accel_z;          // 加速度 Z (g)
     uint32_t timestamp;     // 时间戳 (ms)
     uint64_t read_time_us;  // 精确读取时间 (us) - 用于延迟测量
     bool valid;             // 数据有效
@@ -172,6 +180,7 @@ static TaskHandle_t g_task_balance = NULL;
 static TaskHandle_t g_task_motor = NULL;
 static TaskHandle_t g_task_watchdog = NULL;
 static TaskHandle_t g_task_unified = NULL;        // 合并任务句柄
+static TaskHandle_t g_task_observer = NULL;       // 观测器独立任务句柄
 
 // 任务架构选择
 static bool g_use_unified_task = true;            // true=使用合并任务(默认), false=使用分离任务
@@ -186,6 +195,7 @@ typedef enum {
     CTRL_MODE_SINGLE_PID,   // 单环 PID 控制 (直立环→速度) - 速度模式
     CTRL_MODE_CAR,          // 普通小车模式 (无直立环, 趴下跑)
     CTRL_MODE_TRIPLE_PID,   // 三环 PID 控制 (速度环→角度环→轮速环)
+    CTRL_MODE_FULL_LQR,     // 完整 LQR 控制 (同时输出 T 和 Tp, K 随腿长插值)
 } control_mode_t;
 static control_mode_t g_control_mode = CTRL_MODE_TRIPLE_PID;  // 默认三环 PID 模式
 
@@ -207,6 +217,17 @@ static dual_pid_output_t g_dual_pid_output;       // 保存输出用于调试
 static triple_pid_controller_t g_triple_pid_ctrl;
 static bool g_triple_pid_initialized = false;
 static triple_pid_output_t g_triple_pid_output;   // 保存输出用于调试
+
+// 完整 LQR 控制器 (同时输出 T 和 Tp, K 随腿长插值)
+static full_lqr_controller_t g_full_lqr_ctrl;
+static bool g_full_lqr_initialized = false;
+static full_lqr_output_t g_full_lqr_output_left;   // 左腿输出 (调试)
+static full_lqr_output_t g_full_lqr_output_right;  // 右腿输出 (调试)
+static bool g_full_lqr_stream_enable = false;       // #FLQR 数据流开关
+static float g_full_lqr_Tp_left = 0.0f;             // 左腿 Tp 输出 (用于 VMC 注入)
+static float g_full_lqr_Tp_right = 0.0f;            // 右腿 Tp 输出 (用于 VMC 注入)
+static float g_full_lqr_wheel_T_left = 0.0f;        // 左轮 T 输出 (调试)
+static float g_full_lqr_wheel_T_right = 0.0f;       // 右轮 T 输出 (调试)
 
 // 轮速加权滑动平均滤波器 (用于双环/三环 PID 模式)
 static weighted_ma_filter_t g_wheel_speed_wma;
@@ -407,6 +428,29 @@ static bool g_joint_stream_enable = false;         // 关节电机数据流使�
 static bool g_mpow_stream_enable = false;          // 电机功率数据流使能 (电压/电流)
 static uint8_t g_mpow_volt_poll_idx = 0;           // 电压轮询索引 (0-5, 轮流请求6个电机)
 static uint8_t g_mpow_volt_poll_div = 0;            // 电压轮询分频计数器
+
+// ============================================================================
+// 速度/位移观测器 (卡尔曼滤波融合: 编码器 + IMU 加速度)
+// ============================================================================
+static bool g_observer_enabled = false;            // 观测器使能 (默认关闭, 需手动开启)
+static bool g_obsv_stream_enable = false;          // 观测器数据流输出使能
+static int  g_obsv_period_ms = OBSERVER_PERIOD_MS; // 观测器任务周期 (ms, 可 CLI 调参)
+
+// 2x2 卡尔曼滤波器状态: x = [v, a]^T
+static float g_kf_x[2] = {0};                     // 状态: [速度(m/s), 加速度(m/s²)]
+static float g_kf_P[4] = {1, 0, 0, 1};            // 协方差 P (2x2, 行主序)
+// KF 参数 (可在线调参)
+static float g_kf_Q_v = 0.1f;                     // 过程噪声-速度 (信任模型程度)
+static float g_kf_Q_a = 0.1f;                     // 过程噪声-加速度
+static float g_kf_R_v = 50.0f;                    // 观测噪声-编码器速度
+static float g_kf_R_a = 100.0f;                   // 观测噪声-IMU加速度
+
+// 观测器输出 (可选用于替代原始轮速)
+static float g_obsv_v_encoder = 0.0f;              // 运动学补偿后的编码器速度 (m/s)
+static float g_obsv_v_filter = 0.0f;               // 卡尔曼滤波后的速度 (m/s)
+static float g_obsv_x_filter = 0.0f;               // 滤波速度积分位移 (m)
+static float g_obsv_a_imu = 0.0f;                  // IMU 前进方向加速度 (m/s²), 已去重力
+static float g_obsv_wheel_v_raw = 0.0f;            // 原始轮速 (无补偿) (m/s)
 
 // ============================================================================
 // 关节电机速度滤波 (支持中值滤波 / 限幅滤波切换)
@@ -920,6 +964,17 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
                lh_cur, lk_cur, lw_cur, rh_cur, rk_cur, rw_cur,
                lh_vol, lk_vol, lw_vol, rh_vol, rk_vol, rw_vol);
     }
+    
+    // 观测器数据流 (独立使能, 复用 plot 分频)
+    // 格式: #OBSV,v_raw,v_encoder,v_filter,x_filter,a_imu
+    if (g_obsv_stream_enable) {
+        printf("#OBSV,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+               g_obsv_wheel_v_raw,     // 原始轮速 (无补偿)
+               g_obsv_v_encoder,       // 运动学补偿后的编码器速度
+               g_obsv_v_filter,        // 卡尔曼滤波后的速度
+               g_obsv_x_filter,        // 滤波积分位移
+               g_obsv_a_imu);          // IMU 前进方向加速度
+    }
 }
 
 /**
@@ -1359,6 +1414,48 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
         if (vmc_dual_compute(&g_vmc_params, &dual_input, &g_vmc_dual_output) == ESP_OK) {
             g_vmc_input_valid = true;
             
+            // ===== Full LQR Tp 注入 (替代 F_alpha) =====
+            // 在 Full LQR 模式下, Tp 完全取代 VMC 的 F_alpha
+            // VMC 仍然负责 F_L 腿长控制, 但 F_alpha 方向完全由 Full LQR 的 Tp 控制
+            // 做法: 先减去 VMC 已计算的 J^T × F_alpha, 再加上 J^T × Tp
+            if (g_control_mode == CTRL_MODE_FULL_LQR && g_full_lqr_initialized) {
+                // 获取当前关节雅可比矩阵
+                leg_joint_state_t left_joint_for_tp = {
+                    .hip_angle = left_valid ? can_motor_read_position(g_motor_left_hip) : 0,
+                    .knee_angle = left_valid ? can_motor_read_position(g_motor_left_knee) : 0,
+                };
+                leg_joint_state_t right_joint_for_tp = {
+                    .hip_angle = right_valid ? can_motor_read_position(g_motor_right_hip) : 0,
+                    .knee_angle = right_valid ? can_motor_read_position(g_motor_right_knee) : 0,
+                };
+                
+                float J_left[4], J_right[4];
+                leg_kin_jacobian(&left_joint_for_tp, true, NULL, J_left);
+                leg_kin_jacobian(&right_joint_for_tp, false, NULL, J_right);
+                
+                // 获取 VMC 已计算的 F_alpha (需要减去)
+                float F_alpha_left  = g_vmc_dual_output.left.debug.F_alpha;
+                float F_alpha_right = g_vmc_dual_output.right.debug.F_alpha;
+                
+                // 左腿: 用 Tp 替代 F_alpha
+                // 注意: 左腿 LQR 内部对状态做了符号翻转(pitch/x/v取反),
+                //   导致 Tp_left 的符号与物理方向相反, 需要取反后才能注入 VMC.
+                //   (与轮子扭矩 T_left 取反同理: 参考代码的左右腿电机镜像安装,
+                //    LQR 输出的符号差异通过电机方向自然抵消;
+                //    我们的代码中左腿电机方向不镜像, 需要手动取反)
+                // τ_new = τ_vmc - J^T×F_alpha + J^T×(-Tp_left) = τ_vmc + J^T×(-Tp_left - F_alpha)
+                float Tp_left = -g_full_lqr_Tp_left;  // 取反!
+                float delta_left = Tp_left - F_alpha_left;
+                g_vmc_dual_output.left.hip_torque  += J_left[2] * delta_left;
+                g_vmc_dual_output.left.knee_torque += J_left[3] * delta_left;
+                
+                // 右腿: 用 Tp 替代 F_alpha (取反与 vmc_ctrl_compute 右腿扭矩取反一致)
+                float Tp_right = g_full_lqr_Tp_right;
+                float delta_right = Tp_right - F_alpha_right;
+                g_vmc_dual_output.right.hip_torque  += -(J_right[2] * delta_right);
+                g_vmc_dual_output.right.knee_torque += -(J_right[3] * delta_right);
+            }
+            
             // VMC 数据流输出 (用于 UI 调试)
             // 格式: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync,L_aFL,L_aFa,R_aFL,R_aFa
             // 后4个字段: 从电机电流反解的实际 F_L 和 F_alpha (通过 J^{-T} × τ_actual)
@@ -1667,6 +1764,10 @@ static void task_balance_ctrl(void *arg);
 static void task_motor_comm(void *arg);
 static void task_remote_watchdog(void *arg);
 static void task_unified_control(void *arg);      // 合并任务 (IMU + 控制 + 电机)
+static void task_observer(void *arg);             // 速度观测器独立任务
+
+static void velocity_observer_update(float dt, const shared_imu_data_t *imu,
+                                      float left_vel_rad, float right_vel_rad);
 
 static void update_remote_from_wifi(void);
 static void compute_balance_output(float dt);
@@ -1807,6 +1908,15 @@ esp_err_t balance_test_init(void) {
         g_triple_pid_initialized = true;
         triple_pid_set_angle_zeropoint(&g_triple_pid_ctrl, g_angle_zeropoint);
         ESP_LOGI(TAG, "Triple PID controller initialized");
+    }
+    
+    // 初始化完整 LQR 控制器 (同时输出 T 和 Tp, K 随腿长插值)
+    ret = full_lqr_init(&g_full_lqr_ctrl, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Full LQR init failed");
+    } else {
+        g_full_lqr_initialized = true;
+        ESP_LOGI(TAG, "Full LQR controller initialized");
     }
     
     // 初始化轮速加权滑动平均滤波器
@@ -1957,6 +2067,10 @@ esp_err_t balance_test_start(void) {
     xTaskCreatePinnedToCore(task_remote_watchdog, "watchdog", TASK_STACK_WATCHDOG,
                             NULL, TASK_PRIO_WATCHDOG, &g_task_watchdog, 0);
     
+    // 创建速度观测器独立任务 (Core 1 - 实时, 独立于控制循环)
+    xTaskCreatePinnedToCore(task_observer, "observer", TASK_STACK_OBSERVER,
+                            NULL, TASK_PRIO_OBSERVER, &g_task_observer, 1);
+    
     g_tasks_running = true;
     g_state = BALANCE_TEST_READY;
     
@@ -2002,6 +2116,7 @@ void balance_test_stop(void) {
     g_task_balance = NULL;
     g_task_motor = NULL;
     g_task_watchdog = NULL;
+    g_task_observer = NULL;
     
     // 停止 WiFi
     wifi_remote_stop();
@@ -2249,6 +2364,9 @@ static void task_imu_read(void *arg) {
             g_imu_data.roll_rate = imu.gyro_x;
             g_imu_data.yaw = imu.yaw;
             g_imu_data.yaw_rate = imu.gyro_z;
+            g_imu_data.accel_x = imu.accel_x;
+            g_imu_data.accel_y = imu.accel_y;
+            g_imu_data.accel_z = imu.accel_z;
             g_imu_data.timestamp = imu.timestamp;
             g_imu_data.read_time_us = read_time;  // 记录精确读取时间到数据结构中
             g_imu_data.valid = true;
@@ -2514,6 +2632,51 @@ static void task_unified_control(void *arg) {
     
     ESP_LOGI(TAG, "[task_unified_control] Stopped");
     g_task_unified = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 速度观测器独立任务 (Core 1)
+ * 
+ * 独立于控制循环运行, 可以有自己的频率 (默认 333Hz)
+ * 读取: IMU 数据, 轮电机状态, VMC 输出
+ * 写入: g_obsv_v_filter, g_obsv_x_filter 等
+ * 控制任务只读取观测器输出, 二者不会互相阻塞
+ */
+static void task_observer(void *arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    
+    ESP_LOGI(TAG, "[task_observer] Started on Core %d, period %d ms (%.0f Hz)",
+             xPortGetCoreID(), g_obsv_period_ms, 1000.0f / g_obsv_period_ms);
+    
+    while (g_tasks_running) {
+        const TickType_t period = pdMS_TO_TICKS(g_obsv_period_ms);
+        const float dt = g_obsv_period_ms / 1000.0f;
+        
+        // 只有使能时才运算, 否则空转等待
+        if (g_observer_enabled) {
+            // 读取 IMU 数据 (线程安全)
+            shared_imu_data_t imu;
+            xSemaphoreTake(g_imu_mutex, portMAX_DELAY);
+            memcpy(&imu, &g_imu_data, sizeof(imu));
+            xSemaphoreGive(g_imu_mutex);
+            
+            // 读取轮电机速度 (线程安全)
+            float left_vel_rad, right_vel_rad;
+            xSemaphoreTake(g_wheel_state_mutex, portMAX_DELAY);
+            left_vel_rad  = g_wheel_state.left_speed  * 0.10472f;   // rpm → rad/s
+            right_vel_rad = g_wheel_state.right_speed * 0.10472f;
+            xSemaphoreGive(g_wheel_state_mutex);
+            
+            // 执行观测器更新 (内部读取 g_vmc_dual_output 等全局变量)
+            velocity_observer_update(dt, &imu, left_vel_rad, right_vel_rad);
+        }
+        
+        vTaskDelayUntil(&last_wake, period);
+    }
+    
+    ESP_LOGI(TAG, "[task_observer] Stopped");
+    g_task_observer = NULL;
     vTaskDelete(NULL);
 }
 
@@ -2876,6 +3039,193 @@ static void update_remote_from_wifi(void) {
         }
     }
 }
+
+// ============================================================================
+// 速度/位移观测器 (2x2 卡尔曼滤波)
+// ============================================================================
+// 状态: x = [v, a]^T  (速度 m/s, 加速度 m/s²)
+// 状态转移: F = [1, dt; 0, 1]  (匀加速模型)
+// 观测: z = [v_encoder, a_imu]^T,  H = I
+// 参考: /home/bubble/wheel-legged/docs/速度与位移观测器设计指南.md
+
+/**
+ * @brief 2x2 卡尔曼滤波器更新 (标量展开, 无矩阵库依赖)
+ * @param dt 时间步长 (秒)
+ * @param z_v 编码器速度观测 (m/s)
+ * @param z_a IMU加速度观测 (m/s²)
+ */
+static void kf_observer_update(float dt, float z_v, float z_a) {
+    // ===== Step 1: 状态预测 x' = F * x =====
+    float v_pred = g_kf_x[0] + g_kf_x[1] * dt;
+    float a_pred = g_kf_x[1];
+    
+    // ===== Step 2: 协方差预测 P' = F * P * F^T + Q =====
+    // F = [1, dt; 0, 1],  F^T = [1, 0; dt, 1]
+    // P = [p00, p01; p10, p11]
+    float p00 = g_kf_P[0], p01 = g_kf_P[1], p10 = g_kf_P[2], p11 = g_kf_P[3];
+    
+    // FP = F * P
+    float fp00 = p00 + dt * p10;
+    float fp01 = p01 + dt * p11;
+    float fp10 = p10;
+    float fp11 = p11;
+    
+    // P' = FP * F^T + Q
+    float pp00 = fp00 + fp01 * dt + g_kf_Q_v;
+    float pp01 = fp01;
+    float pp10 = fp10 + fp11 * dt;
+    float pp11 = fp11 + g_kf_Q_a;
+    
+    // ===== Step 3: 卡尔曼增益 K = P' * H^T * (H * P' * H^T + R)^{-1} =====
+    // H = I, 所以 S = P' + R
+    float s00 = pp00 + g_kf_R_v;
+    float s01 = pp01;
+    float s10 = pp10;
+    float s11 = pp11 + g_kf_R_a;
+    
+    // S^{-1} (2x2 矩阵求逆)
+    float det = s00 * s11 - s01 * s10;
+    if (fabsf(det) < 1e-10f) det = 1e-10f;  // 防止除零
+    float inv_det = 1.0f / det;
+    float si00 =  s11 * inv_det;
+    float si01 = -s01 * inv_det;
+    float si10 = -s10 * inv_det;
+    float si11 =  s00 * inv_det;
+    
+    // K = P' * S^{-1}  (因为 H = I)
+    float k00 = pp00 * si00 + pp01 * si10;
+    float k01 = pp00 * si01 + pp01 * si11;
+    float k10 = pp10 * si00 + pp11 * si10;
+    float k11 = pp10 * si01 + pp11 * si11;
+    
+    // ===== Step 4: 状态更新 x = x' + K * (z - H * x') =====
+    float innov_v = z_v - v_pred;
+    float innov_a = z_a - a_pred;
+    
+    g_kf_x[0] = v_pred + k00 * innov_v + k01 * innov_a;
+    g_kf_x[1] = a_pred + k10 * innov_v + k11 * innov_a;
+    
+    // ===== Step 5: 协方差更新 P = (I - K * H) * P' =====
+    // (I - K) * P'  (因为 H = I)
+    float ikh00 = 1.0f - k00, ikh01 = -k01;
+    float ikh10 = -k10,       ikh11 = 1.0f - k11;
+    
+    g_kf_P[0] = ikh00 * pp00 + ikh01 * pp10;
+    g_kf_P[1] = ikh00 * pp01 + ikh01 * pp11;
+    g_kf_P[2] = ikh10 * pp00 + ikh11 * pp10;
+    g_kf_P[3] = ikh10 * pp01 + ikh11 * pp11;
+    
+    // 防止协方差过度收敛 (最小方差约束)
+    if (g_kf_P[0] < 0.001f) g_kf_P[0] = 0.001f;
+    if (g_kf_P[3] < 0.001f) g_kf_P[3] = 0.001f;
+}
+
+/**
+ * @brief 重置观测器状态
+ */
+static void kf_observer_reset(void) {
+    g_kf_x[0] = 0.0f;
+    g_kf_x[1] = 0.0f;
+    g_kf_P[0] = 1.0f; g_kf_P[1] = 0.0f;
+    g_kf_P[2] = 0.0f; g_kf_P[3] = 1.0f;
+    g_obsv_v_encoder = 0.0f;
+    g_obsv_v_filter = 0.0f;
+    g_obsv_x_filter = 0.0f;
+    g_obsv_a_imu = 0.0f;
+    g_obsv_wheel_v_raw = 0.0f;
+}
+
+/**
+ * @brief 速度观测器主函数 (在 compute_balance_output 中每帧调用)
+ * 
+ * 运动学补偿:
+ *   ω_ground = ω_motor - pitch_rate + d_alpha  (轮子对地绝对角速度)
+ *   v_body = ω_ground * R + L0 * d_theta * cos(theta) + d_L0 * sin(theta)
+ * 
+ * 注意正方向: 本项目 left_vel_rad/right_vel_rad 均为 rpm→rad/s,
+ *   向前运动时左轮为负/右轮为负, 取 -0.5*(L+R) 为正方向
+ */
+static void velocity_observer_update(float dt, const shared_imu_data_t *imu,
+                                      float left_vel_rad, float right_vel_rad) {
+    if (!g_observer_enabled) return;
+    
+    // --- 1) 原始轮速 (无补偿, 保留用于对比) ---
+    g_obsv_wheel_v_raw = (-0.5f) * (left_vel_rad + right_vel_rad) * WHEEL_RADIUS_M;
+    
+    // --- 2) 运动学补偿: 减去机体 pitch 旋转 ---
+    // pitch_rate 单位: °/s → 需要转 rad/s
+    float pitch_rate_rad = imu->pitch_rate * 0.0174533f;  // deg/s → rad/s
+    
+    // 轮子对地绝对角速度 (减去机体旋转)
+    // 两轮编码器方向统一 (都是负=前进), 但物理安装镜像对称
+    // pitch 前倾时: 左轮编码器假读正值, 右轮编码器假读负值 (从各自轴端看旋转方向相反)
+    // 但由于最终取 (-0.5)*(L+R), 左+右- 的对称补偿会被抵消
+    // 所以两轮都用减号, 使 pitch 补偿不被取平均消掉:
+    //   (-0.5)*((L-p)+(R-p)) = (-0.5)*(L+R) + p  → 补偿保留
+    float left_ground_rad  = left_vel_rad  - pitch_rate_rad;   // 左轮: - pitch_rate
+    float right_ground_rad = right_vel_rad - pitch_rate_rad;   // 右轮: - pitch_rate
+    
+    // --- 3) 腿部动力学补偿 (仅在 VMC 使能时) ---
+    float left_vbody = left_ground_rad * WHEEL_RADIUS_M;
+    float right_vbody = right_ground_rad * WHEEL_RADIUS_M;
+    
+    if (g_leg_control_enabled && g_vmc_input_valid) {
+        // 左腿: d_alpha, L0, d_L0, body_angle (需转换为 theta = 与竖直方向的夹角)
+        float l_d_alpha = g_vmc_dual_output.left.current_body_angle_rate * 0.0174533f;  // deg/s → rad/s
+        float l_L0 = g_vmc_dual_output.left.current_leg_length;                          // m
+        float l_d_L0 = g_vmc_dual_output.left.current_leg_length_rate;                   // m/s
+        // body_angle: 腿与机身夹角(度), -90°=垂直向下
+        // theta (与竖直方向夹角) = pitch + body_angle + 90
+        float l_theta_deg = imu->pitch + g_vmc_dual_output.left.current_body_angle + 90.0f;
+        float l_theta = l_theta_deg * 0.0174533f;
+        // d_theta ≈ pitch_rate + d_alpha (简化, 忽略高阶项)
+        float l_d_theta = pitch_rate_rad + l_d_alpha;
+        
+        // 补偿: 加入 d_alpha 和腿部运动学 (同号, 与 pitch_rate 同理)
+        left_ground_rad -= l_d_alpha;  // 轮轴定子随腿摆动
+        left_vbody = left_ground_rad * WHEEL_RADIUS_M
+                   + l_L0 * l_d_theta * cosf(l_theta)
+                   + l_d_L0 * sinf(l_theta);
+        
+        // 右腿: 类似处理
+        float r_d_alpha = g_vmc_dual_output.right.current_body_angle_rate * 0.0174533f;
+        float r_L0 = g_vmc_dual_output.right.current_leg_length;
+        float r_d_L0 = g_vmc_dual_output.right.current_leg_length_rate;
+        float r_theta_deg = imu->pitch + g_vmc_dual_output.right.current_body_angle + 90.0f;
+        float r_theta = r_theta_deg * 0.0174533f;
+        float r_d_theta = pitch_rate_rad + r_d_alpha;
+        
+        right_ground_rad -= r_d_alpha;  // 与左腿同号, 避免取平均时抵消
+        right_vbody = right_ground_rad * WHEEL_RADIUS_M
+                    + r_L0 * r_d_theta * cosf(r_theta)
+                    + r_d_L0 * sinf(r_theta);
+    }
+    
+    // --- 4) 双轮取平均 ---
+    // 本项目: 两轮均为负=前进, 取 -0.5*(L+R) 为前进正方向
+    g_obsv_v_encoder = (-0.5f) * (left_vbody + right_vbody);
+    
+    // --- 5) IMU 加速度 (前进方向, 去除重力) ---
+    // WIT IMU 加速度单位: g,  需要乘以 9.81 得到 m/s²
+    // accel_x 对应前进方向 (已确认), pitch 正=前倾
+    // 加速度计原始读数包含重力, 需要去除重力在前进方向的分量
+    // 机体坐标系 → 世界坐标系前进分量:
+    //   a_forward = accel_x * cos(pitch) - accel_z * sin(pitch)
+    // 重力在前进方向的分量 = -g * sin(pitch), 加速度计已包含, 需抵消:
+    //   净加速度 = (accel_x * cos(pitch) - accel_z * sin(pitch) + sin(pitch)) * 9.81
+    float pitch_rad = imu->pitch * 0.0174533f;
+    g_obsv_a_imu = (imu->accel_x * cosf(pitch_rad) - imu->accel_z * sinf(pitch_rad) 
+                    + sinf(pitch_rad)) * 9.81f;
+    
+    // --- 6) 卡尔曼滤波融合 ---
+    kf_observer_update(dt, g_obsv_v_encoder, g_obsv_a_imu);
+    
+    g_obsv_v_filter = g_kf_x[0];
+    
+    // --- 7) 位移积分 ---
+    g_obsv_x_filter += g_obsv_v_filter * dt;
+}
+
 static void compute_balance_output(float dt) {
     // 读取共享数据
     shared_imu_data_t imu;
@@ -2995,6 +3345,14 @@ static void compute_balance_output(float dt) {
     // 所以两轮都为负时，机器人前进；取负后位移为正表示前进
     g_lqr_distance = (-0.5f) * (left_pos_rad + right_pos_rad) * WHEEL_RADIUS_M;  // 单位: m
     g_lqr_speed = (-0.5f) * (left_vel_rad + right_vel_rad) * WHEEL_RADIUS_M;     // 单位: m/s
+    
+    // ======== 速度/位移观测器 ========
+    // 观测器在独立任务 task_observer 中运行, 这里只读取结果
+    // 可选: 用滤波后的速度/位移替代原始值
+    if (g_observer_enabled) {
+        g_lqr_speed = g_obsv_v_filter;
+        g_lqr_distance = g_obsv_x_filter;
+    }
     
     // ======== YAW 过零处理 ========
     // 处理 IMU YAW 从 +180° 跳到 -180° 的情况
@@ -3303,6 +3661,260 @@ static void compute_balance_output(float dt) {
         output.speed_control = g_triple_pid_output.speed_p_out;
         output.filtered_target_speed = g_triple_pid_output.wheel_speed_target;
         
+    } else if (g_control_mode == CTRL_MODE_FULL_LQR && g_full_lqr_initialized) {
+        // ======== 完整 LQR 控制模式 (同时输出 T 和 Tp) ========
+        // 状态向量: [theta, d_theta, x, v, pitch, pitch_rate]
+        // 输出: T (轮子扭矩), Tp (腿部摆动扭矩)
+        // K 增益根据腿长 L0 实时插值 (三次多项式)
+        
+        // 1. 获取腿部状态 (L0, body_angle, body_angle_rate)
+        //    左腿: theta_L = +pitch + body_angle + 90°, d_theta_L = +pitch_rate + d_alpha
+        //    右腿: theta_R = -pitch - body_angle - 90°, d_theta_R = -pitch_rate - d_alpha
+        //    (参考 DM-balance: 左腿 PitchL=-Pitch, 右腿 PitchR=+Pitch)
+        //    使用上一帧的 VMC 输出获取 body_angle_rate (1帧延迟, 可接受)
+        float left_L0 = g_vmc_dual_output.left.current_leg_length;
+        float right_L0 = g_vmc_dual_output.right.current_leg_length;
+        float avg_L0 = (left_L0 + right_L0) / 2.0f;
+        
+        // 如果 VMC 还没运行过, 从 FK 缓存获取腿长
+        if (avg_L0 < 0.01f) {
+            leg_state_t ls, rs;
+            if (leg_ctrl_get_state_cached(true, &ls) == ESP_OK && ls.valid) {
+                left_L0 = ls.workspace.leg_length;
+            }
+            if (leg_ctrl_get_state_cached(false, &rs) == ESP_OK && rs.valid) {
+                right_L0 = rs.workspace.leg_length;
+            }
+            avg_L0 = (left_L0 + right_L0) / 2.0f;
+            if (avg_L0 < 0.01f) avg_L0 = 0.09f; // 安全默认值
+        }
+        
+        // ======================================================================
+        // theta / d_theta 计算 (左右腿符号不同!)
+        // ======================================================================
+        // 参考 DM-balance VMC_calc.c:
+        //   右腿: theta_R = pi/2 - Pitch   - phi0,  d_theta_R = -PitchGyro   - d_phi0
+        //   左腿: theta_L = pi/2 - (-Pitch) - phi0,  d_theta_L = -(-PitchGyro) - d_phi0
+        //         即 theta_L = pi/2 + Pitch - phi0,  d_theta_L = PitchGyro  - d_phi0
+        //
+
+        //
+        // 左腿(LEFT):  theta_L = +pitch + body_angle + 90  (= pitch_for_control)
+        //               d_theta_L = +pitch_rate + d_alpha
+        // 右腿(RIGHT): theta_R = -pitch - body_angle - 90
+        //               d_theta_R = -pitch_rate - d_alpha
+        // ======================================================================
+        
+        float left_body_angle = g_vmc_dual_output.left.current_body_angle;
+        float right_body_angle = g_vmc_dual_output.right.current_body_angle;
+        if (fabsf(left_body_angle) < 0.01f && fabsf(right_body_angle) < 0.01f) {
+            // VMC 未运行, 从 FK 缓存获取
+            leg_state_t ls2, rs2;
+            if (leg_ctrl_get_state_cached(true, &ls2) == ESP_OK && ls2.valid) {
+                left_body_angle = ls2.workspace.body_angle;
+            }
+            if (leg_ctrl_get_state_cached(false, &rs2) == ESP_OK && rs2.valid) {
+                right_body_angle = rs2.workspace.body_angle;
+            }
+        }
+        
+        float pitch_rate_rad = DEG2RAD(imu.pitch_rate);
+        float left_dalpha_rad = DEG2RAD(g_vmc_dual_output.left.current_body_angle_rate);
+        float right_dalpha_rad = DEG2RAD(g_vmc_dual_output.right.current_body_angle_rate);
+        
+        // 左腿 theta/d_theta (left convention: +pitch)
+        float theta_left_lqr = DEG2RAD(imu.pitch + left_body_angle + 90.0f);
+        float d_theta_left_lqr = pitch_rate_rad + left_dalpha_rad;
+        
+        // 右腿 theta/d_theta (right convention: -pitch)
+        float theta_right_lqr = DEG2RAD(-imu.pitch - right_body_angle - 90.0f);
+        float d_theta_right_lqr = -pitch_rate_rad - right_dalpha_rad;
+
+        // 防劈叉用的 theta: 纯几何角 (不含 pitch, 避免 2*pitch 耦合)
+        float theta_left_rad = DEG2RAD(left_body_angle + 90.0f);
+        float theta_right_rad = DEG2RAD(right_body_angle + 90.0f);
+        
+        // 2. 构造输入并计算左腿 LQR
+        full_lqr_input_t flqr_input_left = {
+            .theta = theta_left_lqr,
+            .d_theta = d_theta_left_lqr,
+            .L0 = left_L0,
+            .x = g_lqr_distance,
+            .v = g_lqr_speed,
+            .pitch = DEG2RAD(imu.pitch),
+            .pitch_rate = pitch_rate_rad,
+            .yaw_total = DEG2RAD(g_yaw_angle_total),
+            .yaw_rate = DEG2RAD(imu.yaw_rate),
+            .theta_left = theta_left_rad,
+            .theta_right = theta_right_rad,
+            .v_set = input.target_speed,
+            .x_set = g_distance_zeropoint,
+            .turn_set = DEG2RAD(g_yaw_angle_total), // 方向保持: turn_set = current_yaw
+            .theta_set = 0.0f,
+            .off_ground = g_wheel_off_ground,
+            .dt = dt,
+            .is_left = true,
+        };
+        
+        // 3. 构造输入并计算右腿 LQR (theta/d_theta 使用右腿符号约定)
+        full_lqr_input_t flqr_input_right = flqr_input_left;
+        flqr_input_right.theta = theta_right_lqr;      // 右腿: -pitch - body_angle - 90
+        flqr_input_right.d_theta = d_theta_right_lqr;  // 右腿: -pitch_rate - d_alpha
+        flqr_input_right.L0 = right_L0;
+        flqr_input_right.is_left = false;
+        
+        // 分别计算左右腿
+        esp_err_t ret_l = full_lqr_compute(&g_full_lqr_ctrl, &flqr_input_left, &g_full_lqr_output_left);
+        esp_err_t ret_r = full_lqr_compute(&g_full_lqr_ctrl, &flqr_input_right, &g_full_lqr_output_right);
+        
+        if (ret_l != ESP_OK || ret_r != ESP_OK) {
+            output.left_wheel_torque = 0;
+            output.right_wheel_torque = 0;
+            g_last_lqr_u = 0;
+            g_full_lqr_Tp_left = 0;
+            g_full_lqr_Tp_right = 0;
+        } else {
+            // 4. 轮子扭矩输出
+            // 重要: LQR 模型(及参考代码)假设左右轮电机镜像安装(正方向相反),
+            //   因此左腿 LQR 输出的 T 符号与右腿相反,使两轮物理上做同向运动.
+            //   但本机器人两轮电机正方向相同(+T = 顺时针 = 后退),
+            //   所以左轮扭矩需要取反,使相反符号的 T_left 变成与 T_right 同向.
+            float T_left = -g_full_lqr_output_left.wheel_torque;  // 取反!
+            float T_right = g_full_lqr_output_right.wheel_torque;
+            
+            // 转向差速 (使用右腿的 turn_torque, 左右对称)
+            float turn_T = g_full_lqr_output_right.turn_torque;
+            
+            // go=true 或 CLI 强制使能时使用转向
+            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
+                // 更新 turn_set 为用户目标 (摇杆积分)
+                // 无操作时保持当前角度 (方向保持)
+                if (fabsf((float)remote.joy_x) > 5.0f) {
+                    // 有转向输入时, 持续改变 turn_set
+                    flqr_input_left.turn_set += DEG2RAD(-remote.joy_x * g_joy_yaw_scale * dt);
+                    flqr_input_right.turn_set = flqr_input_left.turn_set;
+                }
+                g_yaw_output = turn_T;
+                T_left += turn_T;
+                T_right -= turn_T;
+            } else {
+                g_yaw_output = 0.0f;
+            }
+            
+            output.left_wheel_torque = T_left;
+            output.right_wheel_torque = T_right;
+            output.lqr_u = (T_left + T_right) / 2.0f;
+            g_last_lqr_u = output.lqr_u;
+            
+            // 5. Tp 输出 (保存到全局, 由 VMC 计算时注入)
+            g_full_lqr_Tp_left = g_full_lqr_output_left.leg_torque;
+            g_full_lqr_Tp_right = -g_full_lqr_output_right.leg_torque;//由于右腿和左腿的符号相反，取反 右腿Tp原来的符号是顺时针为正
+            g_full_lqr_wheel_T_left = T_left;
+            g_full_lqr_wheel_T_right = T_right;
+        }
+        
+        // 轮子离地保护
+        if (g_wheel_off_ground) {
+            g_distance_zeropoint = g_lqr_distance;
+        }
+        
+        // #FLQR 数据流输出
+        if (g_full_lqr_stream_enable) {
+            printf("#FLQR,%.3f,%.3f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                   g_full_lqr_wheel_T_left,      // 左轮 T
+                   g_full_lqr_wheel_T_right,      // 右轮 T
+                   g_full_lqr_Tp_left,            // 左腿 Tp
+                   g_full_lqr_Tp_right,           // 右腿 Tp
+                   avg_L0,                         // 平均腿长
+                   RAD2DEG(theta_right_lqr),       // theta_right (度, 右腿约定)
+                   RAD2DEG(d_theta_right_lqr),     // d_theta_right (度/s)
+                   g_lqr_distance,                 // x (m)
+                   g_lqr_speed,                    // v (m/s)
+                   imu.pitch,                      // pitch (度)
+                   imu.pitch_rate,                 // pitch_rate (度/s)
+                   g_full_lqr_output_right.split_comp);  // 防劈叉
+        }
+        
+        // 填充兼容字段用于波形显示
+        output.angle_control = g_full_lqr_output_right.state_contrib[0];  // theta 分量
+        output.gyro_control = g_full_lqr_output_right.state_contrib[1];   // d_theta 分量
+        output.speed_control = g_full_lqr_output_right.state_contrib[3];  // v 分量
+        output.filtered_target_speed = input.target_speed;
+        
+        // ======== Roll 控制 + X-Offset (Full LQR 模式) ========
+        // Full LQR 模式下 Roll/X-Offset 与 LQR 模式相同
+        if (g_leg_control_enabled && g_roll_control_enabled) {
+            lqr_roll_output_t roll_output;
+            esp_err_t roll_ret = lqr_roll_loop(&g_lqr_ctrl, &input, &roll_output);
+            
+            if (roll_ret == ESP_OK) {
+                g_roll_output = roll_output.roll_control;
+                g_roll_left_delta = roll_output.left_leg_delta;
+                g_roll_right_delta = roll_output.right_leg_delta;
+                g_roll_filtered = roll_output.filtered_roll;
+                
+                float new_left_length = g_leg_base_length + roll_output.left_leg_delta;
+                float new_right_length = g_leg_base_length + roll_output.right_leg_delta;
+                float left_angle = g_leg_base_angle;
+                float right_angle = g_leg_base_angle;
+                
+                // X-Offset
+                if (g_xoffset_enabled) {
+                    g_xoffset_debug_speed = g_lqr_speed;
+                    g_xoffset_value = pid_compute(&g_xoffset_pid, g_lqr_speed, 0.0f, dt);
+                } else {
+                    g_xoffset_value = 0.0f;
+                    g_xoffset_debug_speed = 0.0f;
+                }
+                
+                if (fabsf(g_xoffset_value) > 0.0001f) {
+                    float lx, ly;
+                    leg_kin_polar_to_cartesian(new_left_length, left_angle, &lx, &ly);
+                    lx += g_xoffset_value;
+                    leg_kin_clamp_cartesian_body(&lx, &ly, NULL);
+                    leg_kin_cartesian_to_polar(lx, ly, &new_left_length, &left_angle);
+                    
+                    float rx, ry;
+                    leg_kin_polar_to_cartesian(new_right_length, right_angle, &rx, &ry);
+                    rx += g_xoffset_value;
+                    leg_kin_clamp_cartesian_body(&rx, &ry, NULL);
+                    leg_kin_cartesian_to_polar(rx, ry, &new_right_length, &right_angle);
+                }
+                
+                if (new_left_length < g_leg_length_min) new_left_length = g_leg_length_min;
+                if (new_left_length > g_leg_length_max) new_left_length = g_leg_length_max;
+                if (new_right_length < g_leg_length_min) new_right_length = g_leg_length_min;
+                if (new_right_length > g_leg_length_max) new_right_length = g_leg_length_max;
+                
+                leg_kin_clamp_workspace(&new_left_length, &left_angle, NULL);
+                leg_kin_clamp_workspace(&new_right_length, &right_angle, NULL);
+                
+                leg_workspace_state_t left_ws = { .leg_length = new_left_length, .body_angle = left_angle };
+                leg_workspace_state_t right_ws = { .leg_length = new_right_length, .body_angle = right_angle };
+                leg_joint_state_t left_joint, right_joint;
+                
+                if (leg_kin_inverse(&left_ws, true, NULL, &left_joint) == ESP_OK) {
+                    g_leg_left_target_length = new_left_length;
+                    g_leg_left_target_angle = left_angle;
+                    g_leg_left_hip_angle = left_joint.hip_angle;
+                    g_leg_left_knee_angle = left_joint.knee_angle;
+                }
+                if (leg_kin_inverse(&right_ws, false, NULL, &right_joint) == ESP_OK) {
+                    g_leg_right_target_length = new_right_length;
+                    g_leg_right_target_angle = right_angle;
+                    g_leg_right_hip_angle = right_joint.hip_angle;
+                    g_leg_right_knee_angle = right_joint.knee_angle;
+                }
+            }
+        } else {
+            g_roll_output = 0.0f;
+            g_roll_left_delta = 0.0f;
+            g_roll_right_delta = 0.0f;
+            g_roll_filtered = 0.0f;
+            g_xoffset_value = 0.0f;
+            g_xoffset_debug_speed = 0.0f;
+        }
+        
     } else {
         // ======== LQR 多环控制模式 (默认) ========
         
@@ -3541,12 +4153,12 @@ static void compute_balance_output(float dt) {
         output.zeropoint_adjust_filtered = zp_filtered;
     }
     
-    // ======== X-Offset 计算 (非 LQR 模式: Dual PID / Single PID) ========
-    // LQR 模式的 x_offset 已在上面计算, 这里处理 Dual PID 和 Single PID 模式
-    if (g_control_mode != CTRL_MODE_LQR && g_xoffset_enabled && g_leg_control_enabled) {
+    // ======== X-Offset 计算 (非 LQR/FULL_LQR 模式: Dual PID / Single PID) ========
+    // LQR 和 FULL_LQR 模式的 x_offset 已在上面计算, 这里处理其他模式
+    if (g_control_mode != CTRL_MODE_LQR && g_control_mode != CTRL_MODE_FULL_LQR && g_xoffset_enabled && g_leg_control_enabled) {
         g_xoffset_debug_speed = g_lqr_speed;
         g_xoffset_value = pid_compute(&g_xoffset_pid, g_lqr_speed, 0.0f, dt);
-    } else if (g_control_mode != CTRL_MODE_LQR) {
+    } else if (g_control_mode != CTRL_MODE_LQR && g_control_mode != CTRL_MODE_FULL_LQR) {
         g_xoffset_value = 0.0f;
         g_xoffset_debug_speed = 0.0f;
         if (!g_xoffset_enabled) {
@@ -4882,6 +5494,79 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance mpow [on|off]\n");
         }
     }
+    // ===== 速度/位移观测器 =====
+    else if (strcmp(token, "obsv") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            printf("=== Velocity Observer (KF) ===\n");
+            printf("Observer: %s\n", g_observer_enabled ? "ENABLED" : "DISABLED");
+            printf("Stream:   %s\n", g_obsv_stream_enable ? "ON" : "OFF");
+            printf("Task:     %d ms (%.0f Hz)\n", g_obsv_period_ms, 1000.0f / g_obsv_period_ms);
+            printf("KF Q: v=%.4f  a=%.4f\n", g_kf_Q_v, g_kf_Q_a);
+            printf("KF R: v=%.2f  a=%.2f\n", g_kf_R_v, g_kf_R_a);
+            printf("--- Current values ---\n");
+            printf("  v_raw(wheel)   = %.4f m/s\n", g_obsv_wheel_v_raw);
+            printf("  v_encoder(comp)= %.4f m/s\n", g_obsv_v_encoder);
+            printf("  v_filter(KF)   = %.4f m/s\n", g_obsv_v_filter);
+            printf("  x_filter       = %.4f m\n",   g_obsv_x_filter);
+            printf("  a_imu          = %.4f m/s2\n", g_obsv_a_imu);
+            printf("Usage: balance obsv [on|off|stream|qv|qa|rv|ra|hz|reset]\n");
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+            g_observer_enabled = true;
+            printf("Velocity observer ENABLED (KF replaces raw speed/distance)\n");
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+            g_observer_enabled = false;
+            printf("Velocity observer DISABLED (using raw wheel speed)\n");
+        } else if (strcmp(token, "stream") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                printf("Observer stream: %s\n", g_obsv_stream_enable ? "ON" : "OFF");
+                printf("Usage: balance obsv stream [on|off]\n");
+            } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+                g_obsv_stream_enable = true;
+                printf("Observer stream ON\n");
+            } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+                g_obsv_stream_enable = false;
+                printf("Observer stream OFF\n");
+            }
+        } else if (strcmp(token, "qv") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) { g_kf_Q_v = atof(token); printf("KF Q_v = %.4f\n", g_kf_Q_v); }
+            else { printf("KF Q_v = %.4f\nUsage: balance obsv qv <value>\n", g_kf_Q_v); }
+        } else if (strcmp(token, "qa") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) { g_kf_Q_a = atof(token); printf("KF Q_a = %.4f\n", g_kf_Q_a); }
+            else { printf("KF Q_a = %.4f\nUsage: balance obsv qa <value>\n", g_kf_Q_a); }
+        } else if (strcmp(token, "rv") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) { g_kf_R_v = atof(token); printf("KF R_v = %.2f\n", g_kf_R_v); }
+            else { printf("KF R_v = %.2f\nUsage: balance obsv rv <value>\n", g_kf_R_v); }
+        } else if (strcmp(token, "ra") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) { g_kf_R_a = atof(token); printf("KF R_a = %.2f\n", g_kf_R_a); }
+            else { printf("KF R_a = %.2f\nUsage: balance obsv ra <value>\n", g_kf_R_a); }
+        } else if (strcmp(token, "reset") == 0) {
+            kf_observer_reset();
+            printf("Observer state reset\n");
+        } else if (strcmp(token, "hz") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                int ms = atoi(token);
+                if (ms >= 1 && ms <= 20) {
+                    g_obsv_period_ms = ms;
+                    printf("Observer period = %d ms (%.0f Hz)\n", ms, 1000.0f / ms);
+                } else {
+                    printf("Invalid period (1-20 ms)\n");
+                }
+            } else {
+                printf("Observer period = %d ms (%.0f Hz)\nUsage: balance obsv hz <ms>\n",
+                       g_obsv_period_ms, 1000.0f / g_obsv_period_ms);
+            }
+        } else {
+            printf("Unknown obsv command: %s\n", token);
+            printf("Usage: balance obsv [on|off|stream|qv|qa|rv|ra|hz|reset]\n");
+        }
+    }
     // ===== 树莓派通信开关 =====
     else if (strcmp(token, "picomm") == 0) {
         token = strtok(NULL, " \t\n\r");
@@ -5143,7 +5828,8 @@ void balance_test_process_cmd(const char *cmd_str) {
             const char *mode_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
                                    (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" : 
                                    (g_control_mode == CTRL_MODE_CAR) ? "CAR" :
-                                   (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" : "SINGLE_PID";
+                                   (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" :
+                                   (g_control_mode == CTRL_MODE_FULL_LQR) ? "FULL_LQR" : "SINGLE_PID";
             printf("Control mode: %s\n", mode_str);
             printf("CTRL_MODE:%s\n", mode_str);
             printf("  LQR:        Multi-loop LQR control (angle+gyro+dist+speed) → torque\n");
@@ -5151,7 +5837,8 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("  SINGLE_PID: Single-loop PID (angle→speed) → speed mode\n");
             printf("  CAR:        Car mode (no balance, direct speed control)\n");
             printf("  TRIPLE_PID: Triple-loop PID (speed→angle→wheel) → torque/speed mode\n");
-            printf("Usage: balance mode [lqr|pid|spid|car|tpid]\n");
+            printf("  FULL_LQR:   Full 6-state LQR (T+Tp, K poly-interp by L0) → torque\n");
+            printf("Usage: balance mode [lqr|pid|spid|car|tpid|flqr]\n");
         } else if (strcmp(token, "lqr") == 0 || strcmp(token, "0") == 0) {
             g_control_mode = CTRL_MODE_LQR;
             // 如果正在运行，切换电机到扭矩模式
@@ -5237,6 +5924,23 @@ void balance_test_process_cmd(const char *cmd_str) {
                            ? "speed" : "torque");
                 printf("CTRL_MODE:TRIPLE_PID\n");
             }
+        } else if (strcmp(token, "flqr") == 0 || strcmp(token, "full_lqr") == 0 || strcmp(token, "5") == 0) {
+            if (!g_full_lqr_initialized) {
+                printf("Error: Full LQR controller not initialized\n");
+            } else {
+                g_control_mode = CTRL_MODE_FULL_LQR;
+                full_lqr_reset(&g_full_lqr_ctrl);
+                g_distance_zeropoint = g_lqr_distance;
+                g_full_lqr_Tp_left = 0.0f;
+                g_full_lqr_Tp_right = 0.0f;
+                // 切换电机到扭矩模式
+                if (g_state == BALANCE_TEST_RUNNING) {
+                    can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                    can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                }
+                printf("Control mode set to FULL_LQR (6-state LQR, T+Tp, torque mode)\n");
+                printf("CTRL_MODE:FULL_LQR\n");
+            }
         } else if (strcmp(token, "exit_car") == 0) {
             // 退出小车模式: 恢复之前的模式和腿部姿态
             if (g_control_mode != CTRL_MODE_CAR) {
@@ -5271,13 +5975,14 @@ void balance_test_process_cmd(const char *cmd_str) {
                 
                 const char *restored_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
                                            (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" :
-                                           (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" : "SINGLE_PID";
+                                           (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" :
+                                           (g_control_mode == CTRL_MODE_FULL_LQR) ? "FULL_LQR" : "SINGLE_PID";
                 printf("Exited car mode, restored to %s\n", restored_str);
                 printf("CTRL_MODE:%s\n", restored_str);
             }
         } else {
             printf("Unknown mode: %s\n", token);
-            printf("Usage: balance mode [lqr|pid|spid|car|tpid|exit_car]\n");
+            printf("Usage: balance mode [lqr|pid|spid|car|tpid|flqr|exit_car]\n");
         }
     }
     // ===== 双环 PID 调参命令 =====
@@ -5871,9 +6576,158 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance joy [speed <scale>|yaw <scale>]\n");
         }
     }
+    // ===== Full LQR 调参和数据流命令 =====
+    else if (strcmp(token, "flqr") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            // 显示当前 Full LQR 参数
+            printf("=== Full LQR Parameters ===\n");
+            printf("Initialized: %s\n", g_full_lqr_initialized ? "YES" : "NO");
+            printf("Pitch offset: %.4f rad (%.2f deg)\n",
+                   g_full_lqr_ctrl.params.pitch_offset,
+                   RAD2DEG(g_full_lqr_ctrl.params.pitch_offset));
+            printf("V set scale: %.2f\n", g_full_lqr_ctrl.params.v_set_scale);
+            printf("Max wheel torque: %.2f Nm\n", g_full_lqr_ctrl.params.max_wheel_torque);
+            printf("Max leg torque: %.2f Nm\n", g_full_lqr_ctrl.params.max_leg_torque);
+            printf("Split PD: Kp=%.3f Kd=%.3f limit=%.2f\n",
+                   g_full_lqr_ctrl.params.split_kp,
+                   g_full_lqr_ctrl.params.split_kd,
+                   g_full_lqr_ctrl.params.split_limit);
+            printf("Turn PD: Kp=%.3f Kd=%.4f limit=%.2f\n",
+                   g_full_lqr_ctrl.params.turn_kp,
+                   g_full_lqr_ctrl.params.turn_kd,
+                   g_full_lqr_ctrl.params.turn_limit);
+            printf("Current Tp: L=%.3f R=%.3f  T: L=%.3f R=%.3f\n",
+                   g_full_lqr_Tp_left, g_full_lqr_Tp_right,
+                   g_full_lqr_wheel_T_left, g_full_lqr_wheel_T_right);
+            printf("Current K gains (R leg, L0 interp):\n");
+            for (int i = 0; i < 12; i++) {
+                printf("  K[%2d] = %+10.4f  (%s)\n", i, g_full_lqr_ctrl.K[i],
+                       i < 6 ? "T" : "Tp");
+            }
+            printf("Usage: balance flqr [stream|pitch_offset|v_scale|max_t|max_tp|split|turn|coeff]\n");
+        } else if (strcmp(token, "stream") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                g_full_lqr_stream_enable = !g_full_lqr_stream_enable;
+            } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+                g_full_lqr_stream_enable = true;
+            } else {
+                g_full_lqr_stream_enable = false;
+            }
+            printf("Full LQR stream: %s\n", g_full_lqr_stream_enable ? "ON" : "OFF");
+        } else if (strcmp(token, "pitch_offset") == 0 || strcmp(token, "po") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_full_lqr_ctrl.params.pitch_offset = atof(token);
+                printf("Pitch offset = %.4f rad (%.2f deg)\n",
+                       g_full_lqr_ctrl.params.pitch_offset,
+                       RAD2DEG(g_full_lqr_ctrl.params.pitch_offset));
+            } else {
+                printf("Current pitch_offset = %.4f rad\n", g_full_lqr_ctrl.params.pitch_offset);
+            }
+        } else if (strcmp(token, "v_scale") == 0 || strcmp(token, "vs") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_full_lqr_ctrl.params.v_set_scale = atof(token);
+                printf("V set scale = %.3f\n", g_full_lqr_ctrl.params.v_set_scale);
+            } else {
+                printf("Current v_scale = %.3f\n", g_full_lqr_ctrl.params.v_set_scale);
+            }
+        } else if (strcmp(token, "max_t") == 0 || strcmp(token, "mt") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_full_lqr_ctrl.params.max_wheel_torque = atof(token);
+                printf("Max wheel torque = %.2f Nm\n", g_full_lqr_ctrl.params.max_wheel_torque);
+            } else {
+                printf("Current max_wheel_torque = %.2f Nm\n", g_full_lqr_ctrl.params.max_wheel_torque);
+            }
+        } else if (strcmp(token, "max_tp") == 0 || strcmp(token, "mtp") == 0) {
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_full_lqr_ctrl.params.max_leg_torque = atof(token);
+                printf("Max leg torque = %.2f Nm\n", g_full_lqr_ctrl.params.max_leg_torque);
+            } else {
+                printf("Current max_leg_torque = %.2f Nm\n", g_full_lqr_ctrl.params.max_leg_torque);
+            }
+        } else if (strcmp(token, "split") == 0) {
+            // balance flqr split <kp> <kd> [limit]
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_full_lqr_ctrl.params.split_kp = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) g_full_lqr_ctrl.params.split_kd = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) g_full_lqr_ctrl.params.split_limit = atof(token);
+            }
+            printf("Split PD: Kp=%.3f Kd=%.3f limit=%.2f\n",
+                   g_full_lqr_ctrl.params.split_kp,
+                   g_full_lqr_ctrl.params.split_kd,
+                   g_full_lqr_ctrl.params.split_limit);
+        } else if (strcmp(token, "turn") == 0) {
+            // balance flqr turn <kp> <kd> [limit]
+            token = strtok(NULL, " \t\n\r");
+            if (token) {
+                g_full_lqr_ctrl.params.turn_kp = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) g_full_lqr_ctrl.params.turn_kd = atof(token);
+                token = strtok(NULL, " \t\n\r");
+                if (token) g_full_lqr_ctrl.params.turn_limit = atof(token);
+            }
+            printf("Turn PD: Kp=%.3f Kd=%.4f limit=%.2f\n",
+                   g_full_lqr_ctrl.params.turn_kp,
+                   g_full_lqr_ctrl.params.turn_kd,
+                   g_full_lqr_ctrl.params.turn_limit);
+        } else if (strcmp(token, "coeff") == 0) {
+            // balance flqr coeff [<row>] [<c0> <c1> <c2> <c3>]
+            token = strtok(NULL, " \t\n\r");
+            if (token == NULL) {
+                // 显示所有多项式系数
+                printf("Poly coefficients [12][4]:\n");
+                for (int i = 0; i < 12; i++) {
+                    printf("  K[%2d]: %+12.4f %+12.4f %+12.4f %+12.4f\n",
+                           i,
+                           g_full_lqr_ctrl.params.poly_coeff[i][0],
+                           g_full_lqr_ctrl.params.poly_coeff[i][1],
+                           g_full_lqr_ctrl.params.poly_coeff[i][2],
+                           g_full_lqr_ctrl.params.poly_coeff[i][3]);
+                }
+            } else {
+                int row = atoi(token);
+                if (row < 0 || row >= 12) {
+                    printf("Row must be 0-11\n");
+                } else {
+                    token = strtok(NULL, " \t\n\r");
+                    if (token) {
+                        g_full_lqr_ctrl.params.poly_coeff[row][0] = atof(token);
+                        token = strtok(NULL, " \t\n\r");
+                        if (token) g_full_lqr_ctrl.params.poly_coeff[row][1] = atof(token);
+                        token = strtok(NULL, " \t\n\r");
+                        if (token) g_full_lqr_ctrl.params.poly_coeff[row][2] = atof(token);
+                        token = strtok(NULL, " \t\n\r");
+                        if (token) g_full_lqr_ctrl.params.poly_coeff[row][3] = atof(token);
+                        printf("K[%d] coeff set: %.4f %.4f %.4f %.4f\n", row,
+                               g_full_lqr_ctrl.params.poly_coeff[row][0],
+                               g_full_lqr_ctrl.params.poly_coeff[row][1],
+                               g_full_lqr_ctrl.params.poly_coeff[row][2],
+                               g_full_lqr_ctrl.params.poly_coeff[row][3]);
+                    } else {
+                        printf("K[%d]: %.4f %.4f %.4f %.4f\n", row,
+                               g_full_lqr_ctrl.params.poly_coeff[row][0],
+                               g_full_lqr_ctrl.params.poly_coeff[row][1],
+                               g_full_lqr_ctrl.params.poly_coeff[row][2],
+                               g_full_lqr_ctrl.params.poly_coeff[row][3]);
+                    }
+                }
+            }
+        } else {
+            printf("Unknown flqr sub-command: %s\n", token);
+            printf("Usage: balance flqr [stream|pitch_offset|v_scale|max_t|max_tp|split|turn|coeff]\n");
+        }
+    }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|wma|joy]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|wma|joy|flqr]\n");
     }
 }
 
