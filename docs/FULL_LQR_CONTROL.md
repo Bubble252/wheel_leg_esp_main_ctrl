@@ -25,31 +25,33 @@ Full LQR 是在原有简易 LQR (4环PID级联) 基础上新增的 **6状态完�
 ## 二、状态向量
 
 ```
-x = [theta, d_theta, x, v, pitch, pitch_rate]  (6维)
+x = [theta, d_theta, x, v, phi, phi_rate]  (6维)
 ```
 
-| 状态 | 符号 | 说明 | 来源 |
+**统一约定 (左右腿完全相同, 不再区分左右):**
+
+| 状态 | 符号 | 说明 | 公式 |
 |------|------|------|------|
-| theta | θ | 腿部摆角 (rad) | pitch + body_angle + 90° |
-| d_theta | dθ | 腿部摆角速度 (rad/s) | pitch_rate + body_angle_rate |
+| theta | θ | 腿部摆角 (rad) | 90° + alpha + pitch |
+| d_theta | dθ | 腿部摆角速度 (rad/s) | pitch_rate + d_alpha |
 | x | x | 机器人位移 (m) | 编码器/观测器 |
 | v | v | 机器人速度 (m/s) | 编码器/观测器 |
-| pitch | φ | 机身俯仰角 (rad) | IMU |
-| pitch_rate | dφ | 机身俯仰角速度 (rad/s) | IMU |
+| phi | φ | 机身俯仰角 (rad) | -IMU_pitch |
+| phi_rate | dφ | 机身俯仰角速度 (rad/s) | -IMU_pitch_rate |
 
 ---
 
 ## 三、控制输出
 
-### 3.1 轮子扭矩 T
+### 3.1 轮子扭矩 T (标准 LQR: u = -Kx)
 ```
-T = K[0]*θ + K[1]*dθ + K[2]*x_err + K[3]*v_err + K[4]*φ_err + K[5]*dφ
+T = -(K[0]*θ + K[1]*dθ + K[2]*x_err + K[3]*v_err + K[4]*φ_err + K[5]*dφ)
 ```
-直接发送给轮毂电机 (扭矩模式)。
+直接发送给轮毂电机 (扭矩模式)。左轮电机正方向相同，需要在上层取反。
 
 ### 3.2 腿部摆动扭矩 Tp
 ```
-Tp = K[6]*θ + K[7]*dθ + K[8]*x_err + K[9]*v_err + K[10]*φ_err + K[11]*dφ
+Tp = -(K[6]*θ + K[7]*dθ + K[8]*x_err + K[9]*v_err + K[10]*φ_err + K[11]*dφ)
 Tp += split_comp  (防劈叉补偿)
 ```
 通过 VMC 的雅可比矩阵转换为关节扭矩, **完全替代** VMC 原有的 F_alpha:
@@ -96,18 +98,30 @@ K_i(L0) = c[0]*L0³ + c[1]*L0² + c[2]*L0 + c[3]
 
 ---
 
-## 五、左右腿符号约定
+## 五、左右腿统一约定
 
-参考代码中, K 增益是基于右腿推导的。左腿通过翻转部分状态符号实现对称:
+**重大变更**: 左右腿现在使用 **完全相同** 的公式，不再做任何符号翻转。
 
-| 状态分量 | 右腿 | 左腿 |
-|----------|------|------|
-| theta | θ | θ (相同) |
-| d_theta | dθ | dθ (相同) |
-| x_err | x - x_set | x_set - x |
-| v_err | v - v_scale*v_set | v_scale*v_set - v |
-| pitch_err | pitch - offset | -pitch + offset |
-| pitch_rate | pitch_rate | -pitch_rate |
+| 状态分量 | 右腿 | 左腿 | 说明 |
+|----------|------|------|------|
+| theta | 90°+α+pitch | 90°+α+pitch | 完全相同 |
+| d_theta | pitch_rate+dα | pitch_rate+dα | 完全相同 |
+| x_err | x - x_set | x - x_set | 完全相同 |
+| v_err | v - v_scale*v_set | v - v_scale*v_set | 完全相同 |
+| phi | -pitch | -pitch | 完全相同 |
+| phi_rate | -pitch_rate | -pitch_rate | 完全相同 |
+
+控制律: **u = -Kx** (标准 LQR)
+
+两腿计算出的 T 和 Tp 含义也完全相同:
+- T > 0 = 轮子向后转 (对两腿同意义)
+- Tp > 0 = F_alpha > 0 = 腿向后摆 (对两腿同意义)
+
+**上层处理**:
+- 左轮电机: T_left = **-**output.wheel_torque (取反，因为电机安装方向)
+- 右轮电机: T_right = output.wheel_torque
+- 左腿 Tp 注入: `hip += J[2]*delta` (正常)
+- 右腿 Tp 注入: `hip += -(J[2]*delta)` (因为 vmc_ctrl_compute 右腿输出已取反)
 
 ---
 

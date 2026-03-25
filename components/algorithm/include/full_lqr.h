@@ -6,17 +6,18 @@
  * 
  * @note 参考 DM-balance 五连杆轮足项目的 LQR 控制方法
  * 
- * 状态向量 x = [theta, d_theta, x, v, pitch, pitch_rate]
- *   - theta:     腿部摆角 (rad), theta = pitch + body_angle + 90°
- *   - d_theta:   腿部摆角速度 (rad/s), d_theta = pitch_rate + d_alpha
- *   - x:         机器人位移 (m), 前进为正
- *   - v:         机器人速度 (m/s), 前进为正  
- *   - pitch:     机身俯仰角 (rad), 前倾为正
- *   - pitch_rate:机身俯仰角速度 (rad/s)
+ * 统一约定 (左右腿完全相同):
+ *   theta   = 90° + alpha + pitch        (alpha = body_angle)
+ *   d_theta = pitch_rate + d_alpha
+ *   phi     = -pitch                      (IMU pitch 取反)
+ *   phi_rate= -pitch_rate
+ *   x, v:   前进为正
  * 
- * 输出:
- *   T  = K[0..5]  × (x - x_ref)   轮子扭矩 (Nm)
- *   Tp = K[6..11] × (x - x_ref)   腿部摆动扭矩 (Nm), 通过 VMC J^T 转换到关节
+ * 状态向量 x = [theta, d_theta, x, v, phi, phi_rate]
+ * 
+ * 控制律: u = -K * x  (标准 LQR)
+ *   T  = -(K[0..5]  × state)   轮子扭矩 (Nm)
+ *   Tp = -(K[6..11] × state)   腿部摆动扭矩 (Nm), 通过 VMC J^T 转换到关节
  * 
  * K 增益随腿长 L0 变化, 用三次多项式拟合:
  *   K_i(L0) = c0*L0^3 + c1*L0^2 + c2*L0 + c3
@@ -85,17 +86,17 @@ typedef struct {
  */
 typedef struct {
     // 腿部状态 (来自 VMC/FK)
-    float theta;                // 腿部摆角 (rad): pitch + body_angle + 90°
-    float d_theta;              // 腿部摆角速度 (rad/s): pitch_rate + d_alpha
+    float theta;                // 腿部摆角 (rad): 90° + alpha + pitch (左右腿相同)
+    float d_theta;              // 腿部摆角速度 (rad/s): pitch_rate + d_alpha (左右腿相同)
     float L0;                   // 当前腿长 (m), 用于插值 K 增益
     
     // 机器人状态 (来自观测器或编码器)
     float x;                    // 位移 (m), 前进为正
     float v;                    // 速度 (m/s), 前进为正
     
-    // IMU 数据
-    float pitch;                // 俯仰角 (rad)
-    float pitch_rate;           // 俯仰角速度 (rad/s)
+    // IMU 数据 (注意: 已由调用者做符号转换!)
+    float pitch;                // phi = -IMU_pitch (rad), 调用者已取反
+    float pitch_rate;           // phi_rate = -IMU_pitch_rate (rad/s), 调用者已取反
     float yaw_total;            // 累积偏航角 (rad)
     float yaw_rate;             // 偏航角速度 (rad/s)
     
@@ -115,8 +116,8 @@ typedef struct {
     // 时间步长
     float dt;                   // 控制周期 (秒)
     
-    // 选择用于哪条腿 (左/右有不同符号)
-    bool is_left;               // true=左腿, false=右腿
+    // [已废弃] 左右腿现在使用完全相同的公式, 此字段不再使用
+    bool is_left;               // (废弃) true=左腿, false=右腿
 } full_lqr_input_t;
 
 /**
@@ -192,14 +193,16 @@ float full_lqr_poly_eval(const float *coeff, float L0);
  * @param output 输出 (T, Tp, 转向, 防劈叉)
  * @return ESP_OK 成功
  * 
- * @note 对于左右两条腿, 分别调用此函数:
- *       - 左腿: input.is_left = true
- *       - 右腿: input.is_left = false
- *       各腿的 theta, d_theta 来自 VMC FK,
- *       x, v 是共享的 (两腿使用同一个观测器/编码器值)
+ * @note 左右两条腿使用完全相同的公式, 分别调用此函数.
+ *       调用者需确保:
+ *         theta   = DEG2RAD(90 + alpha + pitch)
+ *         d_theta = pitch_rate_rad + d_alpha_rad
+ *         pitch   = -IMU_pitch (rad)     ← phi
+ *         pitch_rate = -IMU_pitch_rate   ← phi_rate
+ *       控制律: u = -K * x
  * 
  * 输出解释:
- *   wheel_torque: 轮子扭矩, 直接发给轮毂电机
+ *   wheel_torque: 轮子扭矩, 直接发给轮毂电机 (可能需要上层做左轮取反)
  *   leg_torque:   Tp, 需与 F0(腿长PD+重力补偿) 一起通过 VMC J^T 转换:
  *                 τ_hip  = J[0]*F0 + J[2]*Tp
  *                 τ_knee = J[1]*F0 + J[3]*Tp

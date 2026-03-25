@@ -432,7 +432,7 @@ static uint8_t g_mpow_volt_poll_div = 0;            // 电压轮询分频计数�
 // ============================================================================
 // 速度/位移观测器 (卡尔曼滤波融合: 编码器 + IMU 加速度)
 // ============================================================================
-static bool g_observer_enabled = false;            // 观测器使能 (默认关闭, 需手动开启)
+static bool g_observer_enabled = true;             // 观测器使能 (默认开启, 与参考代码一致)
 static bool g_obsv_stream_enable = false;          // 观测器数据流输出使能
 static int  g_obsv_period_ms = OBSERVER_PERIOD_MS; // 观测器任务周期 (ms, 可 CLI 调参)
 
@@ -440,10 +440,10 @@ static int  g_obsv_period_ms = OBSERVER_PERIOD_MS; // 观测器任务周期 (ms,
 static float g_kf_x[2] = {0};                     // 状态: [速度(m/s), 加速度(m/s²)]
 static float g_kf_P[4] = {1, 0, 0, 1};            // 协方差 P (2x2, 行主序)
 // KF 参数 (可在线调参)
-static float g_kf_Q_v = 0.1f;                     // 过程噪声-速度 (信任模型程度)
-static float g_kf_Q_a = 0.1f;                     // 过程噪声-加速度
-static float g_kf_R_v = 50.0f;                    // 观测噪声-编码器速度
-static float g_kf_R_a = 100.0f;                   // 观测噪声-IMU加速度
+static float g_kf_Q_v = 1.0f;                      // 过程噪声-速度 (对标参考代码 Q=I)
+static float g_kf_Q_a = 1.0f;                      // 过程噪声-加速度
+static float g_kf_R_v = 200.0f;                    // 观测噪声-编码器速度 (对标参考代码 R=200I)
+static float g_kf_R_a = 200.0f;                    // 观测噪声-IMU加速度
 
 // 观测器输出 (可选用于替代原始轮速)
 static float g_obsv_v_encoder = 0.0f;              // 运动学补偿后的编码器速度 (m/s)
@@ -1418,6 +1418,9 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
             // 在 Full LQR 模式下, Tp 完全取代 VMC 的 F_alpha
             // VMC 仍然负责 F_L 腿长控制, 但 F_alpha 方向完全由 Full LQR 的 Tp 控制
             // 做法: 先减去 VMC 已计算的 J^T × F_alpha, 再加上 J^T × Tp
+            //
+            // 统一约定: Tp > 0 = F_alpha > 0 = 增大 alpha = 向后摆
+            // 左右腿 LQR 使用完全相同的公式, Tp 含义也完全相同.
             if (g_control_mode == CTRL_MODE_FULL_LQR && g_full_lqr_initialized) {
                 // 获取当前关节雅可比矩阵
                 leg_joint_state_t left_joint_for_tp = {
@@ -1438,18 +1441,15 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                 float F_alpha_right = g_vmc_dual_output.right.debug.F_alpha;
                 
                 // 左腿: 用 Tp 替代 F_alpha
-                // 注意: 左腿 LQR 内部对状态做了符号翻转(pitch/x/v取反),
-                //   导致 Tp_left 的符号与物理方向相反, 需要取反后才能注入 VMC.
-                //   (与轮子扭矩 T_left 取反同理: 参考代码的左右腿电机镜像安装,
-                //    LQR 输出的符号差异通过电机方向自然抵消;
-                //    我们的代码中左腿电机方向不镜像, 需要手动取反)
-                // τ_new = τ_vmc - J^T×F_alpha + J^T×(-Tp_left) = τ_vmc + J^T×(-Tp_left - F_alpha)
-                float Tp_left = -g_full_lqr_Tp_left;  // 取反!
+                // Tp 与 F_alpha 符号约定相同 (正 = 向后摆), 直接替代
+                float Tp_left = g_full_lqr_Tp_left;
                 float delta_left = Tp_left - F_alpha_left;
                 g_vmc_dual_output.left.hip_torque  += J_left[2] * delta_left;
                 g_vmc_dual_output.left.knee_torque += J_left[3] * delta_left;
                 
-                // 右腿: 用 Tp 替代 F_alpha (取反与 vmc_ctrl_compute 右腿扭矩取反一致)
+                // 右腿: 用 Tp 替代 F_alpha
+                // 注意: vmc_ctrl_compute 已对右腿输出做了整体取反,
+                //   所以这里 J^T 的注入也需要取反才能正确叠加.
                 float Tp_right = g_full_lqr_Tp_right;
                 float delta_right = Tp_right - F_alpha_right;
                 g_vmc_dual_output.right.hip_torque  += -(J_right[2] * delta_right);
@@ -3663,15 +3663,17 @@ static void compute_balance_output(float dt) {
         
     } else if (g_control_mode == CTRL_MODE_FULL_LQR && g_full_lqr_initialized) {
         // ======== 完整 LQR 控制模式 (同时输出 T 和 Tp) ========
-        // 状态向量: [theta, d_theta, x, v, pitch, pitch_rate]
+        // 状态向量: [theta, d_theta, x, v, phi, phi_rate]
         // 输出: T (轮子扭矩), Tp (腿部摆动扭矩)
         // K 增益根据腿长 L0 实时插值 (三次多项式)
+        // 控制律: u = -K * x (标准 LQR, 左右腿完全相同)
         
         // 1. 获取腿部状态 (L0, body_angle, body_angle_rate)
-        //    左腿: theta_L = +pitch + body_angle + 90°, d_theta_L = +pitch_rate + d_alpha
-        //    右腿: theta_R = -pitch - body_angle - 90°, d_theta_R = -pitch_rate - d_alpha
-        //    (参考 DM-balance: 左腿 PitchL=-Pitch, 右腿 PitchR=+Pitch)
-        //    使用上一帧的 VMC 输出获取 body_angle_rate (1帧延迟, 可接受)
+        //    统一约定 (左右腿相同):
+        //      theta   = 90° + alpha + pitch
+        //      d_theta = pitch_rate + d_alpha
+        //      phi     = -pitch
+        //      phi_rate= -pitch_rate
         float left_L0 = g_vmc_dual_output.left.current_leg_length;
         float right_L0 = g_vmc_dual_output.right.current_leg_length;
         float avg_L0 = (left_L0 + right_L0) / 2.0f;
@@ -3690,19 +3692,14 @@ static void compute_balance_output(float dt) {
         }
         
         // ======================================================================
-        // theta / d_theta 计算 (左右腿符号不同!)
+        // theta / d_theta 计算 (左右腿完全相同!)
         // ======================================================================
-        // 参考 DM-balance VMC_calc.c:
-        //   右腿: theta_R = pi/2 - Pitch   - phi0,  d_theta_R = -PitchGyro   - d_phi0
-        //   左腿: theta_L = pi/2 - (-Pitch) - phi0,  d_theta_L = -(-PitchGyro) - d_phi0
-        //         即 theta_L = pi/2 + Pitch - phi0,  d_theta_L = PitchGyro  - d_phi0
-        //
-
-        //
-        // 左腿(LEFT):  theta_L = +pitch + body_angle + 90  (= pitch_for_control)
-        //               d_theta_L = +pitch_rate + d_alpha
-        // 右腿(RIGHT): theta_R = -pitch - body_angle - 90
-        //               d_theta_R = -pitch_rate - d_alpha
+        // 统一约定:
+        //   theta   = 90° + alpha + pitch  (alpha = body_angle)
+        //   d_theta = pitch_rate + d_alpha
+        //   phi     = -pitch
+        //   phi_rate= -pitch_rate
+        // 左右腿使用完全相同的公式, 不再区分符号.
         // ======================================================================
         
         float left_body_angle = g_vmc_dual_output.left.current_body_angle;
@@ -3722,27 +3719,27 @@ static void compute_balance_output(float dt) {
         float left_dalpha_rad = DEG2RAD(g_vmc_dual_output.left.current_body_angle_rate);
         float right_dalpha_rad = DEG2RAD(g_vmc_dual_output.right.current_body_angle_rate);
         
-        // 左腿 theta/d_theta (left convention: +pitch)
-        float theta_left_lqr = DEG2RAD(imu.pitch + left_body_angle + 90.0f);
+        // 左腿 theta/d_theta (统一约定: theta = 90° + alpha + pitch)
+        float theta_left_lqr = DEG2RAD(90.0f + left_body_angle + imu.pitch);
         float d_theta_left_lqr = pitch_rate_rad + left_dalpha_rad;
         
-        // 右腿 theta/d_theta (right convention: -pitch)
-        float theta_right_lqr = DEG2RAD(-imu.pitch - right_body_angle - 90.0f);
-        float d_theta_right_lqr = -pitch_rate_rad - right_dalpha_rad;
+        // 右腿 theta/d_theta (与左腿完全相同的公式!)
+        float theta_right_lqr = DEG2RAD(90.0f + right_body_angle + imu.pitch);
+        float d_theta_right_lqr = pitch_rate_rad + right_dalpha_rad;
 
         // 防劈叉用的 theta: 纯几何角 (不含 pitch, 避免 2*pitch 耦合)
         float theta_left_rad = DEG2RAD(left_body_angle + 90.0f);
         float theta_right_rad = DEG2RAD(right_body_angle + 90.0f);
         
-        // 2. 构造输入并计算左腿 LQR
+        // 2. 构造输入并计算左腿 LQR (统一约定: phi = -pitch, phi_rate = -pitch_rate)
         full_lqr_input_t flqr_input_left = {
             .theta = theta_left_lqr,
             .d_theta = d_theta_left_lqr,
             .L0 = left_L0,
             .x = g_lqr_distance,
             .v = g_lqr_speed,
-            .pitch = DEG2RAD(imu.pitch),
-            .pitch_rate = pitch_rate_rad,
+            .pitch = -DEG2RAD(imu.pitch),         // phi = -pitch
+            .pitch_rate = -pitch_rate_rad,          // phi_rate = -pitch_rate
             .yaw_total = DEG2RAD(g_yaw_angle_total),
             .yaw_rate = DEG2RAD(imu.yaw_rate),
             .theta_left = theta_left_rad,
@@ -3753,15 +3750,15 @@ static void compute_balance_output(float dt) {
             .theta_set = 0.0f,
             .off_ground = g_wheel_off_ground,
             .dt = dt,
-            .is_left = true,
+            .is_left = true,   // 已废弃, 不影响计算
         };
         
-        // 3. 构造输入并计算右腿 LQR (theta/d_theta 使用右腿符号约定)
+        // 3. 构造输入并计算右腿 LQR (与左腿完全相同的公式!)
         full_lqr_input_t flqr_input_right = flqr_input_left;
-        flqr_input_right.theta = theta_right_lqr;      // 右腿: -pitch - body_angle - 90
-        flqr_input_right.d_theta = d_theta_right_lqr;  // 右腿: -pitch_rate - d_alpha
+        flqr_input_right.theta = theta_right_lqr;      // 右腿: 90° + alpha_right + pitch
+        flqr_input_right.d_theta = d_theta_right_lqr;  // 右腿: pitch_rate + d_alpha_right
         flqr_input_right.L0 = right_L0;
-        flqr_input_right.is_left = false;
+        flqr_input_right.is_left = false;  // 已废弃, 不影响计算
         
         // 分别计算左右腿
         esp_err_t ret_l = full_lqr_compute(&g_full_lqr_ctrl, &flqr_input_left, &g_full_lqr_output_left);
@@ -3775,11 +3772,8 @@ static void compute_balance_output(float dt) {
             g_full_lqr_Tp_right = 0;
         } else {
             // 4. 轮子扭矩输出
-            // 重要: LQR 模型(及参考代码)假设左右轮电机镜像安装(正方向相反),
-            //   因此左腿 LQR 输出的 T 符号与右腿相反,使两轮物理上做同向运动.
-            //   但本机器人两轮电机正方向相同(+T = 顺时针 = 后退),
-            //   所以左轮扭矩需要取反,使相反符号的 T_left 变成与 T_right 同向.
-            float T_left = -g_full_lqr_output_left.wheel_torque;  // 取反!
+           
+            float T_left = g_full_lqr_output_left.wheel_torque; 
             float T_right = g_full_lqr_output_right.wheel_torque;
             
             // 转向差速 (使用右腿的 turn_torque, 左右对称)
@@ -3807,10 +3801,11 @@ static void compute_balance_output(float dt) {
             g_last_lqr_u = output.lqr_u;
             
             // 5. Tp 输出 (保存到全局, 由 VMC 计算时注入)
+            // 左右腿 LQR 使用完全相同的公式, Tp 符号约定也完全相同, 不再需要取反.
             g_full_lqr_Tp_left = g_full_lqr_output_left.leg_torque;
-            g_full_lqr_Tp_right = -g_full_lqr_output_right.leg_torque;//由于右腿和左腿的符号相反，取反 右腿Tp原来的符号是顺时针为正
-            g_full_lqr_wheel_T_left = T_left;
-            g_full_lqr_wheel_T_right = T_right;
+            g_full_lqr_Tp_right = g_full_lqr_output_right.leg_torque;
+            g_full_lqr_wheel_T_left = -T_left;//都要取反因为仿真和现实中不一样
+            g_full_lqr_wheel_T_right = -T_right;//取反！
         }
         
         // 轮子离地保护

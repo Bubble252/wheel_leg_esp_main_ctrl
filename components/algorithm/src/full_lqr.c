@@ -7,10 +7,19 @@
  * @note 参考 DM-balance 五连杆轮足项目的 LQR 控制方法
  * 
  * 与简易 LQR 的主要区别:
- *   1. 状态向量 6 维: [theta, d_theta, x, v, pitch, pitch_rate]
+ *   1. 状态向量 6 维: [theta, d_theta, x, v, phi, phi_rate]
  *   2. 同时输出轮子扭矩 T 和腿部摆动扭矩 Tp (不再仅输出 T)
  *   3. K 增益根据腿长 L0 实时插值 (三次多项式拟合)
  *   4. Tp 通过 VMC 的 J^T 转换为 hip/knee 关节扭矩
+ * 
+ * 统一约定 (左右腿完全相同, 不再区分左右):
+ *   theta   = 90° + alpha + pitch
+ *   d_theta = pitch_rate + d_alpha
+ *   phi     = -pitch
+ *   phi_rate= -pitch_rate
+ *   x, v:   前进为正
+ * 
+ * 控制律: u = -K * x  (标准 LQR)
  */
 
 #include "full_lqr.h"
@@ -21,36 +30,25 @@
 static const char *TAG = "FULL_LQR";
 
 // ============================================================================
-// 默认多项式拟合系数 (来自 DM-balance 项目)
+// 默认多项式拟合系数 (来自 get_k.m 的新系数)
 // K_i(L0) = c[0]*L0^3 + c[1]*L0^2 + c[2]*L0 + c[3]
 // K[0..5]  -> 轮子扭矩 T 的 6 个增益
 // K[6..11] -> 腿部摆动扭矩 Tp 的 6 个增益
 // ============================================================================
 static const float DEFAULT_POLY_COEFF[FULL_LQR_K_DIM][FULL_LQR_POLY_ORDER] = {
-    // K[0]: theta 对 T 的增益
-    {-213.6885f, 153.3306f, -50.978f, -0.13318f},
-    // K[1]: d_theta 对 T 的增益
-    {-1.1412f, 1.2471f, -3.633f, 0.056666f},
-    // K[2]: x 对 T 的增益
-    {-82.3054f, 49.8361f, -10.6676f, -0.73082f},
-    // K[3]: v 对 T 的增益
-    {-70.3514f, 43.3124f, -10.1995f, -0.64679f},
-    // K[4]: pitch 对 T 的增益
-    {-246.3632f, 173.9108f, -47.6573f, 6.1294f},
-    // K[5]: pitch_rate 对 T 的增益
-    {-13.1949f, 10.2265f, -3.1718f, 0.52012f},
-    // K[6]: theta 对 Tp 的增益
-    {114.4332f, -51.7589f, 2.8343f, 2.599f},
-    // K[7]: d_theta 对 Tp 的增益
-    {14.4172f, -8.5621f, 1.6232f, 0.13359f},
-    // K[8]: x 对 Tp 的增益
-    {-154.0047f, 107.3901f, -28.8305f, 3.5029f},
-    // K[9]: v 对 Tp 的增益
-    {-128.9122f, 90.0203f, -24.2995f, 3.035f},
-    // K[10]: pitch 对 Tp 的增益
-    {577.6103f, -351.5575f, 75.9638f, 4.2419f},
-    // K[11]: pitch_rate 对 Tp 的增益
-    {46.4618f, -29.0229f, 6.5446f, 0.061617f},
+    /* K[0] */ { -85.9446f,  51.8245f, -16.0279f,  0.0171f },
+    /* K[1] */ {  -0.7067f,   0.2248f,  -1.2956f,  0.0074f },
+    /* K[2] */ { -91.1227f,  47.5999f,  -8.8752f, -0.0779f },
+    /* K[3] */ { -76.6760f,  40.6210f,  -8.1250f, -0.0850f },
+    /* K[4] */ { -124.8101f,110.1666f, -34.2998f,  4.6626f },
+    /* K[5] */ {  -6.0142f,   5.2943f,  -1.6627f,  0.2328f },
+
+    /* K[6] */ { 278.8236f, -95.8756f,   2.7879f,  3.3673f },
+    /* K[7] */ {  27.2014f, -11.0475f,   1.3292f,  0.3141f },
+    /* K[8] */ { -101.9070f, 89.9506f, -28.0057f,  3.8070f },
+    /* K[9] */ { -106.9091f, 87.5343f, -26.1997f,  3.6044f },
+    /* K[10]*/ { 2232.0404f,-1165.9537f,217.3977f,  1.9079f },
+    /* K[11]*/ { 112.8738f, -59.0739f,  11.0640f,  0.0073f },
 };
 
 // ============================================================================
@@ -178,74 +176,54 @@ esp_err_t full_lqr_compute(full_lqr_controller_t *ctrl,
         output->K[i] = ctrl->K[i];
     }
     
-    // === 2. 构建状态误差向量 ===
-    // 参考代码的状态向量: [theta, d_theta, x_err, v_err, pitch_err, pitch_rate]
+    // === 2. 构建状态向量 ===
+    // 统一约定 (左右腿完全相同, 不再区分 is_left):
+    //   theta   = 90° + alpha + pitch  (调用前已计算好, 传入 input->theta)
+    //   d_theta = pitch_rate + d_alpha  (调用前已计算好, 传入 input->d_theta)
+    //   phi     = -pitch               (调用前已计算好, 传入 input->pitch = -IMU_pitch)
+    //   phi_rate= -pitch_rate          (调用前已计算好, 传入 input->pitch_rate = -IMU_pitch_rate)
+    //   x, v:   前进为正 (统一)
     //
-    // 符号约定 (参考 DM-balance):
-    //   - 右腿: x_err = (x - x_set),     v_err = (v - v_scale * v_set)
-    //   - 左腿: x_err = (x_set - x),     v_err = (v_scale * v_set - v)
-    //   - 右腿: pitch_err = (pitch - offset), pitch_rate 正常
-    //   - 左腿: pitch = -IMU_Pitch,           pitch_rate = -IMU_PitchRate
-    //
-    // 在我们的项目中:
-    //   theta/d_theta 已经在调用前按左右腿分别计算:
-    //     左腿: theta_L = +Pitch + alpha + 90°,  d_theta_L = +pitch_rate + d_alpha
-    //     右腿: theta_R = -Pitch + alpha + 90°,  d_theta_R = -pitch_rate + d_alpha
-    //   (对应参考代码 VMC_calc_1_left/right 中的 theta/d_theta)
-    //   x, v: 统一的位移/速度 (前进为正)
-    //   pitch, pitch_rate: IMU 原始值 （但是需要取反）
-    //
-    // 参考代码中左右腿的 x/v 和 pitch/pitch_rate 符号相反
-    // 这是因为 K 增益是基于右腿推导的,
-    // 左腿通过取反实现对称控制
+    // 控制律: u = -K * x  (标准 LQR)
+    //   T  = -(K[0]*theta + K[1]*d_theta + K[2]*(x-x_set) + K[3]*(v-v_scale*v_set) + K[4]*phi + K[5]*phi_rate)
+    //   Tp = -(K[6]*theta + K[7]*d_theta + K[8]*(x-x_set) + K[9]*(v-v_scale*v_set) + K[10]*phi + K[11]*phi_rate)
     
-    float theta = input->theta;             // 腿部摆角 (rad)
-    float d_theta = input->d_theta;         // 腿部摆角速度 (rad/s)
+    float theta = input->theta;             // 腿部摆角 (rad): 90° + alpha + pitch
+    float d_theta = input->d_theta;         // 腿部摆角速度 (rad/s): pitch_rate + d_alpha
+    float phi = input->pitch;               // 机身俯仰 (rad): -IMU_pitch (已由调用者取反)
+    float phi_rate = input->pitch_rate;     // 机身俯仰角速度 (rad/s): -IMU_pitch_rate (已由调用者取反)
     float pitch_offset = ctrl->params.pitch_offset;
     float v_scale = ctrl->params.v_set_scale;
     
-    float x_err, v_err, pitch_err, pitch_rate_err;
+    // 状态误差
+    float x_err = input->x - input->x_set;
+    float v_err = input->v - v_scale * input->v_set;
+    float phi_err = phi - pitch_offset;
+    float phi_rate_err = phi_rate;
     
-    if (input->is_left) {
-        // 左腿: 反转 x/v 和 pitch/pitch_rate 的符号
-        // 参考: chassis->x_set - chassis->x_filter
-        // 参考: myPithL = -ins->Pitch, 所以 pitch_err = (-pitch) - (-offset) = -pitch + offset
-        x_err = input->x_set - input->x;
-        v_err = v_scale * input->v_set - input->v;
-        pitch_err = input->pitch - pitch_offset;  // = -pitch + offset
-        pitch_rate_err = input->pitch_rate;
-    } else {
-        // 右腿: 原始符号
-        // 参考: chassis->x_filter - chassis->x_set
-        x_err = input->x - input->x_set;
-        v_err = input->v - v_scale * input->v_set;
-        pitch_err =  -input->pitch - (-pitch_offset);//因为原参考代码时从右边看 逆时针为正
-        pitch_rate_err = -input->pitch_rate;
-    }
+    // === 3. 计算轮子扭矩 T = -(K[0..5] × state) ===
+    float T = -(ctrl->K[0] * theta
+              + ctrl->K[1] * d_theta
+              + ctrl->K[2] * x_err
+              + ctrl->K[3] * v_err
+              + ctrl->K[4] * phi_err
+              + ctrl->K[5] * phi_rate_err);
     
-    // === 3. 计算轮子扭矩 T (K[0..5] × state) ===
-    float T = ctrl->K[0] * theta
-            + ctrl->K[1] * d_theta
-            + ctrl->K[2] * x_err
-            + ctrl->K[3] * v_err
-            + ctrl->K[4] * pitch_err
-            + ctrl->K[5] * pitch_rate_err;
+    // 保存各分量用于调试 (带负号)
+    output->state_contrib[0] = -(ctrl->K[0] * theta);
+    output->state_contrib[1] = -(ctrl->K[1] * d_theta);
+    output->state_contrib[2] = -(ctrl->K[2] * x_err);
+    output->state_contrib[3] = -(ctrl->K[3] * v_err);
+    output->state_contrib[4] = -(ctrl->K[4] * phi_err);
+    output->state_contrib[5] = -(ctrl->K[5] * phi_rate_err);
     
-    // 保存各分量用于调试
-    output->state_contrib[0] = ctrl->K[0] * theta;
-    output->state_contrib[1] = ctrl->K[1] * d_theta;
-    output->state_contrib[2] = ctrl->K[2] * x_err;
-    output->state_contrib[3] = ctrl->K[3] * v_err;
-    output->state_contrib[4] = ctrl->K[4] * pitch_err;
-    output->state_contrib[5] = ctrl->K[5] * pitch_rate_err;
-    
-    // === 4. 计算腿部摆动扭矩 Tp (K[6..11] × state) ===
-    float Tp = ctrl->K[6] * (theta + input->theta_set)
-             + ctrl->K[7] * d_theta
-             + ctrl->K[8] * x_err
-             + ctrl->K[9] * v_err
-             + ctrl->K[10] * pitch_err
-             + ctrl->K[11] * pitch_rate_err;
+    // === 4. 计算腿部摆动扭矩 Tp = -(K[6..11] × state) ===
+    float Tp = -(ctrl->K[6] * (theta + input->theta_set)
+               + ctrl->K[7] * d_theta
+               + ctrl->K[8] * x_err
+               + ctrl->K[9] * v_err
+               + ctrl->K[10] * phi_err
+               + ctrl->K[11] * phi_rate_err);
     
     // === 5. 防劈叉补偿 (PD 控制) ===
     // theta_err = left.theta - right.theta
@@ -274,8 +252,8 @@ esp_err_t full_lqr_compute(full_lqr_controller_t *ctrl,
     // === 7. 离地保护 ===
     if (input->off_ground && ctrl->params.enable_off_ground_protect) {
         // 离地时: 清零 x/v 分量, 仅保留 theta + d_theta
-        T = ctrl->K[0] * theta + ctrl->K[1] * d_theta;
-        Tp = ctrl->K[6] * theta + ctrl->K[7] * d_theta + split_comp;
+        T = -(ctrl->K[0] * theta + ctrl->K[1] * d_theta);
+        Tp = -(ctrl->K[6] * theta + ctrl->K[7] * d_theta) + split_comp;
         // 清零轮子扭矩 (参考代码离地时 wheel_T = 0)
         T = 0.0f;
     }

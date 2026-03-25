@@ -430,12 +430,12 @@ static inline float clamp_f(float value, float min_val, float max_val) {
 /**
  * @brief 扭矩补偿: 将期望实际扭矩(Nm)反解为需要发送的电机命令扭矩(Nm)
  * 
- * 使用拟合的三次多项式直接从期望扭矩(y)计算命令扭矩(x):
- *   x = 6.4068 * y^3 - 5.8745 * y^2 + 2.3684 * y + 0.0529
+ * 使用拟合的四次多项式直接从期望扭矩(y)计算命令扭矩(x):
+ *   x = -47.3469*y^4 + 49.5360*y^3 - 18.4321*y^2 + 3.6328*y + 0.0230
  * 
- * 比之前的二次方程求根法更快 (无 sqrtf，仅乘加运算)。
+ * 注意: 多项式在 y≈0.44Nm 后非单调, 因此输入限幅到 0.45Nm.
  * 
- * @param desired_torque_Nm 期望的实际输出扭矩 (Nm), 可正可负
+ * @param desired_torque_Nm 期望的实际输出扭矩 (Nm), 可正可负, |值|限幅到0.45
  * @return 需要发送给电机的命令扭矩 (Nm)
  */
 float vmc_torque_compensate(float desired_torque_Nm) {
@@ -447,9 +447,12 @@ float vmc_torque_compensate(float desired_torque_Nm) {
     // 取绝对值计算，保持关于原点中心对称
     float y = fabsf(desired_torque_Nm);
     
-    // 三次多项式: x = a3*y^3 + a2*y^2 + a1*y + a0
-    // Horner 形式: x = ((a3*y + a2)*y + a1)*y + a0
-    float cmd_Nm = ((6.4068f * y - 5.8745f) * y + 2.3684f) * y + 0.0529f;
+    // 限幅: 四次多项式在 y≈0.44 后非单调, 限制输入不超过 0.45 Nm
+    if (y > 0.45f) y = 0.45f;
+    
+    // 四次多项式: x = a4*y^4 + a3*y^3 + a2*y^2 + a1*y + a0
+    // Horner 形式: x = ((((a4*y + a3)*y + a2)*y + a1)*y + a0
+    float cmd_Nm = (((-47.346949f * y + 49.535997f) * y - 18.432131f) * y + 3.632793f) * y + 0.022952f;
     if (cmd_Nm < 0.0f) cmd_Nm = 0.0f;
     
     return (desired_torque_Nm >= 0) ? cmd_Nm : -cmd_Nm;
