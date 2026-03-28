@@ -65,7 +65,7 @@ static const char *TAG = "BAL_TEST";
 #define IMU_READ_PERIOD_MS          3       // 333Hz IMU 读取 (仅分离模式使用)
 #define BALANCE_CTRL_PERIOD_MS      2       // 500Hz 平衡控制
 #define MOTOR_COMM_PERIOD_MS        2       // 500Hz 电机通信 (与控制同步)
-#define LEG_MOTOR_DIVIDER           5       // 腿电机分频 (500Hz / 5 = 100Hz, 大幅减轻CAN负担)
+#define LEG_MOTOR_DIVIDER           2       // 腿电机分频 (500Hz / 2 = 250Hz, CAN利用率约50%)
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 #define OBSERVER_PERIOD_MS          3       // 333Hz 速度观测器 (独立任务)
 
@@ -451,6 +451,13 @@ static float g_obsv_v_filter = 0.0f;               // 卡尔曼滤波后的速�
 static float g_obsv_x_filter = 0.0f;               // 滤波速度积分位移 (m)
 static float g_obsv_a_imu = 0.0f;                  // IMU 前进方向加速度 (m/s²), 已去重力
 static float g_obsv_wheel_v_raw = 0.0f;            // 原始轮速 (无补偿) (m/s)
+
+// 加速度计零偏校准 + 低通滤波 + 死区
+static float g_accel_bias = 0.0f;                  // 启动时校准的加速度偏置 (m/s²)
+static bool  g_accel_bias_calibrated = false;       // 偏置校准完成标志
+static float g_accel_lpf = 0.0f;                   // 低通滤波后的加速度 (m/s²)
+static float g_accel_lpf_tau = 0.009f;             // LPF 时间常数 (s), 对标参考代码
+static float g_accel_deadzone = 0.2f;              // 死区阈值 (m/s²), 约 0.02g
 
 // ============================================================================
 // 关节电机速度滤波 (支持中值滤波 / 限幅滤波切换)
@@ -2649,6 +2656,38 @@ static void task_observer(void *arg) {
     ESP_LOGI(TAG, "[task_observer] Started on Core %d, period %d ms (%.0f Hz)",
              xPortGetCoreID(), g_obsv_period_ms, 1000.0f / g_obsv_period_ms);
     
+    // --- 启动时加速度计零偏校准 (采集 200 次取平均, ~0.6s) ---
+    if (!g_accel_bias_calibrated) {
+        const int CAL_SAMPLES = 200;
+        float bias_sum = 0.0f;
+        int valid_count = 0;
+        ESP_LOGI(TAG, "[observer] Accel bias calibration: collecting %d samples...", CAL_SAMPLES);
+        
+        for (int i = 0; i < CAL_SAMPLES && g_tasks_running; i++) {
+            shared_imu_data_t imu;
+            xSemaphoreTake(g_imu_mutex, portMAX_DELAY);
+            memcpy(&imu, &g_imu_data, sizeof(imu));
+            xSemaphoreGive(g_imu_mutex);
+            
+            if (imu.valid) {
+                float pitch_rad = imu.pitch * 0.0174533f;
+                float a_raw = (imu.accel_x * cosf(pitch_rad)
+                             - imu.accel_z * sinf(pitch_rad)
+                             + sinf(pitch_rad)) * 9.81f;
+                bias_sum += a_raw;
+                valid_count++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(3));
+        }
+        
+        if (valid_count > 0) {
+            g_accel_bias = bias_sum / valid_count;
+            g_accel_bias_calibrated = true;
+            ESP_LOGI(TAG, "[observer] Accel bias calibrated: %.4f m/s² (%d samples)",
+                     g_accel_bias, valid_count);
+        }
+    }
+    
     while (g_tasks_running) {
         const TickType_t period = pdMS_TO_TICKS(g_obsv_period_ms);
         const float dt = g_obsv_period_ms / 1000.0f;
@@ -3214,8 +3253,24 @@ static void velocity_observer_update(float dt, const shared_imu_data_t *imu,
     // 重力在前进方向的分量 = -g * sin(pitch), 加速度计已包含, 需抵消:
     //   净加速度 = (accel_x * cos(pitch) - accel_z * sin(pitch) + sin(pitch)) * 9.81
     float pitch_rad = imu->pitch * 0.0174533f;
-    g_obsv_a_imu = (imu->accel_x * cosf(pitch_rad) - imu->accel_z * sinf(pitch_rad) 
-                    + sinf(pitch_rad)) * 9.81f;
+    float a_raw = (imu->accel_x * cosf(pitch_rad) - imu->accel_z * sinf(pitch_rad) 
+                   + sinf(pitch_rad)) * 9.81f;
+    
+    // 5a) 零偏补偿
+    if (g_accel_bias_calibrated) {
+        a_raw -= g_accel_bias;
+    }
+    
+    // 5b) 低通滤波 (一阶 IIR, 对标参考代码 AccelLPF ≈ 0.009s)
+    float alpha = dt / (g_accel_lpf_tau + dt);
+    g_accel_lpf = g_accel_lpf * (1.0f - alpha) + a_raw * alpha;
+    
+    // 5c) 死区滤波 (消除静止时的微小偏移)
+    if (fabsf(g_accel_lpf) < g_accel_deadzone) {
+        g_obsv_a_imu = 0.0f;
+    } else {
+        g_obsv_a_imu = g_accel_lpf;
+    }
     
     // --- 6) 卡尔曼滤波融合 ---
     kf_observer_update(dt, g_obsv_v_encoder, g_obsv_a_imu);
@@ -3795,8 +3850,8 @@ static void compute_balance_output(float dt) {
                 g_yaw_output = 0.0f;
             }
             
-            output.left_wheel_torque = T_left;
-            output.right_wheel_torque = T_right;
+            output.left_wheel_torque = -T_left;//都要取反因为仿真和现实中不一样
+            output.right_wheel_torque = -T_right;//取反！
             output.lqr_u = (T_left + T_right) / 2.0f;
             g_last_lqr_u = output.lqr_u;
             
@@ -3804,8 +3859,8 @@ static void compute_balance_output(float dt) {
             // 左右腿 LQR 使用完全相同的公式, Tp 符号约定也完全相同, 不再需要取反.
             g_full_lqr_Tp_left = g_full_lqr_output_left.leg_torque;
             g_full_lqr_Tp_right = g_full_lqr_output_right.leg_torque;
-            g_full_lqr_wheel_T_left = -T_left;//都要取反因为仿真和现实中不一样
-            g_full_lqr_wheel_T_right = -T_right;//取反！
+            g_full_lqr_wheel_T_left = T_left;
+            g_full_lqr_wheel_T_right = T_right;
         }
         
         // 轮子离地保护
