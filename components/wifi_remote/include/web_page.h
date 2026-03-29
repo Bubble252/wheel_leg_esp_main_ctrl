@@ -320,7 +320,7 @@ static const char web_page_html[] = R"rawliteral(
             </div>
             
             <div class="ctrl-row">
-                <label>📍 Distance Loop (位移环)</label>
+                <label>� Distance Loop (位移环)</label>
                 <input type="checkbox" id="distEnableSwitch" class="switch" checked onclick="toggleDistEnable()">
             </div>
         </div>
