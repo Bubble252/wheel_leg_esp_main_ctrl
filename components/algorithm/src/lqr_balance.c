@@ -1196,18 +1196,18 @@ static const triple_pid_params_t triple_pid_default_params = {
     .angle_kp = 1.2f,
     .angle_ki = 0.0f,
     .angle_kd = 0.0f,
-    .angle_limit = 20.0f,       // 最大目标轮速 20 rad/s
+    .angle_limit = 28.0f,       // 最大目标轮速 28 rad/s
 
     // 轮速环 (内环): wheel_speed_target - wheel_speed → torque
     .wheel_kp = 0.5f,
     .wheel_ki = 0.01f,
     .wheel_kd = 0.0f,
-    .wheel_limit = 15.0f,       // 最大扭矩 15 Nm
+    .wheel_limit = 20.0f,       // 最大扭矩 20 Nm
 
     // 通用参数
     .angle_zeropoint = -7.0f,
     .emergency_angle = 45.0f,
-    .max_torque = 15.0f,
+    .max_torque = 20.0f,
     .speed_cmd_gain = 15.0f,
     .lpf_joyy_tf = 0.2f,
     

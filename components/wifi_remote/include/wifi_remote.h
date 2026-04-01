@@ -68,6 +68,9 @@ typedef struct {
     // 位移环开关
     bool dist_enable;           // 位移环使能 (true=开启位移环)
     
+    // Yaw 闭环开关
+    bool yaw_enable;            // Yaw 控制使能 (true=开启转向控制)
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量

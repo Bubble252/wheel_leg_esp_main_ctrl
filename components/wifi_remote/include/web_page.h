@@ -268,16 +268,6 @@ static const char web_page_html[] = R"rawliteral(
         
         <div id="status" class="status disconnected">Disconnected</div>
         
-        <div class="switch-container">
-            <input type="checkbox" id="goSwitch" class="switch" onclick="toggleGo()">
-            <label for="goSwitch" style="font-size:18px; font-weight:bold;"> Robot Go!</label>
-        </div>
-        
-        <div class="switch-container">
-            <input type="checkbox" id="carSwitch" class="switch car-switch" onclick="toggleCarMode()">
-            <label for="carSwitch" style="font-size:16px; font-weight:bold;"> 🚗 Car Mode</label>
-        </div>
-        
         <!-- 紧急停止 -->
         <div class="ctrl-panel">
             <div class="estop-container">
@@ -295,7 +285,12 @@ static const char web_page_html[] = R"rawliteral(
             </div>
             
             <div class="ctrl-row">
-                <label>📐 Pitch Compensation</label>
+                <label>� Yaw Enable</label>
+                <input type="checkbox" id="yawEnableSwitch" class="switch" checked onclick="toggleYawEnable()">
+            </div>
+            
+            <div class="ctrl-row">
+                <label>�📐 Pitch Compensation</label>
                 <input type="checkbox" id="pitchCompSwitch" class="switch" onclick="togglePitchComp()">
             </div>
             
@@ -440,6 +435,7 @@ static const char web_page_html[] = R"rawliteral(
     var socket;
     var g_go = 0;
     var g_carMode = 0;
+    var g_yawEnable = 1;
     var g_height = 38;
     var g_roll = 0;
     var g_joyX = 0;
@@ -464,6 +460,7 @@ static const char web_page_html[] = R"rawliteral(
     var g_drAngle = -90;
     var g_drSpeed = 0;
     var msgCount = 0;
+    var heartbeatTimer = null;
     
     // WebSocket 初始化
     function initWebSocket() {
@@ -474,12 +471,16 @@ static const char web_page_html[] = R"rawliteral(
             document.getElementById('status').className = 'status connected';
             document.getElementById('status').innerText = 'Connected';
             log('WebSocket connected');
+            // 启动心跳: 每500ms发送一次数据，防止看门狗超时
+            if (heartbeatTimer) clearInterval(heartbeatTimer);
+            heartbeatTimer = setInterval(function(){ sendData(true); }, 500);
         };
         
         socket.onclose = function() {
             document.getElementById('status').className = 'status disconnected';
             document.getElementById('status').innerText = 'Disconnected';
             log('WebSocket disconnected, reconnecting...');
+            if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
             setTimeout(initWebSocket, 2000);
         };
         
@@ -501,7 +502,7 @@ static const char web_page_html[] = R"rawliteral(
         }
     }
     
-    function sendData() {
+    function sendData(silent) {
         if (socket && socket.readyState === WebSocket.OPEN) {
             var data = {
                 mode: 'basic',
@@ -531,23 +532,21 @@ static const char web_page_html[] = R"rawliteral(
                 detail_right_speed: g_drSpeed,
                 joy_speed_gain: g_joySpeedGain / 1000.0,
                 joy_yaw_gain: g_joyYawGain / 1000.0,
-                dist_enable: g_distEnable
+                dist_enable: g_distEnable,
+                yaw_enable: g_yawEnable
             };
             socket.send(JSON.stringify(data));
             msgCount++;
-            log('TX[' + msgCount + ']: dir=' + g_dir + ' joy=(' + g_joyX + ',' + g_joyY + ') go=' + g_go);
+            if (!silent) {
+                log('TX[' + msgCount + ']: dir=' + g_dir + ' joy=(' + g_joyX + ',' + g_joyY + ') go=' + g_go);
+            }
         }
     }
     
-    function toggleGo() {
-        g_go = document.getElementById('goSwitch').checked ? 1 : 0;
+    function toggleYawEnable() {
+        g_yawEnable = document.getElementById('yawEnableSwitch').checked ? 1 : 0;
         sendData();
-    }
-    
-    function toggleCarMode() {
-        g_carMode = document.getElementById('carSwitch').checked ? 1 : 0;
-        sendData();
-        log('Car mode: ' + (g_carMode ? 'ON' : 'OFF'));
+        log('Yaw enable: ' + (g_yawEnable ? 'ON' : 'OFF'));
     }
     
     function updateHeight() {
@@ -584,9 +583,9 @@ static const char web_page_html[] = R"rawliteral(
         if (g_estop) {
             btn.className = 'estop-btn active';
             btn.innerText = '🛑 E-STOP ACTIVE!';
-            // 急停时自动关闭 go
-            g_go = 0;
-            document.getElementById('goSwitch').checked = false;
+            // 急停时自动关闭平衡
+            g_balanceEnable = 0;
+            document.getElementById('balanceSwitch').checked = false;
         } else {
             btn.className = 'estop-btn';
             btn.innerText = '🛑 Emergency Stop';

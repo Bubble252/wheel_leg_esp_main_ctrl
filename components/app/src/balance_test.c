@@ -285,7 +285,7 @@ static int g_uncontrolable = 0;             // 失控标志
 
 // 遥杆映射比例 (可通过 UI/CLI 在线调节)
 static float g_joy_speed_scale = 0.003f;    // joy_y → target_speed 比例 (默认 0.003, max ±0.3)
-static float g_joy_yaw_scale = 0.03f;       // joy_x → target_yaw_rate 比例 (默认 0.03)
+static float g_joy_yaw_scale = 0.09f;       // joy_x → target_yaw_rate 比例 (默认 0.09)
 static float g_tpid_yaw_scale = 500.0f;     // 三环PID yaw输出缩放 (LQR yaw输出太小, 需放大)
 
 // 轮速加速度计算 (用于离地检测)
@@ -2731,19 +2731,17 @@ static void task_remote_watchdog(void *arg) {
     while (g_tasks_running) {
         // 检查遥控超时
         if (wifi_remote_check_timeout(REMOTE_TIMEOUT_MS)) {
-            // 超时，禁用遥控输入
-            xSemaphoreTake(g_remote_mutex, portMAX_DELAY);
-            if (g_remote_data.go) {
-                // 限流打印: 每秒最多一次
-                static uint32_t last_timeout_log_ms = 0;
-                uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                if (now_ms - last_timeout_log_ms >= 1000) {
-                    ESP_LOGW(TAG, "Remote timeout, disabling go");
-                    last_timeout_log_ms = now_ms;
-                }
-                g_remote_data.go = false;
+            // 超时，紧急停止 (仅在非 EMERGENCY 状态时触发一次)
+            if (g_state != BALANCE_TEST_EMERGENCY) {
+                ESP_LOGW(TAG, "Remote timeout, emergency stop");
+                balance_test_emergency_stop();
             }
-            xSemaphoreGive(g_remote_mutex);
+        } else {
+            // WiFi 恢复连接，自动清除超时导致的 EMERGENCY 状态
+            if (g_state == BALANCE_TEST_EMERGENCY) {
+                ESP_LOGI(TAG, "Remote reconnected, clearing emergency");
+                balance_test_reset_emergency();
+            }
         }
         
         // 统计 WiFi 消息数
@@ -2784,80 +2782,17 @@ static void update_remote_from_wifi(void) {
     
     xSemaphoreGive(g_remote_mutex);
     
-    // 根据 go 状态切换平衡控制
-    static bool last_go = false;
-    if (wifi_data->go && !last_go) {
-        // go 从 false 变为 true
-        balance_test_enable();
-    } else if (!wifi_data->go && last_go) {
-        // go 从 true 变为 false
-        balance_test_disable();
-    }
-    last_go = wifi_data->go;
-    
-    // 根据 car_mode 状态切换小车模式
-    static bool last_car_mode = false;
-    if (wifi_data->car_mode && !last_car_mode) {
-        // car_mode 从 false 变为 true → 进入小车模式
-        if (g_control_mode != CTRL_MODE_CAR) {
-            g_car_mode_prev_mode = g_control_mode;
-            g_car_mode_prev_base_angle = g_leg_base_angle;
-            g_car_mode_prev_base_length = g_leg_base_length;
-            g_control_mode = CTRL_MODE_CAR;
-            
-            if (g_state == BALANCE_TEST_RUNNING) {
-                can_motor_set_mode(g_motor_left, MODE_SPEED);
-                can_motor_set_mode(g_motor_right, MODE_SPEED);
-            }
-            if (g_leg_control_enabled) {
-                leg_ctrl_set_target(true, CAR_MODE_LEG_LENGTH, CAR_MODE_BODY_ANGLE);
-                leg_ctrl_set_target(false, CAR_MODE_LEG_LENGTH, CAR_MODE_BODY_ANGLE);
-            }
-            ESP_LOGI(TAG, "WiFi: Entered CAR mode (body=%.0f°, leg=%.0fmm)",
-                     CAR_MODE_BODY_ANGLE, CAR_MODE_LEG_LENGTH * 1000.0f);
-            printf("CTRL_MODE:CAR\n");
-        }
-    } else if (!wifi_data->car_mode && last_car_mode) {
-        // car_mode 从 true 变为 false → 退出小车模式
-        if (g_control_mode == CTRL_MODE_CAR) {
-            if (g_state == BALANCE_TEST_RUNNING) {
-                can_motor_set_speed(g_motor_left, 0);
-                can_motor_set_speed(g_motor_right, 0);
-            }
-            if (g_leg_control_enabled) {
-                leg_ctrl_set_target(true, g_car_mode_prev_base_length, g_car_mode_prev_base_angle);
-                leg_ctrl_set_target(false, g_car_mode_prev_base_length, g_car_mode_prev_base_angle);
-            }
-            g_control_mode = g_car_mode_prev_mode;
-            if (g_state == BALANCE_TEST_RUNNING) {
-                if (g_control_mode == CTRL_MODE_SINGLE_PID ||
-                    (g_control_mode == CTRL_MODE_TRIPLE_PID && g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
-                    can_motor_set_mode(g_motor_left, MODE_SPEED);
-                    can_motor_set_mode(g_motor_right, MODE_SPEED);
-                } else {
-                    can_motor_set_mode(g_motor_left, MODE_TORQUE);
-                    can_motor_set_mode(g_motor_right, MODE_TORQUE);
-                }
-            }
-            const char *restored_str = (g_control_mode == CTRL_MODE_LQR) ? "LQR" : 
-                                       (g_control_mode == CTRL_MODE_DUAL_PID) ? "DUAL_PID" :
-                                       (g_control_mode == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" : "SINGLE_PID";
-            ESP_LOGI(TAG, "WiFi: Exited CAR mode, restored to %s", restored_str);
-            printf("CTRL_MODE:%s\n", restored_str);
-        }
-    }
-    last_car_mode = wifi_data->car_mode;
-    
     // ======== 处理紧急停止 ========
     static bool last_estop = false;
     if (wifi_data->estop && !last_estop) {
         ESP_LOGW(TAG, "WiFi: E-STOP activated!");
-        balance_test_disable();
+        balance_test_emergency_stop();
         if (g_leg_control_enabled) {
             balance_test_set_leg_control(false);
         }
     } else if (!wifi_data->estop && last_estop) {
         ESP_LOGI(TAG, "WiFi: E-STOP released");
+        balance_test_reset_emergency();
     }
     last_estop = wifi_data->estop;
     
@@ -2941,6 +2876,25 @@ static void update_remote_from_wifi(void) {
         printf("Triple PID distance loop %s\n", wifi_data->dist_enable ? "ENABLED" : "DISABLED");
         printf("TPID:DISTEN,%d\n", wifi_data->dist_enable ? 1 : 0);
         last_dist_enable = wifi_data->dist_enable;
+    }
+    
+    // ======== 处理 Yaw 闭环开关 ========
+    static bool last_yaw_enable = true;  // 默认开启
+    if (wifi_data->yaw_enable != last_yaw_enable) {
+        g_yaw_control_enabled = wifi_data->yaw_enable;
+        if (!wifi_data->yaw_enable) {
+            g_yaw_output = 0.0f;
+        } else {
+            // 开启时同步方向锁定点到当前航向角，避免累积误差冲击
+            g_lqr_ctrl.yaw_angle_target = g_yaw_angle_total;
+            g_lqr_ctrl.yaw_holding = false;
+            pid_reset(&g_lqr_ctrl.pid_yaw_angle);
+            pid_reset(&g_lqr_ctrl.pid_yaw_gyro);
+        }
+        ESP_LOGW(TAG, "WiFi: Yaw %s, target=%.1f total=%.1f",
+                 wifi_data->yaw_enable ? "ON" : "OFF",
+                 g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
+        last_yaw_enable = wifi_data->yaw_enable;
     }
     
     // ======== 处理腿部使能 ========
@@ -3488,7 +3442,13 @@ static void compute_balance_output(float dt) {
         g_distance_zeropoint = g_lqr_distance;
         lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
         triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
+        // 保存 yaw 状态 (lqr_reset 会清零)
+        float saved_yaw_target = g_lqr_ctrl.yaw_angle_target;
+        bool saved_yaw_holding = g_lqr_ctrl.yaw_holding;
         lqr_reset(&g_lqr_ctrl);  // 仅重置一次
+        // 恢复 yaw 状态 (移动时不应该丢失方向保持)
+        g_lqr_ctrl.yaw_angle_target = saved_yaw_target;
+        g_lqr_ctrl.yaw_holding = saved_yaw_holding;
     }
     if (is_moving || is_turning) {
         // 移动或转向过程中持续更新位移零点 (防止位移环干扰)
@@ -3517,6 +3477,29 @@ static void compute_balance_output(float dt) {
         triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
     }
     
+    // ======== YAW 使能边沿检测 (所有控制模式通用) ========
+    // 检测 OFF→ON 瞬间: 重置目标角到当前角, 清 PID, 使 error 从 0 起步
+    {
+        static bool prev_yaw_enabled = true;  // 匹配 g_yaw_control_enabled 的启动默认值
+        bool yaw_now = g_yaw_control_enabled && (g_uncontrolable == 0);
+
+        if (yaw_now && !prev_yaw_enabled) {
+            // OFF→ON: 同步目标到当前角度, 清零 PID, error 立刻为 0
+            g_lqr_ctrl.yaw_angle_target = g_yaw_angle_total;
+            g_lqr_ctrl.yaw_holding = false;
+            pid_reset(&g_lqr_ctrl.pid_yaw_angle);
+            pid_reset(&g_lqr_ctrl.pid_yaw_gyro);
+            g_yaw_output = 0.0f;
+            ESP_LOGW(TAG, "YAW ON edge: target=%.1f total=%.1f rate=%.1f",
+                     g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total, imu.yaw_rate);
+        }
+        if (!yaw_now && prev_yaw_enabled) {
+            g_yaw_output = 0.0f;
+            ESP_LOGW(TAG, "YAW OFF edge: total=%.1f", g_yaw_angle_total);
+        }
+        prev_yaw_enabled = yaw_now;
+    }
+
     // ======== 根据控制模式选择算法 ========
     lqr_output_t output = {0};
     
@@ -3548,12 +3531,12 @@ static void compute_balance_output(float dt) {
             float torque = g_dual_pid_output.torque;
             output.lqr_u = torque;  // 用于波形显示兼容
             
-            // YAW 控制 (go=true 或 CLI 强制使能)
-            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
+            // YAW 控制
+            if (g_yaw_control_enabled) {
                 lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
                 g_yaw_output = output.yaw_control;
-                output.left_wheel_torque = torque + g_yaw_output;
-                output.right_wheel_torque = torque - g_yaw_output;
+                output.left_wheel_torque = torque - g_yaw_output;
+                output.right_wheel_torque = torque + g_yaw_output;
             } else {
                 output.left_wheel_torque = torque;
                 output.right_wheel_torque = torque;
@@ -3596,9 +3579,9 @@ static void compute_balance_output(float dt) {
             // 存入 output 结构 (注意这里是速度不是扭矩，需要后续特殊处理)
             output.lqr_u = target_speed;  // 用于波形显示兼容
             
-            // YAW 控制 (go=true 或 CLI 强制使能)
+            // YAW 控制
             // 单环模式下 YAW 也是速度差速
-            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
+            if (g_yaw_control_enabled) {
                 lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
                 g_yaw_output = output.yaw_control;
                 output.left_wheel_torque = target_speed + g_yaw_output;
@@ -3641,7 +3624,7 @@ static void compute_balance_output(float dt) {
         if (right_speed_rpm > CAR_MODE_MAX_SPEED) right_speed_rpm = CAR_MODE_MAX_SPEED;
         if (right_speed_rpm < -CAR_MODE_MAX_SPEED) right_speed_rpm = -CAR_MODE_MAX_SPEED;
         
-        // go 开关: 只有 go=true 时才输出速度
+        // go 开关: CAR模式需要go=true才输出速度 (WiFi已移除, CLI可用)
         if (!remote.go) {
             left_speed_rpm = 0;
             right_speed_rpm = 0;
@@ -3689,12 +3672,12 @@ static void compute_balance_output(float dt) {
             float ctrl_output = g_triple_pid_output.torque;
             output.lqr_u = ctrl_output;
             
-            // YAW 控制 (go=true 或 CLI 强制使能)
-            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
+            // YAW 控制
+            if (g_yaw_control_enabled) {
                 lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
                 g_yaw_output = output.yaw_control * g_tpid_yaw_scale;  // 缩放到三环PID量级
-                output.left_wheel_torque = ctrl_output + g_yaw_output;
-                output.right_wheel_torque = ctrl_output - g_yaw_output;
+                output.left_wheel_torque = ctrl_output - g_yaw_output;
+                output.right_wheel_torque = ctrl_output + g_yaw_output;
             } else {
                 output.left_wheel_torque = ctrl_output;
                 output.right_wheel_torque = ctrl_output;
@@ -3834,8 +3817,8 @@ static void compute_balance_output(float dt) {
             // 转向差速 (使用右腿的 turn_torque, 左右对称)
             float turn_T = g_full_lqr_output_right.turn_torque;
             
-            // go=true 或 CLI 强制使能时使用转向
-            if ((remote.go || g_yaw_force_enable) && g_yaw_control_enabled) {
+            // 转向差速
+            if (g_yaw_control_enabled) {
                 // 更新 turn_set 为用户目标 (摇杆积分)
                 // 无操作时保持当前角度 (方向保持)
                 if (fabsf((float)remote.joy_x) > 5.0f) {
@@ -3844,8 +3827,8 @@ static void compute_balance_output(float dt) {
                     flqr_input_right.turn_set = flqr_input_left.turn_set;
                 }
                 g_yaw_output = turn_T;
-                T_left += turn_T;
-                T_right -= turn_T;
+                T_left += g_yaw_output;
+                T_right -= g_yaw_output;
             } else {
                 g_yaw_output = 0.0f;
             }
@@ -4008,10 +3991,12 @@ static void compute_balance_output(float dt) {
         }
         
         // ======== YAW 轴转向控制 ========
-        // go=true 或 CLI 强制使能时生效 (无需遥控器也可方向保持)
-        if ((remote.go || g_yaw_force_enable) && g_uncontrolable == 0 && g_yaw_control_enabled) {
+        {
+            // 注: 通用边沿检测已在 compute_balance_output 入口处完成
+            bool yaw_active = g_yaw_control_enabled && g_uncontrolable == 0;
+            
+            if (yaw_active) {
             // 使用 lqr_yaw_loop 计算 YAW 控制量
-            // input.target_yaw_rate 已经在前面设置为 remote.joy_x * 0.02f
             lqr_yaw_loop(&g_lqr_ctrl, &input, &output);
             
             // 保存 YAW 输出用于调试
@@ -4019,9 +4004,10 @@ static void compute_balance_output(float dt) {
             
             // 合成输出 (参考 shibo_wheel_leg)
             // 平衡控制输出 + YAW 差速
+            // 正yaw_output → 右轮加速 → 左转(CCW) → yaw_total增大
             float lqr_u = output.lqr_u;
-            output.left_wheel_torque = lqr_u + g_yaw_output;
-            output.right_wheel_torque = lqr_u - g_yaw_output;
+            output.left_wheel_torque = lqr_u - g_yaw_output;
+            output.right_wheel_torque = lqr_u + g_yaw_output;
         } else {
             // 简单模式/YAW禁用时，直接使用 LQR 输出，无 YAW 控制
             float lqr_u = output.lqr_u;
@@ -4029,6 +4015,7 @@ static void compute_balance_output(float dt) {
             output.right_wheel_torque = lqr_u;
             g_yaw_output = 0.0f;
         }
+        }  // end YAW block
         g_last_lqr_u = output.lqr_u;  // 保存用于波形显示
         
         // ======== X-Offset 计算 (腿部速度自适应偏移) ========
@@ -5818,14 +5805,14 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("YAW force enable: %s\n", g_yaw_force_enable ? "ON" : "OFF");
             printf("YAW loop enabled: %s\n", g_yaw_control_enabled ? "YES" : "NO");
             printf("TPID yaw scale:  %.1f\n", g_tpid_yaw_scale);
-            printf("  When FORCE ON, YAW works without remote.go\n");
+            printf("  When FORCE ON, YAW works regardless of WiFi yaw_enable\n");
             printf("Usage: balance yaw [on|off|scale <value>]\n");
         } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0 || strcmp(token, "enable") == 0) {
             g_yaw_force_enable = true;
             printf("YAW force enable ON - YAW active without remote\n");
         } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0 || strcmp(token, "disable") == 0) {
             g_yaw_force_enable = false;
-            printf("YAW force enable OFF - YAW requires remote.go\n");
+            printf("YAW force enable OFF - YAW controlled by WiFi yaw_enable\n");
         } else if (strcmp(token, "scale") == 0) {
             token = strtok(NULL, " \t\n\r");
             if (token) {
