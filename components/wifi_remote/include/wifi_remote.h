@@ -71,6 +71,12 @@ typedef struct {
     // Yaw 闭环开关
     bool yaw_enable;            // Yaw 控制使能 (true=开启转向控制)
     
+    // Roll 闭环开关
+    bool roll_enable;           // Roll 控制使能 (true=开启横滚平衡)
+    
+    // 跳跃按钮
+    bool jump;                  // 跳跃按钮 (true=按下跳跃, 上升沿触发)
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量

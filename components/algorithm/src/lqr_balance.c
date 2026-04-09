@@ -60,10 +60,10 @@ static const lqr_params_t default_params = {
     .yaw_gyro_limit = 7.0f,
     
     // 横滚控制 PID
-    .roll_kp = 0.0f,
+    .roll_kp = 0.001f,
     .roll_ki = 0.0f,
     .roll_kd = 0.0f,
-    .roll_limit = 5.0f,
+    .roll_limit = 0.015f,
     
     // 零点调整 PID
     .zeropoint_kp = 0.0f,

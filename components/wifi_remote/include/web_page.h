@@ -304,6 +304,11 @@ static const char web_page_html[] = R"rawliteral(
                 </select>
             </div>
             
+            <div class="ctrl-row">
+                <label>🚗 Car Mode (趴下跑)</label>
+                <input type="checkbox" id="carModeSwitch" class="switch" onclick="toggleCarMode()">
+            </div>
+            
             <div class="slider-row">
                 <label id="joySpeedLabel">🏎️ Speed Gain: 3.0 ‰</label>
                 <input type="range" id="joySpeedSlider" min="1" max="20" value="3" step="0.5" oninput="updateJoySpeed()">
@@ -327,6 +332,11 @@ static const char web_page_html[] = R"rawliteral(
             <div class="ctrl-row">
                 <label>🔌 Leg Enable</label>
                 <input type="checkbox" id="legEnableSwitch" class="switch" onclick="toggleLegEnable()">
+            </div>
+            
+            <div class="ctrl-row">
+                <label>↔️ Roll Enable</label>
+                <input type="checkbox" id="rollEnableSwitch" class="switch" onclick="toggleRollEnable()">
             </div>
             
             <div class="slider-row">
@@ -446,6 +456,7 @@ static const char web_page_html[] = R"rawliteral(
     var g_ctrlMode = 4;
     var g_pitchComp = 0;
     var g_legEnable = 0;
+    var g_rollEnable = 0;
     var g_legAngle = -90;
     var g_legLength = 90;
     var g_joySpeedGain = 3.0;
@@ -533,7 +544,8 @@ static const char web_page_html[] = R"rawliteral(
                 joy_speed_gain: g_joySpeedGain / 1000.0,
                 joy_yaw_gain: g_joyYawGain / 1000.0,
                 dist_enable: g_distEnable,
-                yaw_enable: g_yawEnable
+                yaw_enable: g_yawEnable,
+                roll_enable: g_rollEnable
             };
             socket.send(JSON.stringify(data));
             msgCount++;
@@ -594,6 +606,12 @@ static const char web_page_html[] = R"rawliteral(
         log('E-Stop: ' + (g_estop ? 'ACTIVE' : 'Released'));
     }
     
+    function toggleCarMode() {
+        g_carMode = document.getElementById('carModeSwitch').checked ? 1 : 0;
+        sendData();
+        log('Car Mode: ' + (g_carMode ? 'ON' : 'OFF'));
+    }
+    
     function updateCtrlMode() {
         g_ctrlMode = parseInt(document.getElementById('ctrlModeSelect').value);
         var names = {0:'LQR', 1:'Dual PID', 2:'Single PID', 4:'Triple PID'};
@@ -611,6 +629,12 @@ static const char web_page_html[] = R"rawliteral(
         g_legEnable = document.getElementById('legEnableSwitch').checked ? 1 : 0;
         sendData();
         log('Leg Enable: ' + (g_legEnable ? 'ON' : 'OFF'));
+    }
+    
+    function toggleRollEnable() {
+        g_rollEnable = document.getElementById('rollEnableSwitch').checked ? 1 : 0;
+        sendData();
+        log('Roll Enable: ' + (g_rollEnable ? 'ON' : 'OFF'));
     }
     
     function updateLegAngle() {

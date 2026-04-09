@@ -2740,6 +2740,176 @@ class MotorControlPanel(QWidget):
 
 
 # ============================================================================
+# STW 电机配置面板 (仅 STW 品牌电机适用)
+# ============================================================================
+class STWConfigPanel(QWidget):
+    """STW 电机驱动器内部参数配置面板"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ---- 电机选择 ----
+        sel_layout = QHBoxLayout()
+        sel_layout.addWidget(QLabel("电机:"))
+        self.motor_combo = QComboBox()
+        self.motor_combo.addItems([
+            "1 - 左髋", "2 - 左膝", "3 - 左轮",
+            "4 - 右髋", "5 - 右膝", "6 - 右轮"
+        ])
+        sel_layout.addWidget(self.motor_combo)
+        self.info_btn = QPushButton("📋 读取电机信息")
+        self.info_btn.clicked.connect(self._read_info)
+        sel_layout.addWidget(self.info_btn)
+        layout.addLayout(sel_layout)
+
+        # 电机信息显示
+        self.info_label = QLabel("极对数: --  Kt: --  减速比: --")
+        self.info_label.setStyleSheet(SS("font-weight: bold; padding: 4px;"))
+        layout.addWidget(self.info_label)
+
+        # ---- 参数限制 (0xB2-0xB5) ----
+        limit_group = QGroupBox("参数限制")
+        limit_layout = QGridLayout()
+
+        self.limit_inputs = {}
+        limits = [
+            ("maxspeed", "最大速度 (RPM)", -10000, 10000, 100, 1),
+            ("maxcur",   "最大电流 (A)",   0, 50, 0.5, 2),
+            ("slope",    "电流斜率 (A/s)", 0, 10000, 10, 1),
+            ("accel",    "加速度 (RPM/s)", 0, 100000, 100, 1),
+        ]
+        for row, (key, label, lo, hi, step, dec) in enumerate(limits):
+            limit_layout.addWidget(QLabel(label), row, 0)
+            spin = QDoubleSpinBox()
+            spin.setRange(lo, hi)
+            spin.setSingleStep(step)
+            spin.setDecimals(dec)
+            limit_layout.addWidget(spin, row, 1)
+            btn = QPushButton("设置")
+            btn.clicked.connect(lambda checked, k=key: self._set_limit(k))
+            limit_layout.addWidget(btn, row, 2)
+            self.limit_inputs[key] = spin
+
+        limit_group.setLayout(limit_layout)
+        layout.addWidget(limit_group)
+
+        # ---- 驱动器 PID (0xB6-0xB9) ----
+        pid_group = QGroupBox("驱动器内部 PID")
+        pid_layout = QGridLayout()
+
+        self.pid_inputs = {}
+        pid_params = [
+            ("pos_kp", "位置 Kp"),
+            ("pos_ki", "位置 Ki"),
+            ("spd_kp", "速度 Kp"),
+            ("spd_ki", "速度 Ki"),
+        ]
+        for row, (key, label) in enumerate(pid_params):
+            pid_layout.addWidget(QLabel(label), row, 0)
+            spin = QDoubleSpinBox()
+            spin.setRange(0, 99999)
+            spin.setSingleStep(0.1)
+            spin.setDecimals(6)
+            pid_layout.addWidget(spin, row, 1)
+            w_btn = QPushButton("写入")
+            w_btn.clicked.connect(lambda checked, k=key: self._write_pid(k))
+            pid_layout.addWidget(w_btn, row, 2)
+            self.pid_inputs[key] = spin
+
+        read_all_btn = QPushButton("📖 读取全部 PID")
+        read_all_btn.clicked.connect(self._read_all_pid)
+        pid_layout.addWidget(read_all_btn, len(pid_params), 0, 1, 3)
+
+        pid_group.setLayout(pid_layout)
+        layout.addWidget(pid_group)
+
+        # ---- MIT 运控模式 ----
+        mit_group = QGroupBox("MIT 阻抗控制")
+        mit_layout = QGridLayout()
+
+        # MIT 配置
+        mit_layout.addWidget(QLabel("pos_max (rad):"), 0, 0)
+        self.mit_pmax = QDoubleSpinBox(); self.mit_pmax.setRange(0, 100); self.mit_pmax.setDecimals(2); self.mit_pmax.setValue(12.57)
+        mit_layout.addWidget(self.mit_pmax, 0, 1)
+        mit_layout.addWidget(QLabel("vel_max (rad/s):"), 0, 2)
+        self.mit_vmax = QDoubleSpinBox(); self.mit_vmax.setRange(0, 500); self.mit_vmax.setDecimals(2); self.mit_vmax.setValue(45.0)
+        mit_layout.addWidget(self.mit_vmax, 0, 3)
+        mit_layout.addWidget(QLabel("t_max (Nm):"), 0, 4)
+        self.mit_tmax = QDoubleSpinBox(); self.mit_tmax.setRange(0, 100); self.mit_tmax.setDecimals(2); self.mit_tmax.setValue(18.0)
+        mit_layout.addWidget(self.mit_tmax, 0, 5)
+        self.mit_cfg_btn = QPushButton("设置 MIT 配置")
+        self.mit_cfg_btn.clicked.connect(self._set_mit_config)
+        mit_layout.addWidget(self.mit_cfg_btn, 0, 6)
+
+        # MIT 控制
+        mit_ctrl_labels = [("目标位置 (rad):", "mit_pos", -50, 50, 0.1, 3),
+                           ("目标速度 (rad/s):", "mit_vel", -100, 100, 1, 2),
+                           ("Kp (0~500):", "mit_kp", 0, 500, 1, 1),
+                           ("Kd (0~5):", "mit_kd", 0, 5, 0.01, 3),
+                           ("前馈力矩 (Nm):", "mit_torque", -20, 20, 0.01, 3)]
+        self.mit_ctrl_inputs = {}
+        for col, (label, key, lo, hi, step, dec) in enumerate(mit_ctrl_labels):
+            mit_layout.addWidget(QLabel(label), 1, col)
+            spin = QDoubleSpinBox(); spin.setRange(lo, hi); spin.setSingleStep(step); spin.setDecimals(dec)
+            mit_layout.addWidget(spin, 2, col)
+            self.mit_ctrl_inputs[key] = spin
+
+        self.mit_ctrl_btn = QPushButton("▶ 发送 MIT 控制")
+        self.mit_ctrl_btn.setStyleSheet(SS("background-color: #ff8800; color: white; font-weight: bold;"))
+        self.mit_ctrl_btn.clicked.connect(self._send_mit_ctrl)
+        mit_layout.addWidget(self.mit_ctrl_btn, 2, 5, 1, 2)
+
+        self.mit_state_btn = QPushButton("📊 读取 MIT 状态")
+        self.mit_state_btn.clicked.connect(self._read_mit_state)
+        mit_layout.addWidget(self.mit_state_btn, 3, 0, 1, 2)
+
+        self.mit_state_label = QLabel("MIT 状态: --")
+        mit_layout.addWidget(self.mit_state_label, 3, 2, 1, 5)
+
+        mit_group.setLayout(mit_layout)
+        layout.addWidget(mit_group)
+        layout.addStretch()
+
+    # ------- helpers -------
+    def _mid(self):
+        return self.motor_combo.currentIndex() + 1
+
+    def _send(self, cmd):
+        if self.parent_window and self.parent_window.is_connected():
+            self.parent_window.send_command(cmd)
+
+    def _read_info(self):
+        self._send(f"stw info {self._mid()}")
+
+    def _set_limit(self, key):
+        val = self.limit_inputs[key].value()
+        self._send(f"stw {key} {self._mid()} {val}")
+
+    def _write_pid(self, key):
+        val = self.pid_inputs[key].value()
+        self._send(f"stw pid {self._mid()} {key} {val}")
+
+    def _read_all_pid(self):
+        self._send(f"stw pid {self._mid()} read")
+
+    def _set_mit_config(self):
+        self._send(f"stw mit config {self._mid()} {self.mit_pmax.value()} {self.mit_vmax.value()} {self.mit_tmax.value()}")
+
+    def _send_mit_ctrl(self):
+        m = self.mit_ctrl_inputs
+        self._send(f"stw mit ctrl {self._mid()} {m['mit_pos'].value()} {m['mit_vel'].value()} "
+                    f"{m['mit_kp'].value()} {m['mit_kd'].value()} {m['mit_torque'].value()}")
+
+    def _read_mit_state(self):
+        self._send(f"stw mit state {self._mid()}")
+
+
+# ============================================================================
 # IMU 控制面板
 # ============================================================================
 class IMUControlPanel(QWidget):
@@ -7972,6 +8142,10 @@ class PIDTunerUI(QMainWindow):
         # 电机控制面板
         self.motor_panel = MotorControlPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.motor_panel), "⚙️ 电机控制")
+        
+        # STW 配置面板
+        self.stw_panel = STWConfigPanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.stw_panel), "🔧 STW配置")
         
         # IMU控制面板
         self.imu_panel = IMUControlPanel(self)

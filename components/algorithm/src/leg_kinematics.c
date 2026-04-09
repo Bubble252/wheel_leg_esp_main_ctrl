@@ -10,6 +10,8 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "config.h"
+#include "can_motor_stw_regs.h"
 
 static const char *TAG = "LEG_KIN";
 
@@ -439,23 +441,20 @@ static inline float clamp_f(float value, float min_val, float max_val) {
  * @return 需要发送给电机的命令扭矩 (Nm)
  */
 float vmc_torque_compensate(float desired_torque_Nm) {
-    // 处理接近零的情况
-    if (fabsf(desired_torque_Nm) < 0.001f) {
-        return 0.0f;
+    if (MOTOR_BRAND_OF(MOTOR_ID_LEFT_HIP) == MOTOR_BRAND_JUCI) {
+        // 俱瓷电机: 非线性特性, 需要四次多项式补偿
+        if (fabsf(desired_torque_Nm) < 0.001f) {
+            return 0.0f;
+        }
+        float y = fabsf(desired_torque_Nm);
+        if (y > 0.45f) y = 0.45f;
+        float cmd_Nm = (((-47.346949f * y + 49.535997f) * y - 18.432131f) * y + 3.632793f) * y + 0.022952f;
+        if (cmd_Nm < 0.0f) cmd_Nm = 0.0f;
+        return (desired_torque_Nm >= 0) ? cmd_Nm : -cmd_Nm;
+    } else {
+        // STW 电机: 线性力矩特性, 直通不补偿
+        return desired_torque_Nm;
     }
-    
-    // 取绝对值计算，保持关于原点中心对称
-    float y = fabsf(desired_torque_Nm);
-    
-    // 限幅: 四次多项式在 y≈0.44 后非单调, 限制输入不超过 0.45 Nm
-    if (y > 0.45f) y = 0.45f;
-    
-    // 四次多项式: x = a4*y^4 + a3*y^3 + a2*y^2 + a1*y + a0
-    // Horner 形式: x = ((((a4*y + a3)*y + a2)*y + a1)*y + a0
-    float cmd_Nm = (((-47.346949f * y + 49.535997f) * y - 18.432131f) * y + 3.632793f) * y + 0.022952f;
-    if (cmd_Nm < 0.0f) cmd_Nm = 0.0f;
-    
-    return (desired_torque_Nm >= 0) ? cmd_Nm : -cmd_Nm;
 }
 
 /**
@@ -468,10 +467,16 @@ float vmc_torque_compensate(float desired_torque_Nm) {
  * @return 预测的实际输出扭矩 (Nm)
  */
 float vmc_torque_forward(float cmd_torque_Nm) {
-    float x = fabsf(cmd_torque_Nm);
-    float y = 1.7485f * x * x + 0.0085f * x - 0.0002f;
-    if (y < 0.0f) y = 0.0f;
-    return (cmd_torque_Nm >= 0) ? y : -y;
+    if (MOTOR_BRAND_OF(MOTOR_ID_LEFT_HIP) == MOTOR_BRAND_JUCI) {
+        // 俱瓷电机: 二次多项式正解
+        float x = fabsf(cmd_torque_Nm);
+        float y = 1.7485f * x * x + 0.0085f * x - 0.0002f;
+        if (y < 0.0f) y = 0.0f;
+        return (cmd_torque_Nm >= 0) ? y : -y;
+    } else {
+        // STW 电机: 线性, 直通
+        return cmd_torque_Nm;
+    }
 }
 
 /**
@@ -483,7 +488,13 @@ float vmc_torque_forward(float cmd_torque_Nm) {
  * @return 实际扭矩 (Nm)
  */
 float vmc_current_to_torque(float current_A) {
-    return current_A * 0.25f;
+    if (MOTOR_BRAND_OF(MOTOR_ID_LEFT_HIP) == MOTOR_BRAND_JUCI) {
+        // 俱瓷电机: 1A ≈ 0.25 Nm
+        return current_A * 0.25f;
+    } else {
+        // STW 电机: T = Kt × I (线性)
+        return current_A * STW_TORQUE_CONSTANT;
+    }
 }
 
 /**

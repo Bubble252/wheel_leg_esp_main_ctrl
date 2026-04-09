@@ -8,5 +8,5 @@ idf_component_register(
         "src/leg_kinematics.c"
     INCLUDE_DIRS "include"
     REQUIRES freertos common
-    PRIV_REQUIRES esp_timer
+    PRIV_REQUIRES esp_timer device
 )

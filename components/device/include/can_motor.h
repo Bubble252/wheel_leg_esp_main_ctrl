@@ -301,6 +301,122 @@ esp_err_t can_motor_all_enter_closed_loop(void);
  */
 esp_err_t can_motor_all_set_idle(void);
 
+// ============================================================================
+// STW 专用命令 (仅 MOTOR_BRAND_STW 时有效, JUCI 返回 NOT_SUPPORTED)
+// ============================================================================
+
+/**
+ * @brief STW 电机信息 (0xB0 应答)
+ */
+typedef struct {
+    uint8_t pole_pairs;     // 极对数
+    float   kt;             // 力矩常数 Kt (Nm/A)
+    uint8_t gear_ratio;     // 减速比
+} stw_motor_info_t;
+
+/**
+ * @brief STW MIT 实时状态 (0xF1 应答)
+ */
+typedef struct {
+    float   position;       // 位置 (rad)
+    float   velocity;       // 速度 (rad/s)
+    float   torque;         // 力矩 (Nm)
+    uint8_t status;         // 状态: Bit0=MIT模式, Bit1=故障
+} stw_mit_state_t;
+
+/**
+ * @brief 请求读取电机信息 (极对数/Kt/减速比) — 0xB0
+ * @note 结果通过 RX 解析后存入内部, 用 can_motor_stw_get_motor_info() 读取
+ */
+esp_err_t can_motor_stw_request_motor_info(can_motor_handle_t motor);
+
+/**
+ * @brief 获取上次 0xB0 应答的电机信息
+ */
+esp_err_t can_motor_stw_get_motor_info(can_motor_handle_t motor, stw_motor_info_t *info);
+
+/**
+ * @brief 设置位置模式最大速度 — 0xB2
+ * @param speed_rpm 最大速度 (RPM)
+ */
+esp_err_t can_motor_stw_set_max_speed(can_motor_handle_t motor, float speed_rpm);
+
+/**
+ * @brief 设置最大 Q 轴电流 — 0xB3
+ * @param current_a 最大电流 (A)
+ */
+esp_err_t can_motor_stw_set_max_current(can_motor_handle_t motor, float current_a);
+
+/**
+ * @brief 设置电流斜率 — 0xB4
+ * @param slope 电流斜率 (A/s)
+ */
+esp_err_t can_motor_stw_set_torque_slope(can_motor_handle_t motor, float slope);
+
+/**
+ * @brief 设置速度模式加速度 — 0xB5
+ * @param accel 加速度 (RPM/s)
+ */
+esp_err_t can_motor_stw_set_accel(can_motor_handle_t motor, float accel);
+
+/**
+ * @brief 读取 PID 参数 — 0xB6~0xB9 (DLC=1 请求)
+ * @param cmd STW_CMD_POS_KP / POS_KI / SPD_KP / SPD_KI
+ * @note 结果通过 RX 解析后存入内部, 用 can_motor_stw_get_pid() 读取
+ */
+esp_err_t can_motor_stw_request_pid(can_motor_handle_t motor, uint8_t cmd);
+
+/**
+ * @brief 写入 PID 参数 — 0xB6~0xB9 (DLC=5 写入)
+ * @param cmd STW_CMD_POS_KP / POS_KI / SPD_KP / SPD_KI
+ * @param value PID 参数值 (IEEE 754 float)
+ */
+esp_err_t can_motor_stw_write_pid(can_motor_handle_t motor, uint8_t cmd, float value);
+
+/**
+ * @brief 获取上次 PID 读取结果
+ * @param cmd STW_CMD_POS_KP / POS_KI / SPD_KP / SPD_KI
+ * @param[out] value 参数值
+ */
+esp_err_t can_motor_stw_get_pid(can_motor_handle_t motor, uint8_t cmd, float *value);
+
+/**
+ * @brief 配置 MIT 运控参数 — 0xF0 (DLC=7 写入)
+ * @param pos_max 位置最大值 (rad)
+ * @param vel_max 速度最大值 (rad/s)
+ * @param t_max 力矩最大值 (Nm)
+ */
+esp_err_t can_motor_stw_mit_set_config(can_motor_handle_t motor,
+                                       float pos_max, float vel_max, float t_max);
+
+/**
+ * @brief 读取 MIT 配置 — 0xF0 (DLC=1 请求)
+ */
+esp_err_t can_motor_stw_mit_request_config(can_motor_handle_t motor);
+
+/**
+ * @brief 请求 MIT 实时状态 — 0xF1 (DLC=1 请求)
+ * @note 结果通过 RX 解析后存入内部, 用 can_motor_stw_mit_get_state() 读取
+ */
+esp_err_t can_motor_stw_mit_request_state(can_motor_handle_t motor);
+
+/**
+ * @brief 获取上次 MIT 状态应答
+ */
+esp_err_t can_motor_stw_mit_get_state(can_motor_handle_t motor, stw_mit_state_t *state);
+
+/**
+ * @brief MIT 运控控制命令 — StdID=(0x400|addr), DLC=8
+ * @param target_pos 目标位置 (rad)
+ * @param target_vel 目标速度 (rad/s)
+ * @param kp 位置刚度 (0~500)
+ * @param kd 速度阻尼 (0~5)
+ * @param target_torque 前馈力矩 (Nm)
+ */
+esp_err_t can_motor_stw_mit_control(can_motor_handle_t motor,
+                                    float target_pos, float target_vel,
+                                    float kp, float kd, float target_torque);
+
 #ifdef __cplusplus
 }
 #endif

@@ -22,6 +22,39 @@ extern "C" {
 #define PROJECT_VERSION     "1.0.0"
 
 // ============================================================================
+// 电机品牌选择 (宏定义切换)
+// ============================================================================
+
+#define MOTOR_BRAND_JUCI    0           // 俱瓷科技 (JuCi) 电机
+#define MOTOR_BRAND_STW     1           // 伺泰威 (STW) 电机
+
+// 当前使用的电机品牌 - 修改此宏即可切换电机类型
+// 支持单品牌 (MOTOR_BRAND_JUCI / MOTOR_BRAND_STW) 或混合品牌:
+//   在混合模式下, 通过 MOTOR_BRAND_OF(id) 宏为每个电机指定品牌
+#define MOTOR_BRAND    MOTOR_BRAND_STW
+
+// ============================================================================
+// 混合品牌配置 (按电机 ID 指定品牌)
+// ============================================================================
+// 轮电机 (ID 3,6) = JuCi, 关节电机 (ID 1,2,4,5) = STW
+// 修改此处即可切换各电机品牌
+#define MOTOR_BRAND_ID1     MOTOR_BRAND_STW     // 左大腿(关节)
+#define MOTOR_BRAND_ID2     MOTOR_BRAND_STW     // 左小腿(关节)
+#define MOTOR_BRAND_ID3     MOTOR_BRAND_JUCI    // 左轮
+#define MOTOR_BRAND_ID4     MOTOR_BRAND_STW     // 右大腿(关节)
+#define MOTOR_BRAND_ID5     MOTOR_BRAND_STW     // 右小腿(关节)
+#define MOTOR_BRAND_ID6     MOTOR_BRAND_JUCI    // 右轮
+
+// 查询表: 根据 motor_id (1~6) 获取品牌
+#define MOTOR_BRAND_OF(id) ( \
+    (id) == 1 ? MOTOR_BRAND_ID1 : \
+    (id) == 2 ? MOTOR_BRAND_ID2 : \
+    (id) == 3 ? MOTOR_BRAND_ID3 : \
+    (id) == 4 ? MOTOR_BRAND_ID4 : \
+    (id) == 5 ? MOTOR_BRAND_ID5 : \
+    (id) == 6 ? MOTOR_BRAND_ID6 : MOTOR_BRAND_STW)
+
+// ============================================================================
 // CAN 总线配置
 // ============================================================================
 
@@ -29,7 +62,7 @@ extern "C" {
 #define CAN_RX_PIN          GPIO_NUM_17
 #define CAN_BAUDRATE        1000000     // 1Mbps
 
-// CAN 帧 ID 基地址
+// CAN 帧 ID 基地址 (俱瓷科技, 混合模式下也需要)
 #define CAN_TX_BASE_ID      0x600       // 发送帧基地址
 #define CAN_RX_BASE_ID      0x580       // 接收帧基地址
 

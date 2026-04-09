@@ -65,6 +65,7 @@ static remote_data_t g_remote_data = {
     .joy_yaw_gain = 0.03f,
     .dist_enable = true,       // 默认开启位移环
     .yaw_enable = true,        // 默认开启 Yaw 控制
+    .roll_enable = false,      // 默认关闭 Roll 控制
     .last_update_ms = 0,
     .msg_count = 0,
     .connected = false,
@@ -269,6 +270,18 @@ static void parse_json_command(const char *json_str) {
     cJSON *yaw_enable = cJSON_GetObjectItem(json, "yaw_enable");
     if (yaw_enable && cJSON_IsNumber(yaw_enable)) {
         g_remote_data.yaw_enable = (yaw_enable->valueint == 1);
+    }
+    
+    // 解析 Roll 闭环开关
+    cJSON *roll_enable = cJSON_GetObjectItem(json, "roll_enable");
+    if (roll_enable && cJSON_IsNumber(roll_enable)) {
+        g_remote_data.roll_enable = (roll_enable->valueint == 1);
+    }
+    
+    // 解析跳跃按钮
+    cJSON *jump = cJSON_GetObjectItem(json, "jump");
+    if (jump && cJSON_IsNumber(jump)) {
+        g_remote_data.jump = (jump->valueint == 1);
     }
     
     // 更新时间戳和计数

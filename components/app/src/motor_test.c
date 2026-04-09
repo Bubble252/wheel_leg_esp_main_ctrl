@@ -24,6 +24,7 @@
 #include "sensor_test.h"
 #include "balance_test.h"
 #include "can_motor.h"
+#include "can_motor_stw_regs.h"
 #include "wifi_remote.h"
 #include "commander_parser.h"
 #include "config.h"
@@ -237,6 +238,21 @@ static void print_help(void) {
     printf("  LPF IDs: G=JoyY J=Zero L=Roll\n");
     printf("  Params: P/I/D/L(limit)/R(ramp)/T(lpf)\n");
     printf("  tune status   - Print all parameters\n");
+    printf("==========================================\n\n");
+    printf("========== STW Motor Commands ============\n");
+    printf("  stw info <id>              - Read motor info (poles/Kt/gear)\n");
+    printf("  stw maxspeed <id> <rpm>    - Set position max speed\n");
+    printf("  stw maxcur <id> <A>        - Set max Q-axis current\n");
+    printf("  stw slope <id> <A/s>       - Set torque current slope\n");
+    printf("  stw accel <id> <RPM/s>     - Set speed mode accel\n");
+    printf("  stw pid <id> read          - Read all 4 PID params\n");
+    printf("  stw pid <id> <type> <val>  - Write PID param\n");
+    printf("      type: pos_kp pos_ki spd_kp spd_ki\n");
+    printf("  stw mit config <id> <pmax> <vmax> <tmax>\n");
+    printf("                             - Set MIT limits\n");
+    printf("  stw mit state <id>         - Read MIT state\n");
+    printf("  stw mit ctrl <id> <pos> <vel> <kp> <kd> <torque>\n");
+    printf("                             - MIT impedance control\n");
     printf("==========================================\n\n");
 }
 
@@ -822,6 +838,234 @@ static void process_command(char *cmd) {
             printf("  balance plot [on|off] - Enable/disable waveform output\n");
             printf("  balance plot div <N> - Set plot divider (1-255, default 10=20Hz)\n");
         }
+    }
+    // ========== STW 电机专属命令 ==========
+    else if (strcmp(token, "stw") == 0) {
+        char *sub = strtok(NULL, " \t\n\r");
+        if (!sub) {
+            printf("Usage: stw <info|maxspeed|maxcur|slope|accel|pid|mit> ...\n");
+        }
+        // --- stw info <id> ---
+        else if (strcmp(sub, "info") == 0) {
+            char *id_str = strtok(NULL, " \t\n\r");
+            if (!id_str) { printf("Usage: stw info <id>\n"); }
+            else {
+                int id = atoi(id_str);
+                if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                    printf("Invalid motor %d\n", id);
+                } else {
+                    can_motor_handle_t m = g_motors[id-1];
+                    printf("Motor %d: Requesting info...\n", id);
+                    esp_err_t ret = can_motor_stw_request_motor_info(m);
+                    if (ret == ESP_OK) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        stw_motor_info_t info;
+                        if (can_motor_stw_get_motor_info(m, &info) == ESP_OK) {
+                            printf("  Pole pairs : %u\n", info.pole_pairs);
+                            printf("  Kt (Nm/A)  : %.4f\n", info.kt);
+                            printf("  Gear ratio : %u\n", info.gear_ratio);
+                        } else {
+                            printf("  No info received yet\n");
+                        }
+                    } else {
+                        printf("Request failed: %s\n", esp_err_to_name(ret));
+                    }
+                }
+            }
+        }
+        // --- stw maxspeed <id> <val> ---
+        else if (strcmp(sub, "maxspeed") == 0) {
+            char *id_str = strtok(NULL, " \t\n\r");
+            char *val_str = strtok(NULL, " \t\n\r");
+            if (!id_str || !val_str) { printf("Usage: stw maxspeed <id> <rpm>\n"); }
+            else {
+                int id = atoi(id_str);
+                if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                    printf("Invalid motor %d\n", id);
+                } else {
+                    esp_err_t ret = can_motor_stw_set_max_speed(g_motors[id-1], atof(val_str));
+                    printf("Motor %d: set max speed = %.1f rpm -> %s\n", id, atof(val_str), esp_err_to_name(ret));
+                }
+            }
+        }
+        // --- stw maxcur <id> <val> ---
+        else if (strcmp(sub, "maxcur") == 0) {
+            char *id_str = strtok(NULL, " \t\n\r");
+            char *val_str = strtok(NULL, " \t\n\r");
+            if (!id_str || !val_str) { printf("Usage: stw maxcur <id> <A>\n"); }
+            else {
+                int id = atoi(id_str);
+                if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                    printf("Invalid motor %d\n", id);
+                } else {
+                    esp_err_t ret = can_motor_stw_set_max_current(g_motors[id-1], atof(val_str));
+                    printf("Motor %d: set max current = %.2f A -> %s\n", id, atof(val_str), esp_err_to_name(ret));
+                }
+            }
+        }
+        // --- stw slope <id> <val> ---
+        else if (strcmp(sub, "slope") == 0) {
+            char *id_str = strtok(NULL, " \t\n\r");
+            char *val_str = strtok(NULL, " \t\n\r");
+            if (!id_str || !val_str) { printf("Usage: stw slope <id> <A/s>\n"); }
+            else {
+                int id = atoi(id_str);
+                if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                    printf("Invalid motor %d\n", id);
+                } else {
+                    esp_err_t ret = can_motor_stw_set_torque_slope(g_motors[id-1], atof(val_str));
+                    printf("Motor %d: set torque slope = %.2f A/s -> %s\n", id, atof(val_str), esp_err_to_name(ret));
+                }
+            }
+        }
+        // --- stw accel <id> <val> ---
+        else if (strcmp(sub, "accel") == 0) {
+            char *id_str = strtok(NULL, " \t\n\r");
+            char *val_str = strtok(NULL, " \t\n\r");
+            if (!id_str || !val_str) { printf("Usage: stw accel <id> <RPM/s>\n"); }
+            else {
+                int id = atoi(id_str);
+                if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                    printf("Invalid motor %d\n", id);
+                } else {
+                    esp_err_t ret = can_motor_stw_set_accel(g_motors[id-1], atof(val_str));
+                    printf("Motor %d: set accel = %.1f RPM/s -> %s\n", id, atof(val_str), esp_err_to_name(ret));
+                }
+            }
+        }
+        // --- stw pid <id> read / stw pid <id> <type> <val> ---
+        else if (strcmp(sub, "pid") == 0) {
+            char *id_str  = strtok(NULL, " \t\n\r");
+            char *action  = strtok(NULL, " \t\n\r");
+            if (!id_str || !action) {
+                printf("Usage: stw pid <id> read\n");
+                printf("       stw pid <id> <pos_kp|pos_ki|spd_kp|spd_ki> <val>\n");
+            } else {
+                int id = atoi(id_str);
+                if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                    printf("Invalid motor %d\n", id);
+                } else {
+                    can_motor_handle_t m = g_motors[id-1];
+                    if (strcmp(action, "read") == 0) {
+                        // 读取全部4个PID参数
+                        static const uint8_t cmds[] = {STW_CMD_POS_KP, STW_CMD_POS_KI, STW_CMD_SPD_KP, STW_CMD_SPD_KI};
+                        static const char *names[] = {"pos_kp", "pos_ki", "spd_kp", "spd_ki"};
+                        printf("Motor %d PID params:\n", id);
+                        for (int i = 0; i < 4; i++) {
+                            can_motor_stw_request_pid(m, cmds[i]);
+                            vTaskDelay(pdMS_TO_TICKS(50));
+                            float val = 0;
+                            if (can_motor_stw_get_pid(m, cmds[i], &val) == ESP_OK) {
+                                printf("  %-6s = %.6f\n", names[i], val);
+                            } else {
+                                printf("  %-6s = (no reply)\n", names[i]);
+                            }
+                        }
+                    } else {
+                        // 写入单个PID参数
+                        uint8_t cmd = 0;
+                        if (strcmp(action, "pos_kp") == 0) cmd = STW_CMD_POS_KP;
+                        else if (strcmp(action, "pos_ki") == 0) cmd = STW_CMD_POS_KI;
+                        else if (strcmp(action, "spd_kp") == 0) cmd = STW_CMD_SPD_KP;
+                        else if (strcmp(action, "spd_ki") == 0) cmd = STW_CMD_SPD_KI;
+                        else {
+                            printf("Unknown PID type: %s (use pos_kp/pos_ki/spd_kp/spd_ki)\n", action);
+                            goto stw_done;
+                        }
+                        char *val_str = strtok(NULL, " \t\n\r");
+                        if (!val_str) {
+                            printf("Usage: stw pid %d %s <value>\n", id, action);
+                        } else {
+                            float val = atof(val_str);
+                            esp_err_t ret = can_motor_stw_write_pid(m, cmd, val);
+                            printf("Motor %d: set %s = %.6f -> %s\n", id, action, val, esp_err_to_name(ret));
+                        }
+                    }
+                }
+            }
+        }
+        // --- stw mit <subcmd> ---
+        else if (strcmp(sub, "mit") == 0) {
+            char *mit_sub = strtok(NULL, " \t\n\r");
+            if (!mit_sub) {
+                printf("Usage: stw mit config <id> <pmax> <vmax> <tmax>\n");
+                printf("       stw mit state <id>\n");
+                printf("       stw mit ctrl <id> <pos> <vel> <kp> <kd> <torque>\n");
+            }
+            else if (strcmp(mit_sub, "config") == 0) {
+                char *id_str = strtok(NULL, " \t\n\r");
+                char *p_str  = strtok(NULL, " \t\n\r");
+                char *v_str  = strtok(NULL, " \t\n\r");
+                char *t_str  = strtok(NULL, " \t\n\r");
+                if (!id_str || !p_str || !v_str || !t_str) {
+                    printf("Usage: stw mit config <id> <pos_max> <vel_max> <t_max>\n");
+                } else {
+                    int id = atoi(id_str);
+                    if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                        printf("Invalid motor %d\n", id);
+                    } else {
+                        float pm = atof(p_str), vm = atof(v_str), tm = atof(t_str);
+                        esp_err_t ret = can_motor_stw_mit_set_config(g_motors[id-1], pm, vm, tm);
+                        printf("Motor %d: MIT config pos_max=%.2f vel_max=%.2f t_max=%.2f -> %s\n",
+                               id, pm, vm, tm, esp_err_to_name(ret));
+                    }
+                }
+            }
+            else if (strcmp(mit_sub, "state") == 0) {
+                char *id_str = strtok(NULL, " \t\n\r");
+                if (!id_str) { printf("Usage: stw mit state <id>\n"); }
+                else {
+                    int id = atoi(id_str);
+                    if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                        printf("Invalid motor %d\n", id);
+                    } else {
+                        can_motor_handle_t m = g_motors[id-1];
+                        can_motor_stw_mit_request_state(m);
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        stw_mit_state_t st;
+                        if (can_motor_stw_mit_get_state(m, &st) == ESP_OK) {
+                            printf("Motor %d MIT state:\n", id);
+                            printf("  Position : %.4f rad\n", st.position);
+                            printf("  Velocity : %.4f rad/s\n", st.velocity);
+                            printf("  Torque   : %.4f Nm\n", st.torque);
+                            printf("  Status   : 0x%02X (MIT=%d Fault=%d)\n",
+                                   st.status, st.status & 1, (st.status >> 1) & 1);
+                        } else {
+                            printf("  No MIT state received yet\n");
+                        }
+                    }
+                }
+            }
+            else if (strcmp(mit_sub, "ctrl") == 0) {
+                char *id_str = strtok(NULL, " \t\n\r");
+                char *pos_s  = strtok(NULL, " \t\n\r");
+                char *vel_s  = strtok(NULL, " \t\n\r");
+                char *kp_s   = strtok(NULL, " \t\n\r");
+                char *kd_s   = strtok(NULL, " \t\n\r");
+                char *t_s    = strtok(NULL, " \t\n\r");
+                if (!id_str || !pos_s || !vel_s || !kp_s || !kd_s || !t_s) {
+                    printf("Usage: stw mit ctrl <id> <pos> <vel> <kp> <kd> <torque>\n");
+                } else {
+                    int id = atoi(id_str);
+                    if (id < 1 || id > MOTOR_COUNT || !g_motors[id-1]) {
+                        printf("Invalid motor %d\n", id);
+                    } else {
+                        float pos = atof(pos_s), vel = atof(vel_s);
+                        float kp = atof(kp_s), kd = atof(kd_s), t = atof(t_s);
+                        esp_err_t ret = can_motor_stw_mit_control(g_motors[id-1], pos, vel, kp, kd, t);
+                        printf("Motor %d: MIT ctrl pos=%.3f vel=%.3f kp=%.1f kd=%.2f t=%.3f -> %s\n",
+                               id, pos, vel, kp, kd, t, esp_err_to_name(ret));
+                    }
+                }
+            }
+            else {
+                printf("Unknown MIT sub-command: %s\n", mit_sub);
+            }
+        }
+        else {
+            printf("Unknown STW sub-command: %s\n", sub);
+        }
+        stw_done: ;
     }
     // ========== PID 调参命令 (Commander 协议) ==========
     else if (strcmp(token, "tune") == 0) {
