@@ -120,6 +120,15 @@ float can_motor_read_speed(can_motor_handle_t motor);
 float can_motor_read_current(can_motor_handle_t motor);
 
 /**
+ * @brief 请求读取角度/位置寄存器 (非阻塞, 轻量)
+ * @note 只发送一次 CAN 读请求, 结果通过 process_rx 更新到 state.position
+ *       STW: 发送 0xA3 多圈角度读取; JUCI: 发送位置寄存器读取
+ * @param motor 电机句柄
+ * @return ESP_OK 成功
+ */
+esp_err_t can_motor_request_angle(can_motor_handle_t motor);
+
+/**
  * @brief 请求读取电源电压寄存器 (非阻塞, 轻量)
  * @note 只发送一次 CAN 读请求, 结果通过 process_rx 更新到 state.voltage
  * @param motor 电机句柄

@@ -77,6 +77,12 @@ typedef struct {
     // 跳跃按钮
     bool jump;                  // 跳跃按钮 (true=按下跳跃, 上升沿触发)
     
+    // 起身按钮
+    bool standup;               // 起身按钮 (true=按下起身, 上升沿触发)
+    
+    // 角度零点
+    float angle_zero;           // 角度零点偏移 (度, -30 ~ 30)
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量

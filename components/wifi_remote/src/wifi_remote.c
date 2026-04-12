@@ -66,6 +66,7 @@ static remote_data_t g_remote_data = {
     .dist_enable = true,       // 默认开启位移环
     .yaw_enable = true,        // 默认开启 Yaw 控制
     .roll_enable = false,      // 默认关闭 Roll 控制
+    .angle_zero = 7.4f,        // 默认角度零点
     .last_update_ms = 0,
     .msg_count = 0,
     .connected = false,
@@ -282,6 +283,18 @@ static void parse_json_command(const char *json_str) {
     cJSON *jump = cJSON_GetObjectItem(json, "jump");
     if (jump && cJSON_IsNumber(jump)) {
         g_remote_data.jump = (jump->valueint == 1);
+    }
+    
+    // 解析起身按钮
+    cJSON *standup = cJSON_GetObjectItem(json, "standup");
+    if (standup && cJSON_IsNumber(standup)) {
+        g_remote_data.standup = (standup->valueint == 1);
+    }
+    
+    // 解析角度零点
+    cJSON *angle_zero = cJSON_GetObjectItem(json, "angle_zero");
+    if (angle_zero && cJSON_IsNumber(angle_zero)) {
+        g_remote_data.angle_zero = (float)angle_zero->valuedouble;
     }
     
     // 更新时间戳和计数

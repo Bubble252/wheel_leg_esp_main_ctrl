@@ -3350,14 +3350,45 @@ class BalanceControlPanel(QWidget):
         zero_group = QGroupBox("🎯 角度零点设置 & 自适应")
         zero_main_layout = QVBoxLayout()
         
-        # 第一行: 手动设置零点
+        # 第一行: 滑条调节零点 + 微调箭头
+        zero_slider_row = QHBoxLayout()
+        zero_slider_row.addWidget(QLabel("零点 (°):"))
+        
+        self.zero_dec_btn = QPushButton("◀")
+        self.zero_dec_btn.setFixedWidth(30)
+        self.zero_dec_btn.setToolTip("减少 0.1°")
+        self.zero_dec_btn.clicked.connect(lambda: self._nudge_zero(-0.1))
+        zero_slider_row.addWidget(self.zero_dec_btn)
+        
+        self.zero_slider = QSlider(Qt.Horizontal)
+        self.zero_slider.setRange(-3000, 3000)  # -30.00° ~ +30.00°, 单位 0.01°
+        self.zero_slider.setValue(740)           # 默认 7.40°
+        self.zero_slider.setTickPosition(QSlider.TicksBelow)
+        self.zero_slider.setTickInterval(500)    # 每 5° 一个刻度
+        self.zero_slider.valueChanged.connect(self._on_zero_slider_changed)
+        zero_slider_row.addWidget(self.zero_slider, 1)
+        
+        self.zero_inc_btn = QPushButton("▶")
+        self.zero_inc_btn.setFixedWidth(30)
+        self.zero_inc_btn.setToolTip("增加 0.1°")
+        self.zero_inc_btn.clicked.connect(lambda: self._nudge_zero(+0.1))
+        zero_slider_row.addWidget(self.zero_inc_btn)
+        
+        self.zero_value_label = QLabel("7.400°")
+        self.zero_value_label.setFixedWidth(60)
+        self.zero_value_label.setStyleSheet(SS("font-weight: bold; font-size: 12px;"))
+        zero_slider_row.addWidget(self.zero_value_label)
+        zero_main_layout.addLayout(zero_slider_row)
+        
+        # 第二行: 精确输入 + 设置/查询按钮
         zero_row1 = QHBoxLayout()
-        zero_row1.addWidget(QLabel("零点角度 (°):"))
+        zero_row1.addWidget(QLabel("精确值:"))
         self.zero_input = QDoubleSpinBox()
         self.zero_input.setRange(-30, 30)
         self.zero_input.setSingleStep(0.01)
         self.zero_input.setDecimals(3)
         self.zero_input.setValue(7.4)
+        self.zero_input.valueChanged.connect(self._on_zero_spinbox_changed)
         zero_row1.addWidget(self.zero_input)
         
         self.set_zero_btn = QPushButton("设置零点")
@@ -4055,6 +4086,28 @@ class BalanceControlPanel(QWidget):
     
     def set_zero_point(self):
         self.send_cmd(f"balance zero {self.zero_input.value()}")
+    
+    def _on_zero_slider_changed(self, int_val):
+        """滑条值变化 → 同步 spinbox 和 label"""
+        val = int_val / 100.0
+        self.zero_input.blockSignals(True)
+        self.zero_input.setValue(val)
+        self.zero_input.blockSignals(False)
+        self.zero_value_label.setText(f"{val:.2f}°")
+    
+    def _on_zero_spinbox_changed(self, val):
+        """spinbox 值变化 → 同步滑条"""
+        self.zero_slider.blockSignals(True)
+        self.zero_slider.setValue(int(val * 100))
+        self.zero_slider.blockSignals(False)
+        self.zero_value_label.setText(f"{val:.2f}°")
+    
+    def _nudge_zero(self, delta):
+        """微调箭头: 调整零点并立即发送"""
+        new_val = self.zero_input.value() + delta
+        new_val = max(-30.0, min(30.0, new_val))
+        self.zero_input.setValue(new_val)
+        self.set_zero_point()
     
     def set_zp_threshold(self):
         self.send_cmd(f"balance zero threshold {self.zp_threshold_input.value()}")

@@ -512,7 +512,7 @@ void vmc_get_default_params(vmc_params_t *params) {
     params->D_y = 0.0f;            // 垂直阻尼 (Ns/m)
     
     // === 机身坐标系参数 ===
-    params->K_L = 0.0f;          // 腿长刚度 (N/m)
+    params->K_L = 300.0f;        // 腿长刚度 (N/m)
     params->D_L = 0.0f;            // 腿长阻尼 (Ns/m)
     params->K_alpha = 0.0f;         // 身体角度刚度 (Nm/rad)
     params->D_alpha = 0.0f;         // 身体角度阻尼 (Nm·s/rad)
@@ -534,7 +534,7 @@ void vmc_get_default_params(vmc_params_t *params) {
     params->vmc_diff_method = VMC_DIFF_JACOBIAN; // 默认雅可比 (解析精确、无延迟)
     
     // 重力补偿
-    params->gravity_comp = 0.0f;    // 50% 重力补偿 (保守起见)
+    params->gravity_comp = 0.7f;    // 70% 重力补偿
     params->robot_mass = 1.0f;      // 机器人质量 (kg)
     
     // 输出限幅

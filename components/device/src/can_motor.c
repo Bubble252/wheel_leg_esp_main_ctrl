@@ -966,6 +966,16 @@ float can_motor_read_voltage(can_motor_handle_t motor) {
     return motor ? motor->state.voltage : 0.0f;
 }
 
+esp_err_t can_motor_request_angle(can_motor_handle_t motor) {
+    if (motor == NULL) return ESP_ERR_INVALID_ARG;
+    if (motor->brand == MOTOR_BRAND_JUCI) {
+        return read_reg_2_request(motor, REG_POSITION);
+    } else {
+        // STW: 0xA3 读取多圈角度
+        return stw_send_cmd_simple(motor, STW_CMD_READ_ANGLE);
+    }
+}
+
 esp_err_t can_motor_request_voltage(can_motor_handle_t motor) {
     if (motor == NULL) return ESP_ERR_INVALID_ARG;
     if (motor->brand == MOTOR_BRAND_JUCI) {

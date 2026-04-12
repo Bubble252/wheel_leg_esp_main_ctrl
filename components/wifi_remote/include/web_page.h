@@ -310,6 +310,15 @@ static const char web_page_html[] = R"rawliteral(
             </div>
             
             <div class="slider-row">
+                <label id="angleZeroLabel">🎯 Angle Zero: 7.40°</label>
+                <div style="display:flex; align-items:center; gap:4px;">
+                    <button class="dir-btn" style="width:36px; height:32px; font-size:16px; padding:0;" onclick="nudgeAngleZero(-0.1)">◀</button>
+                    <input type="range" id="angleZeroSlider" min="-30" max="30" value="7.4" step="0.1" style="flex:1;" oninput="updateAngleZero()">
+                    <button class="dir-btn" style="width:36px; height:32px; font-size:16px; padding:0;" onclick="nudgeAngleZero(0.1)">▶</button>
+                </div>
+            </div>
+            
+            <div class="slider-row">
                 <label id="joySpeedLabel">🏎️ Speed Gain: 3.0 ‰</label>
                 <input type="range" id="joySpeedSlider" min="1" max="20" value="3" step="0.5" oninput="updateJoySpeed()">
             </div>
@@ -438,6 +447,12 @@ static const char web_page_html[] = R"rawliteral(
             <div></div>
         </div>
         
+        <div style="text-align:center; margin:10px 0;">
+            <button class="dir-btn" style="width:120px; background:#ff8c00; border-color:#ff8c00; color:white;"
+                    ontouchstart="standupPress()" ontouchend="standupRelease()"
+                    onmousedown="standupPress()" onmouseup="standupRelease()">Standup</button>
+        </div>
+        
         <div class="debug-info" id="debugInfo">Waiting for connection...</div>
     </div>
 
@@ -472,6 +487,8 @@ static const char web_page_html[] = R"rawliteral(
     var g_drSpeed = 0;
     var msgCount = 0;
     var heartbeatTimer = null;
+    var g_standup = 0;
+    var g_angleZero = 7.4;
     
     // WebSocket 初始化
     function initWebSocket() {
@@ -545,7 +562,9 @@ static const char web_page_html[] = R"rawliteral(
                 joy_yaw_gain: g_joyYawGain / 1000.0,
                 dist_enable: g_distEnable,
                 yaw_enable: g_yawEnable,
-                roll_enable: g_rollEnable
+                roll_enable: g_rollEnable,
+                standup: g_standup,
+                angle_zero: parseFloat(g_angleZero.toFixed(2))
             };
             socket.send(JSON.stringify(data));
             msgCount++;
@@ -580,6 +599,16 @@ static const char web_page_html[] = R"rawliteral(
     
     function dirRelease() {
         g_dir = 'stop';
+        sendData();
+    }
+    
+    function standupPress() {
+        g_standup = 1;
+        sendData();
+    }
+    
+    function standupRelease() {
+        g_standup = 0;
         sendData();
     }
     
@@ -647,6 +676,21 @@ static const char web_page_html[] = R"rawliteral(
         g_legLength = parseInt(document.getElementById('legLengthSlider').value);
         document.getElementById('legLengthLabel').innerText = 'Leg Length: ' + g_legLength + ' mm';
         sendData();
+    }
+    
+    function updateAngleZero() {
+        g_angleZero = parseFloat(document.getElementById('angleZeroSlider').value);
+        document.getElementById('angleZeroLabel').innerText = '🎯 Angle Zero: ' + g_angleZero.toFixed(1) + '°';
+        sendData();
+        log('Angle zeropoint: ' + g_angleZero.toFixed(2) + '°');
+    }
+    
+    function nudgeAngleZero(delta) {
+        g_angleZero = Math.max(-30, Math.min(30, parseFloat((g_angleZero + delta).toFixed(2))));
+        document.getElementById('angleZeroSlider').value = g_angleZero;
+        document.getElementById('angleZeroLabel').innerText = '🎯 Angle Zero: ' + g_angleZero.toFixed(1) + '°';
+        sendData();
+        log('Angle zeropoint nudge: ' + g_angleZero.toFixed(2) + '°');
     }
     
     function updateJoySpeed() {
