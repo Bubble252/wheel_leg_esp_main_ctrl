@@ -70,6 +70,11 @@ static const char *TAG = "BAL_TEST";
 #define WATCHDOG_PERIOD_MS          100     // 10Hz
 #define OBSERVER_PERIOD_MS          3       // 333Hz 速度观测器 (独立任务)
 
+// 电机力矩安全限幅 (Nm) - 基于实际电机硬件极限
+#define WHEEL_TORQUE_LIMIT          0.3f    // 轮电机力矩上限
+#define HIP_TORQUE_LIMIT            1.6f    // Hip 关节力矩上限
+#define KNEE_TORQUE_LIMIT           3.5f    // Knee 关节力矩上限
+
 // ===== 合并任务配置 =====
 // 将 IMU读取 + 控制算法 + 电机通信 合并到一个任务中运行
 // 默认使用分离任务架构，可通过 CLI 切换
@@ -1627,6 +1632,17 @@ static void apply_leg_motor_commands(void) {
         // ===== VMC 力控模式: 发送已计算好的扭矩 =====
         // STW 电机: 使用 MIT 前馈电流控制 (kp=0, kd=0), 更直接的力矩控制
         // JuCi 电机: 使用 0xC0 Q轴电流命令 + 非线性补偿
+        
+        // 关节力矩安全限幅 (在发送电机命令前)
+        if (g_vmc_dual_output.left.hip_torque > HIP_TORQUE_LIMIT) g_vmc_dual_output.left.hip_torque = HIP_TORQUE_LIMIT;
+        if (g_vmc_dual_output.left.hip_torque < -HIP_TORQUE_LIMIT) g_vmc_dual_output.left.hip_torque = -HIP_TORQUE_LIMIT;
+        if (g_vmc_dual_output.left.knee_torque > KNEE_TORQUE_LIMIT) g_vmc_dual_output.left.knee_torque = KNEE_TORQUE_LIMIT;
+        if (g_vmc_dual_output.left.knee_torque < -KNEE_TORQUE_LIMIT) g_vmc_dual_output.left.knee_torque = -KNEE_TORQUE_LIMIT;
+        if (g_vmc_dual_output.right.hip_torque > HIP_TORQUE_LIMIT) g_vmc_dual_output.right.hip_torque = HIP_TORQUE_LIMIT;
+        if (g_vmc_dual_output.right.hip_torque < -HIP_TORQUE_LIMIT) g_vmc_dual_output.right.hip_torque = -HIP_TORQUE_LIMIT;
+        if (g_vmc_dual_output.right.knee_torque > KNEE_TORQUE_LIMIT) g_vmc_dual_output.right.knee_torque = KNEE_TORQUE_LIMIT;
+        if (g_vmc_dual_output.right.knee_torque < -KNEE_TORQUE_LIMIT) g_vmc_dual_output.right.knee_torque = -KNEE_TORQUE_LIMIT;
+        
         if (g_motor_left_hip) {
             can_motor_stw_mit_control(g_motor_left_hip, 0, 0, 0, 0,
                 g_vmc_dual_output.left.hip_torque);
@@ -4541,6 +4557,12 @@ static void compute_balance_output(float dt) {
             } else {
                 g_yaw_output = 0.0f;
             }
+            
+            // 转向差速后再次限幅, 确保最终轮扭矩不超过电机极限
+            if (T_left > WHEEL_TORQUE_LIMIT) T_left = WHEEL_TORQUE_LIMIT;
+            if (T_left < -WHEEL_TORQUE_LIMIT) T_left = -WHEEL_TORQUE_LIMIT;
+            if (T_right > WHEEL_TORQUE_LIMIT) T_right = WHEEL_TORQUE_LIMIT;
+            if (T_right < -WHEEL_TORQUE_LIMIT) T_right = -WHEEL_TORQUE_LIMIT;
             
             output.left_wheel_torque = -T_left;//都要取反因为仿真和现实中不一样
             output.right_wheel_torque = -T_right;//取反！
