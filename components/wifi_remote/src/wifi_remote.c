@@ -67,6 +67,9 @@ static remote_data_t g_remote_data = {
     .yaw_enable = true,        // 默认开启 Yaw 控制
     .roll_enable = false,      // 默认关闭 Roll 控制
     .angle_zero = 7.4f,        // 默认角度零点
+    .obsv_speed = false,        // 默认使用轮速
+    .xoffset_enable = false,    // 默认关闭X-Offset
+    .xoffset_kp = 0.1f,        // 默认X-Offset Kp
     .last_update_ms = 0,
     .msg_count = 0,
     .connected = false,
@@ -295,6 +298,24 @@ static void parse_json_command(const char *json_str) {
     cJSON *angle_zero = cJSON_GetObjectItem(json, "angle_zero");
     if (angle_zero && cJSON_IsNumber(angle_zero)) {
         g_remote_data.angle_zero = (float)angle_zero->valuedouble;
+    }
+    
+    // 解析三环PID速度源
+    cJSON *obsv_speed = cJSON_GetObjectItem(json, "obsv_speed");
+    if (obsv_speed && cJSON_IsNumber(obsv_speed)) {
+        g_remote_data.obsv_speed = (obsv_speed->valueint == 1);
+    }
+    
+    // 解析X-Offset开关
+    cJSON *xoffset_enable = cJSON_GetObjectItem(json, "xoffset_enable");
+    if (xoffset_enable && cJSON_IsNumber(xoffset_enable)) {
+        g_remote_data.xoffset_enable = (xoffset_enable->valueint == 1);
+    }
+    
+    // 解析X-Offset Kp
+    cJSON *xoffset_kp = cJSON_GetObjectItem(json, "xoffset_kp");
+    if (xoffset_kp && cJSON_IsNumber(xoffset_kp)) {
+        g_remote_data.xoffset_kp = (float)xoffset_kp->valuedouble;
     }
     
     // 更新时间戳和计数

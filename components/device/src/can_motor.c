@@ -71,6 +71,10 @@ static uint32_t g_can_busoff_count = 0;
 static uint32_t g_can_tx_error_count = 0;
 static uint32_t g_can_recovery_count = 0;
 
+// CAN 调试开关 (打印每帧 TX/RX)
+static bool g_can_debug = false;
+static uint32_t g_can_debug_filter_id = 0;  // 0=全部, >0=只打印指定 motor_id
+
 // 保存初始化引脚，用于恢复失败时重新初始化
 static gpio_num_t g_can_tx_pin = GPIO_NUM_NC;
 static gpio_num_t g_can_rx_pin = GPIO_NUM_NC;
@@ -175,6 +179,20 @@ static esp_err_t can_send_frame(uint32_t id, uint8_t *data, uint8_t len) {
     memcpy(msg.data, data, len > 8 ? 8 : len);
     
     esp_err_t ret = twai_transmit(&msg, pdMS_TO_TICKS(1));  // 1ms 超时，避免阻塞高频控制循环
+    if (g_can_debug) {
+        // 过滤: 只打印指定电机的帧
+        bool show = (g_can_debug_filter_id == 0) ||
+                    (id == CAN_TX_BASE_ID + g_can_debug_filter_id) ||
+                    (id == CAN_RX_BASE_ID + g_can_debug_filter_id) ||
+                    (id == (STW_TX_ID_OFFSET | g_can_debug_filter_id)) ||
+                    (id == g_can_debug_filter_id);
+        if (show) {
+            printf("CAN TX 0x%03lX [%d]: %02X %02X %02X %02X %02X %02X %02X %02X %s\n",
+                   id, len, data[0], data[1], data[2], data[3],
+                   data[4], data[5], data[6], data[7],
+                   (ret == ESP_OK) ? "OK" : esp_err_to_name(ret));
+        }
+    }
     if (ret != ESP_OK) {
         g_can_tx_error_count++;
         // TX 失败可能是 Bus-Off，尝试检查和恢复

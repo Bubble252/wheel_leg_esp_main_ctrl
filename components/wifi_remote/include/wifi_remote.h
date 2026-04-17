@@ -83,6 +83,13 @@ typedef struct {
     // 角度零点
     float angle_zero;           // 角度零点偏移 (度, -30 ~ 30)
     
+    // 三环PID速度源
+    bool obsv_speed;            // 使用观测器速度 (true=观测器, false=轮速)
+    
+    // X-Offset控制
+    bool xoffset_enable;        // X-Offset使能
+    float xoffset_kp;           // X-Offset Kp参数
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量

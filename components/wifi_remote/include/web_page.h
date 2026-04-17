@@ -331,8 +331,21 @@ static const char web_page_html[] = R"rawliteral(
             <div class="ctrl-row">
                 <label>� Distance Loop (位移环)</label>
                 <input type="checkbox" id="distEnableSwitch" class="switch" checked onclick="toggleDistEnable()">
+            </div>            
+            <div class="ctrl-row">
+                <label>👁️ Observer Speed (观测器速度)</label>
+                <input type="checkbox" id="obsvSpeedSwitch" class="switch" onclick="toggleObsvSpeed()">
             </div>
-        </div>
+            
+            <div class="ctrl-row">
+                <label>↔️ X-Offset Enable</label>
+                <input type="checkbox" id="xoffsetEnableSwitch" class="switch" onclick="toggleXoffsetEnable()">
+            </div>
+            
+            <div class="slider-row">
+                <label id="xoffsetKpLabel">↔️ X-Offset Kp: 0.100</label>
+                <input type="range" id="xoffsetKpSlider" min="0" max="1000" value="100" step="1" oninput="updateXoffsetKp()">
+            </div>        </div>
         
         <!-- 腿部控制面板 -->
         <div class="ctrl-panel">
@@ -489,6 +502,9 @@ static const char web_page_html[] = R"rawliteral(
     var heartbeatTimer = null;
     var g_standup = 0;
     var g_angleZero = 7.4;
+    var g_obsvSpeed = 0;
+    var g_xoffsetEnable = 0;
+    var g_xoffsetKp = 100;
     
     // WebSocket 初始化
     function initWebSocket() {
@@ -564,7 +580,10 @@ static const char web_page_html[] = R"rawliteral(
                 yaw_enable: g_yawEnable,
                 roll_enable: g_rollEnable,
                 standup: g_standup,
-                angle_zero: parseFloat(g_angleZero.toFixed(2))
+                angle_zero: parseFloat(g_angleZero.toFixed(2)),
+                obsv_speed: g_obsvSpeed,
+                xoffset_enable: g_xoffsetEnable,
+                xoffset_kp: g_xoffsetKp / 1000.0
             };
             socket.send(JSON.stringify(data));
             msgCount++;
@@ -691,6 +710,25 @@ static const char web_page_html[] = R"rawliteral(
         document.getElementById('angleZeroLabel').innerText = '🎯 Angle Zero: ' + g_angleZero.toFixed(1) + '°';
         sendData();
         log('Angle zeropoint nudge: ' + g_angleZero.toFixed(2) + '°');
+    }
+    
+    function toggleObsvSpeed() {
+        g_obsvSpeed = document.getElementById('obsvSpeedSwitch').checked ? 1 : 0;
+        sendData();
+        log('Observer speed: ' + (g_obsvSpeed ? 'ON' : 'OFF'));
+    }
+    
+    function toggleXoffsetEnable() {
+        g_xoffsetEnable = document.getElementById('xoffsetEnableSwitch').checked ? 1 : 0;
+        sendData();
+        log('X-Offset: ' + (g_xoffsetEnable ? 'ON' : 'OFF'));
+    }
+    
+    function updateXoffsetKp() {
+        g_xoffsetKp = parseFloat(document.getElementById('xoffsetKpSlider').value);
+        document.getElementById('xoffsetKpLabel').innerText = '↔️ X-Offset Kp: ' + (g_xoffsetKp / 1000).toFixed(3);
+        sendData();
+        log('X-Offset Kp: ' + (g_xoffsetKp / 1000).toFixed(3));
     }
     
     function updateJoySpeed() {

@@ -31,7 +31,7 @@ static const lqr_params_t default_params = {
     // 位移环 PID
     .distance_kp = 7.0f,
     .distance_ki = 0.001f,
-    .distance_kd = 0.1f,
+    .distance_kd = 1.2f,
     .distance_limit = 10.0f,
 
     // 速度环 PID
@@ -1218,9 +1218,9 @@ static const triple_pid_params_t triple_pid_default_params = {
     .gyro_limit = 10.0f,
     
     // 位移环 (最外环, 默认开启)
-    .distance_kp = 7.0f,
+    .distance_kp = 4.2f,
     .distance_ki = 0.0f,
-    .distance_kd = 0.1f,
+    .distance_kd = 1.2f,
     .distance_limit = 10.0f,   // 最大速度修正
     .distance_enable = 1,      // 默认开启
     

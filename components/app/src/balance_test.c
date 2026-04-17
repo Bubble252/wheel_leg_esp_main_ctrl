@@ -192,7 +192,7 @@ static TaskHandle_t g_task_observer = NULL;       // 观测器独立任务句柄
 static bool g_use_unified_task = true;            // true=使用合并任务(默认), false=使用分离任务
 
 // 功能开关
-static bool g_uncontrolable_check_enabled = false; // true=启用失控检测(默认), false=禁用失控检测
+static bool g_uncontrolable_check_enabled = true;  // true=启用失控检测(默认), false=禁用失控检测
 
 // 控制模式选择
 typedef enum {
@@ -225,6 +225,8 @@ static bool g_triple_pid_initialized = false;
 static triple_pid_output_t g_triple_pid_output;   // 保存输出用于调试
 
 // 完整 LQR 控制器 (同时输出 T 和 Tp, K 随腿长插值)
+static bool g_auto_enable_inhibited = false;       // true=手动 disable 后禁止自动重新使能
+
 static full_lqr_controller_t g_full_lqr_ctrl;
 static bool g_full_lqr_initialized = false;
 static full_lqr_output_t g_full_lqr_output_left;   // 左腿输出 (调试)
@@ -519,6 +521,7 @@ static uint8_t g_mpow_volt_poll_div = 0;            // 电压轮询分频计数�
 // 速度/位移观测器 (卡尔曼滤波融合: 编码器 + IMU 加速度)
 // ============================================================================
 static bool g_observer_enabled = true;             // 观测器使能 (默认开启, 与参考代码一致)
+static bool g_tpid_use_observer_speed = false;     // 三环PID速度源: true=观测器, false=滤波轮速
 static bool g_obsv_stream_enable = false;          // 观测器数据流输出使能
 static int  g_obsv_period_ms = OBSERVER_PERIOD_MS; // 观测器任务周期 (ms, 可 CLI 调参)
 
@@ -2131,7 +2134,7 @@ esp_err_t balance_test_init(void) {
     // 初始化 X-Offset PID (腿部速度自适应偏移)
     {
         pid_params_t xoffset_params = {
-            .kp = 0.01f,           // 默认比例增益 (m/s → m)
+            .kp = 0.1f,            // 默认比例增益 (m/s → m)
             .ki = 0.0f,            // 默认无积分
             .kd = 0.0f,            // 默认无微分
             .output_min = -g_xoffset_limit,
@@ -2275,9 +2278,9 @@ esp_err_t balance_test_start(void) {
     ESP_LOGI(TAG, "Balance test tasks started (%s mode)", 
              g_use_unified_task ? "unified" : "separate");
     ESP_LOGI(TAG, "=================================");
-    ESP_LOGI(TAG, "Connect to WiFi: WL-PRO (password: 12345678)");
+    ESP_LOGI(TAG, "WiFi AP: WL-PRO (password: 12345678)");
     ESP_LOGI(TAG, "Open http://192.168.4.1 in browser");
-    ESP_LOGI(TAG, "Toggle 'Robot Go!' switch to enable balance");
+    ESP_LOGI(TAG, "Auto-enable after IMU stable & pitch < 30 deg");
     ESP_LOGI(TAG, "=================================");
     
     return ESP_OK;
@@ -2336,6 +2339,9 @@ void balance_test_enable(void) {
     
     ESP_LOGI(TAG, "Balance control ENABLED");
     
+    // 清除自动使能抑制 (手动 enable 后允许后续自动使能)
+    g_auto_enable_inhibited = false;
+    
     // 重置控制器
     lqr_reset(&g_lqr_ctrl);
     g_distance_zeropoint = g_lqr_distance;
@@ -2372,6 +2378,9 @@ void balance_test_enable(void) {
 
 void balance_test_disable(void) {
     ESP_LOGI(TAG, "Balance control DISABLED");
+    
+    // 禁止自动重新使能 (手动 disable 后需要手动 enable)
+    g_auto_enable_inhibited = true;
     
     xSemaphoreTake(g_wheel_cmd_mutex, portMAX_DELAY);
     g_wheel_cmd.enabled = false;
@@ -2768,6 +2777,29 @@ static void task_unified_control(void *arg) {
             
             g_stats.imu_read_count++;
             g_imu_count_per_sec++;
+        }
+        
+        // ======== Step 2.5: 自动使能 (等待 IMU 稳定 + 姿态安全) ========
+        // 在 READY 状态下, 连续 500 帧 (1 秒) IMU 有效且 pitch < 30° 后自动使能
+        {
+            static int auto_enable_count = 0;
+            const int AUTO_ENABLE_THRESHOLD = 500;  // 500 frames @ 500Hz = 1s
+            const float AUTO_ENABLE_MAX_PITCH = 30.0f;
+            
+            if (g_state == BALANCE_TEST_READY && g_imu_data.valid && !g_auto_enable_inhibited) {
+                if (fabsf(g_imu_data.pitch) < AUTO_ENABLE_MAX_PITCH) {
+                    auto_enable_count++;
+                    if (auto_enable_count >= AUTO_ENABLE_THRESHOLD) {
+                        ESP_LOGI(TAG, "Auto-enable: IMU stable, pitch=%.1f deg", g_imu_data.pitch);
+                        balance_test_enable();
+                        auto_enable_count = 0;
+                    }
+                } else {
+                    auto_enable_count = 0;  // 姿态不安全, 重新计数
+                }
+            } else if (g_state != BALANCE_TEST_READY) {
+                auto_enable_count = 0;  // 非 READY 状态, 重置计数
+            }
         }
         
         // ======== Step 3: 处理 CAN 接收 ========
@@ -3545,6 +3577,30 @@ static void update_remote_from_wifi(void) {
         last_roll_enable = wifi_data->roll_enable;
     }
     
+    // ======== 处理三环PID速度源切换 ========
+    static bool last_obsv_speed = false;
+    if (wifi_data->obsv_speed != last_obsv_speed) {
+        g_tpid_use_observer_speed = wifi_data->obsv_speed;
+        ESP_LOGI(TAG, "WiFi: TPID speed source = %s", g_tpid_use_observer_speed ? "OBSERVER" : "WHEEL");
+        last_obsv_speed = wifi_data->obsv_speed;
+    }
+    
+    // ======== 处理X-Offset开关 ========
+    static bool last_xoffset_enable = false;
+    if (wifi_data->xoffset_enable != last_xoffset_enable) {
+        balance_test_set_xoffset(wifi_data->xoffset_enable);
+        ESP_LOGI(TAG, "WiFi: X-Offset %s", wifi_data->xoffset_enable ? "ENABLED" : "DISABLED");
+        last_xoffset_enable = wifi_data->xoffset_enable;
+    }
+
+    // ======== 处理X-Offset Kp调节 ========
+    static float last_xoffset_kp = 0.1f;
+    if (fabsf(wifi_data->xoffset_kp - last_xoffset_kp) > 0.001f) {
+        balance_test_set_xoffset_pid(wifi_data->xoffset_kp, g_xoffset_pid.ki, g_xoffset_pid.kd);
+        ESP_LOGI(TAG, "WiFi: X-Offset Kp=%.4f", wifi_data->xoffset_kp);
+        last_xoffset_kp = wifi_data->xoffset_kp;
+    }
+
     // ======== 处理角度零点调节 ========
     static float last_angle_zero = 7.4f;
     if (fabsf(wifi_data->angle_zero - last_angle_zero) > 0.01f) {
@@ -4376,9 +4432,35 @@ static void compute_balance_output(float dt) {
         // 角度环(中): pitch_target - pitch → wheel_speed_target
         // 轮速环(内): wheel_speed_target → torque(软件PID) 或 speed_cmd(电机速度模式)
         
-        float wheel_speed_avg = -(left_vel_rad + right_vel_rad) / 2.0f;
-        if (g_wma_enabled) {
+        float wheel_speed_avg;
+        if (g_tpid_use_observer_speed) {
+            // 观测器速度 (m/s) → 轮角速度 (rad/s)
+            wheel_speed_avg = g_obsv_v_filter / WHEEL_RADIUS_M;
+        } else {
+            wheel_speed_avg = -(left_vel_rad + right_vel_rad) / 2.0f;
             wheel_speed_avg = wma_compute(&g_wheel_speed_wma, wheel_speed_avg);
+        }
+        
+        // 根据腿长线性插值角度环Kp: L0=0.06→Kp=1.3, L0=0.11→Kp=0.9
+        {
+            float avg_L0 = (g_leg_left_target_length + g_leg_right_target_length) * 0.5f;
+            if (avg_L0 < 0.06f) avg_L0 = 0.06f;
+            if (avg_L0 > 0.11f) avg_L0 = 0.11f;
+            float interp_angle_kp = 1.25f + (1.15f - 1.25f) * (avg_L0 - 0.06f) / (0.11f - 0.06f);
+            triple_pid_set_angle_gains(&g_triple_pid_ctrl, interp_angle_kp,
+                                       g_triple_pid_ctrl.params.angle_ki,
+                                       g_triple_pid_ctrl.params.angle_kd);
+        }
+        
+        // 根据腿长线性插值角速度环Kp: L0=0.06→Kp=0.11, L0=0.11→Kp=0.09
+        {
+            float avg_L0 = (g_leg_left_target_length + g_leg_right_target_length) * 0.5f;
+            if (avg_L0 < 0.06f) avg_L0 = 0.06f;
+            if (avg_L0 > 0.11f) avg_L0 = 0.11f;
+            float interp_gyro_kp = 0.105f + (0.095f - 0.105f) * (avg_L0 - 0.06f) / (0.11f - 0.06f);
+            triple_pid_set_gyro_gains(&g_triple_pid_ctrl, interp_gyro_kp,
+                                      g_triple_pid_ctrl.params.gyro_ki,
+                                      g_triple_pid_ctrl.params.gyro_kd);
         }
         
         esp_err_t ret = triple_pid_balance_loop(&g_triple_pid_ctrl,
@@ -5107,24 +5189,35 @@ static void apply_motor_commands(void) {
     memcpy(&cmd, &g_wheel_cmd, sizeof(cmd));
     xSemaphoreGive(g_wheel_cmd_mutex);
     
-    if (cmd.enabled && g_state == BALANCE_TEST_RUNNING) {
-        if (cmd.use_speed_mode) {
+    if (g_state == BALANCE_TEST_EMERGENCY) {
+        // E-stop: 强制发送扭矩 0
+        can_motor_set_torque(g_motor_left, 0);
+        can_motor_set_torque(g_motor_right, 0);
+    } else if (cmd.enabled && g_state == BALANCE_TEST_RUNNING) {
+        if (g_uncontrolable != 0) {
+            // IMU 角度超限: 强制发送扭矩 0
+            can_motor_set_torque(g_motor_left, 0);
+            can_motor_set_torque(g_motor_right, 0);
+        } else if (cmd.use_speed_mode) {
             // 速度模式 (单环 PID 输出): left_torque/right_torque 实际存储的是速度 (rad/s)
             // 转换: rad/s → rpm (rpm = rad/s * 60 / 2π ≈ rad/s * 9.5493)
             float left_speed_rpm = cmd.left_torque * 9.5493f;
             float right_speed_rpm = cmd.right_torque * 9.5493f;
+            // 死区补偿: 非零指令时叠加 1 RPM 起始值, 确保电机能动
+            const float SPEED_DEADZONE_RPM = 2.0f;
+            if (left_speed_rpm > 0.0f)       left_speed_rpm += SPEED_DEADZONE_RPM;
+            else if (left_speed_rpm < 0.0f)   left_speed_rpm -= SPEED_DEADZONE_RPM;
+            if (right_speed_rpm > 0.0f)       right_speed_rpm += SPEED_DEADZONE_RPM;
+            else if (right_speed_rpm < 0.0f)  right_speed_rpm -= SPEED_DEADZONE_RPM;
             can_motor_set_speed(g_motor_left, left_speed_rpm);
             can_motor_set_speed(g_motor_right, right_speed_rpm);
         } else {
-            // 扭矩模式 (LQR / 双环 PID 输出)
+            // 扭矩模式 (LQR / FULL_LQR / 双环 PID 输出)
             can_motor_set_torque(g_motor_left, cmd.left_torque);
             can_motor_set_torque(g_motor_right, cmd.right_torque);
         }
-    } else {
-        // 停止时使用扭矩模式发送 0
-        can_motor_set_torque(g_motor_left, 0);
-        can_motor_set_torque(g_motor_right, 0);
     }
+    // READY/IDLE 状态: 不发送任何轮电机命令, 不占用 CAN 总线, 允许手动测试
     
     // 记录电机命令发送时间
     g_motor_send_time_us = esp_timer_get_time();
