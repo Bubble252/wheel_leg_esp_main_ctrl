@@ -64,12 +64,13 @@ static remote_data_t g_remote_data = {
     .joy_speed_gain = 0.003f,
     .joy_yaw_gain = 0.03f,
     .dist_enable = true,       // 默认开启位移环
-    .yaw_enable = true,        // 默认开启 Yaw 控制
+    .yaw_enable = false,       // 默认关闭 Yaw 控制
     .roll_enable = false,      // 默认关闭 Roll 控制
     .angle_zero = 7.4f,        // 默认角度零点
     .obsv_speed = false,        // 默认使用轮速
     .xoffset_enable = false,    // 默认关闭X-Offset
     .xoffset_kp = 0.1f,        // 默认X-Offset Kp
+    .diff_speed_enable = false,  // 默认关闭差速转向
     .last_update_ms = 0,
     .msg_count = 0,
     .connected = false,
@@ -316,6 +317,12 @@ static void parse_json_command(const char *json_str) {
     cJSON *xoffset_kp = cJSON_GetObjectItem(json, "xoffset_kp");
     if (xoffset_kp && cJSON_IsNumber(xoffset_kp)) {
         g_remote_data.xoffset_kp = (float)xoffset_kp->valuedouble;
+    }
+    
+    // 解析差速转向开关
+    cJSON *diff_speed_enable = cJSON_GetObjectItem(json, "diff_speed_enable");
+    if (diff_speed_enable && cJSON_IsNumber(diff_speed_enable)) {
+        g_remote_data.diff_speed_enable = (diff_speed_enable->valueint == 1);
     }
     
     // 更新时间戳和计数

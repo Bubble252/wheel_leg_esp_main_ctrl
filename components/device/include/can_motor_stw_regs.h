@@ -97,6 +97,8 @@ extern "C" {
 // 力矩常数 Kt (Nm/A): 力矩 = Kt × Q轴电流
 // !! 请根据实际电机规格修改此值, 可通过 0xB0 命令从电机读取 !!
 #define STW_TORQUE_CONSTANT     0.44f       // Kt (Nm/A), 从 0xB0 实测: poles=11, Kt=0.44, gear=8
+#define STW_GEAR_RATIO          8           // 减速比, 从 0xB0 实测
+#define STW_JOINT_TORQUE_CONST  (STW_TORQUE_CONSTANT * STW_GEAR_RATIO)  // 输出轴等效力矩常数 (Nm/A)
 
 // 位置: 16384 count/rev → 度
 #define STW_POS_COUNTS_PER_REV  16384.0f

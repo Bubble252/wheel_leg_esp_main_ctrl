@@ -225,7 +225,7 @@ static bool g_triple_pid_initialized = false;
 static triple_pid_output_t g_triple_pid_output;   // 保存输出用于调试
 
 // 完整 LQR 控制器 (同时输出 T 和 Tp, K 随腿长插值)
-static bool g_auto_enable_inhibited = false;       // true=手动 disable 后禁止自动重新使能
+static bool g_auto_enable_inhibited = true;        // true=禁止自动使能, 需手动 balance enable
 
 static full_lqr_controller_t g_full_lqr_ctrl;
 static bool g_full_lqr_initialized = false;
@@ -306,6 +306,15 @@ static float g_prev_right_wheel_speed = 0.0f;   // 上次右轮速度
 static bool g_wheel_off_ground = false;          // 轮子离地标志
 static int g_off_ground_counter = 0;             // 离地检测去抖计数器
 
+// 支持力离地检测去抖 (左右腿独立)
+static int g_sforce_left_off_cnt  = 0;           // 左腿支持力离地计数器
+static int g_sforce_right_off_cnt = 0;           // 右腿支持力离地计数器
+static bool g_sforce_left_off  = false;          // 左轮小力离地标志
+static bool g_sforce_right_off = false;          // 右轮小力离地标志
+#define SFORCE_FL_THRESHOLD   1.0f              // F_L 离地判定阈値 (N)
+#define SFORCE_OFF_ENTER_CNT  5                 // 连续 5 帧判定离地 (10ms@500Hz)
+#define SFORCE_OFF_EXIT_CNT   10                // 连续 10 帧判定着地 (20ms@500Hz)
+
 // 离地检测去抖参数
 #define OFF_GROUND_ENTER_COUNT  8   // 连续 8 帧判定离地 (16ms@500Hz)
 #define OFF_GROUND_EXIT_COUNT   13  // 连续 13 帧判定着地 (26ms@500Hz)
@@ -343,8 +352,10 @@ static uint8_t g_pid_debug_counter = 0;     // 分频计数器
 
 // 环路使能控制 (用于单环调试)
 static uint8_t g_loop_enable_mask = LOOP_FULL;  // 默认全部启用
-static bool g_yaw_control_enabled = true;       // YAW 控制独立开关
+static bool g_yaw_control_enabled = false;      // YAW 控制独立开关 (默认关, 需手动开启)
 static bool g_yaw_force_enable = false;         // YAW 强制使能 (无需遥控器 go, 通过 CLI 控制)
+static bool g_diff_speed_enabled = false;       // 差速转向使能 (Yaw失能时的开环差速)
+static float g_diff_speed_scale = 0.9f;        // 差速转向增益 (joy_x * scale)
 static bool g_loop_manual_mode = false;         // 手动模式 (禁止自动切换 simple/full)
 
 // ============================================================================
@@ -434,6 +445,7 @@ typedef enum {
 static jump_state_t g_jump_state = JUMP_IDLE;
 static uint32_t g_jump_state_enter_ms = 0;         // 进入当前状态的时间 (ms)
 static float g_jump_saved_leg_length = 0.09f;      // 跳跃前保存的腿长 (m)
+static float g_jump_saved_base_angle = -90.0f;      // 跳跃前保存的身体夹角 (度)
 static bool g_jump_last_btn = false;                // 上一帧跳跃按钮状态 (用于上升沿检测)
 
 // 跳跃参数 (可调)
@@ -516,6 +528,13 @@ static bool g_joint_stream_enable = false;         // 关节电机数据流使�
 static bool g_mpow_stream_enable = false;          // 电机功率数据流使能 (电压/电流)
 static uint8_t g_mpow_volt_poll_idx = 0;           // 电压轮询索引 (0-5, 轮流请求6个电机)
 static uint8_t g_mpow_volt_poll_div = 0;            // 电压轮询分频计数器
+
+// 支持力估计 (从电机电流通过逆雅可比反解, 始终计算)
+static float g_support_force_left_FL = 0.0f;       // 左腿实际 F_L (N), 沿腿方向
+static float g_support_force_right_FL = 0.0f;      // 右腿实际 F_L (N), 沿腿方向
+static float g_support_force_left_Fa = 0.0f;       // 左腿实际 F_alpha (Nm)
+static float g_support_force_right_Fa = 0.0f;      // 右腿实际 F_alpha (Nm)
+static bool  g_sforce_stream_enable = false;        // 支持力数据流使能
 
 // ============================================================================
 // 速度/位移观测器 (卡尔曼滤波融合: 编码器 + IMU 加速度)
@@ -1071,6 +1090,14 @@ static void output_plot_data(const lqr_input_t *input, const lqr_output_t *outpu
                g_obsv_x_filter,        // 滤波积分位移
                g_obsv_a_imu);          // IMU 前进方向加速度
     }
+
+    // 支持力数据流 (独立使能, 复用 plot 分频)
+    // 格式: #SFORCE,L_FL(N),L_Fa(Nm),R_FL(N),R_Fa(Nm)
+    if (g_sforce_stream_enable) {
+        printf("#SFORCE,%.2f,%.3f,%.2f,%.3f\n",
+               g_support_force_left_FL, g_support_force_left_Fa,
+               g_support_force_right_FL, g_support_force_right_Fa);
+    }
 }
 
 /**
@@ -1440,6 +1467,66 @@ void balance_test_set_leg_speed(float speed) {
  * 
  * 所有 FK、雅可比、VMC 计算都封装在 leg_kinematics.c 中
  */
+
+/**
+ * @brief 支持力估计 (任意模式下均可调用)
+ * @note 仅依赖关节电机有效, 与 VMC/LQR 模式无关
+ *       若 VMC 未启用则自行刷新 CAN 缓冲区
+ *       [F_L; F_α] = (J^T)^{-1} × [τ_hip; τ_knee]
+ */
+static void compute_support_force(void) {
+    bool left_valid  = (g_motor_left_hip  && g_motor_left_knee);
+    bool right_valid = (g_motor_right_hip && g_motor_right_knee);
+
+    if (!left_valid && !right_valid) return;
+
+    // VMC 未启用时需要在此刷新 CAN 接收缓冲区
+    if (!g_vmc_enabled || !g_leg_control_enabled) {
+        can_motor_process_rx();
+    }
+
+    float l_hip_actual_Nm  = left_valid  ? vmc_current_to_torque(can_motor_read_current(g_motor_left_hip))  : 0;
+    float l_knee_actual_Nm = left_valid  ? vmc_current_to_torque(can_motor_read_current(g_motor_left_knee)) : 0;
+    float r_hip_actual_Nm  = right_valid ? vmc_current_to_torque(can_motor_read_current(g_motor_right_hip))  : 0;
+    float r_knee_actual_Nm = right_valid ? vmc_current_to_torque(can_motor_read_current(g_motor_right_knee)) : 0;
+
+    // 右腿扭矩方向修正 (与 vmc_ctrl_compute 中的取反对应)
+    r_hip_actual_Nm  = -r_hip_actual_Nm;
+    r_knee_actual_Nm = -r_knee_actual_Nm;
+
+    float l_FL = 0, l_Fa = 0, r_FL = 0, r_Fa = 0;
+
+    if (left_valid) {
+        leg_joint_state_t lj = { .hip_angle = can_motor_read_position(g_motor_left_hip),
+                                 .knee_angle = can_motor_read_position(g_motor_left_knee) };
+        float J[4];
+        leg_kin_jacobian(&lj, true, NULL, J);
+        float det = J[0] * J[3] - J[1] * J[2];
+        if (fabsf(det) > 1e-6f) {
+            float inv_det = 1.0f / det;
+            l_FL = inv_det * ( J[3] * l_hip_actual_Nm - J[2] * l_knee_actual_Nm);
+            l_Fa = inv_det * (-J[1] * l_hip_actual_Nm + J[0] * l_knee_actual_Nm);
+        }
+    }
+    if (right_valid) {
+        leg_joint_state_t rj = { .hip_angle = can_motor_read_position(g_motor_right_hip),
+                                 .knee_angle = can_motor_read_position(g_motor_right_knee) };
+        float J[4];
+        leg_kin_jacobian(&rj, false, NULL, J);
+        float det = J[0] * J[3] - J[1] * J[2];
+        if (fabsf(det) > 1e-6f) {
+            float inv_det = 1.0f / det;
+            r_FL = inv_det * ( J[3] * r_hip_actual_Nm - J[2] * r_knee_actual_Nm);
+            r_Fa = inv_det * (-J[1] * r_hip_actual_Nm + J[0] * r_knee_actual_Nm);
+        }
+    }
+
+    g_support_force_left_FL  = l_FL;
+    g_support_force_right_FL = r_FL;
+    g_support_force_left_Fa  = l_Fa;
+    g_support_force_right_Fa = r_Fa;
+}
+
 static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
     if (!g_vmc_enabled || !g_leg_control_enabled) {
         g_vmc_input_valid = false;
@@ -1552,69 +1639,29 @@ static void vmc_compute_leg_state(const lqr_input_t *lqr_input) {
                 g_vmc_dual_output.right.knee_torque += -(J_right[3] * delta_right);
             }
             
-            // VMC 数据流输出 (用于 UI 调试)
-            // 格式: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync,L_aFL,L_aFa,R_aFL,R_aFa
-            // 后4个字段: 从电机电流反解的实际 F_L 和 F_alpha (通过 J^{-T} × τ_actual)
-            if (g_vmc_stream_enable) {
-                // 从电机电流反解实际扭矩 (1A = 0.25Nm)
-                float l_hip_actual_Nm  = left_valid  ? vmc_current_to_torque(can_motor_read_current(g_motor_left_hip))  : 0;
-                float l_knee_actual_Nm = left_valid  ? vmc_current_to_torque(can_motor_read_current(g_motor_left_knee)) : 0;
-                float r_hip_actual_Nm  = right_valid ? vmc_current_to_torque(can_motor_read_current(g_motor_right_hip))  : 0;
-                float r_knee_actual_Nm = right_valid ? vmc_current_to_torque(can_motor_read_current(g_motor_right_knee)) : 0;
-                
-                // 右腿扭矩方向修正 (与 vmc_ctrl_compute 中的取反对应)
-                r_hip_actual_Nm  = -r_hip_actual_Nm;
-                r_knee_actual_Nm = -r_knee_actual_Nm;
-                
-                // 通过雅可比逆矩阵反解虚拟力: [F_L; F_α] = (J^T)^{-1} × [τ_hip; τ_knee]
-                // J^{-T} = (1/det) × [J[3], -J[2]; -J[1], J[0]]
-                // det(J) = J[0]*J[3] - J[1]*J[2]
-                float l_actual_FL = 0, l_actual_Fa = 0;
-                float r_actual_FL = 0, r_actual_Fa = 0;
-                
-                if (left_valid) {
-                    leg_joint_state_t lj = { .hip_angle = can_motor_read_position(g_motor_left_hip),
-                                             .knee_angle = can_motor_read_position(g_motor_left_knee) };
-                    float J[4];
-                    leg_kin_jacobian(&lj, true, NULL, J);
-                    float det = J[0] * J[3] - J[1] * J[2];
-                    if (fabsf(det) > 1e-6f) {
-                        float inv_det = 1.0f / det;
-                        l_actual_FL = inv_det * ( J[3] * l_hip_actual_Nm - J[2] * l_knee_actual_Nm);
-                        l_actual_Fa = inv_det * (-J[1] * l_hip_actual_Nm + J[0] * l_knee_actual_Nm);
-                    }
+            // 支持力估计已移至 compute_support_force(), 在 compute_balance_output() 中无条件调用
+
+                // VMC 数据流输出 (用于 UI 调试)
+                // 格式: #VMC,L_len,L_ang,L_FL,L_Fa,L_hip,L_knee,R_len,R_ang,R_FL,R_Fa,R_hip,R_knee,diff,Fsync,L_aFL,L_aFa,R_aFL,R_aFa
+                if (g_vmc_stream_enable) {
+                    printf("#VMC,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f,%.3f\n",
+                           g_vmc_dual_output.left.current_leg_length,
+                           g_vmc_dual_output.left.current_body_angle,
+                           g_vmc_dual_output.left.debug.F_L,
+                           g_vmc_dual_output.left.debug.F_alpha,
+                           g_vmc_dual_output.left.hip_torque,
+                           g_vmc_dual_output.left.knee_torque,
+                           g_vmc_dual_output.right.current_leg_length,
+                           g_vmc_dual_output.right.current_body_angle,
+                           g_vmc_dual_output.right.debug.F_L,
+                           g_vmc_dual_output.right.debug.F_alpha,
+                           g_vmc_dual_output.right.hip_torque,
+                           g_vmc_dual_output.right.knee_torque,
+                           g_vmc_dual_output.angle_diff_deg,
+                           g_vmc_dual_output.F_sync,
+                           g_support_force_left_FL, g_support_force_left_Fa,
+                           g_support_force_right_FL, g_support_force_right_Fa);
                 }
-                if (right_valid) {
-                    leg_joint_state_t rj = { .hip_angle = can_motor_read_position(g_motor_right_hip),
-                                             .knee_angle = can_motor_read_position(g_motor_right_knee) };
-                    float J[4];
-                    leg_kin_jacobian(&rj, false, NULL, J);
-                    float det = J[0] * J[3] - J[1] * J[2];
-                    if (fabsf(det) > 1e-6f) {
-                        float inv_det = 1.0f / det;
-                        r_actual_FL = inv_det * ( J[3] * r_hip_actual_Nm - J[2] * r_knee_actual_Nm);
-                        r_actual_Fa = inv_det * (-J[1] * r_hip_actual_Nm + J[0] * r_knee_actual_Nm);
-                    }
-                }
-                
-                printf("#VMC,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.3f,%.1f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f,%.3f\n",
-                       g_vmc_dual_output.left.current_leg_length,
-                       g_vmc_dual_output.left.current_body_angle,
-                       g_vmc_dual_output.left.debug.F_L,
-                       g_vmc_dual_output.left.debug.F_alpha,
-                       g_vmc_dual_output.left.hip_torque,
-                       g_vmc_dual_output.left.knee_torque,
-                       g_vmc_dual_output.right.current_leg_length,
-                       g_vmc_dual_output.right.current_body_angle,
-                       g_vmc_dual_output.right.debug.F_L,
-                       g_vmc_dual_output.right.debug.F_alpha,
-                       g_vmc_dual_output.right.hip_torque,
-                       g_vmc_dual_output.right.knee_torque,
-                       g_vmc_dual_output.angle_diff_deg,
-                       g_vmc_dual_output.F_sync,
-                       l_actual_FL, l_actual_Fa,
-                       r_actual_FL, r_actual_Fa);
-            }
         }
     }
 }
@@ -1794,6 +1841,13 @@ static void apply_leg_motor_commands(void) {
         if (g_motor_right_knee) {
             can_motor_set_position(g_motor_right_knee, right_knee_cmd, g_leg_move_speed);
         }
+        // ===== 位置模式电流轮询 =====
+        // 0xC2 位置命令的应答只含角度，需额外请求 0xA1 获取 Q 轴电流
+        // 否则 can_motor_read_current() 始终为 0，支持力估算无效
+        if (g_motor_left_hip)   can_motor_request_current(g_motor_left_hip);
+        if (g_motor_left_knee)  can_motor_request_current(g_motor_left_knee);
+        if (g_motor_right_hip)  can_motor_request_current(g_motor_right_hip);
+        if (g_motor_right_knee) can_motor_request_current(g_motor_right_knee);
     }
 }
 // ============================================================================
@@ -3058,8 +3112,8 @@ static void jump_state_machine_update(void) {
                     DEG2RAD(g_leg_right_knee_angle)
                 };
                 // 计算蹬伸目标关节角度 (IK)
-                leg_ctrl_set_target(true, g_jump_extend_length, g_leg_base_angle);
-                leg_ctrl_set_target(false, g_jump_extend_length, g_leg_base_angle);
+                leg_ctrl_set_target(true, g_jump_extend_length, g_jump_saved_base_angle+10.0f);
+                leg_ctrl_set_target(false, g_jump_extend_length, g_jump_saved_base_angle+10.0f);
                 // 保存目标角度为 rad (MIT 使用弧度)
                 g_jump_mit_target_rad[0] = DEG2RAD(g_leg_left_hip_angle);
                 g_jump_mit_target_rad[1] = DEG2RAD(g_leg_left_knee_angle);
@@ -3092,8 +3146,8 @@ static void jump_state_machine_update(void) {
                 can_motor_stw_write_pid(g_motor_left_knee, STW_CMD_POS_KP, g_jump_retract_pos_kp);
                 can_motor_stw_write_pid(g_motor_right_hip, STW_CMD_POS_KP, g_jump_retract_pos_kp);
                 can_motor_stw_write_pid(g_motor_right_knee, STW_CMD_POS_KP, g_jump_retract_pos_kp);
-                leg_ctrl_set_target(true, g_jump_retract_length, g_leg_base_angle);
-                leg_ctrl_set_target(false, g_jump_retract_length, g_leg_base_angle);
+                leg_ctrl_set_target(true, g_jump_retract_length, g_jump_saved_base_angle);
+                leg_ctrl_set_target(false, g_jump_retract_length, g_jump_saved_base_angle);
                 ESP_LOGW(TAG, "JUMP: AIR_RETRACT! leg=%.0fmm->%.0fmm pos_kp=%.1f (hold %lums)",
                          avg_leg_length * 1000.0f, g_jump_retract_length * 1000.0f,
                          g_jump_retract_pos_kp, (unsigned long)elapsed);
@@ -3119,10 +3173,13 @@ static void jump_state_machine_update(void) {
                     can_motor_stw_write_pid(g_motor_right_hip, STW_CMD_POS_KP, g_joint_normal_pos_kp);
                     can_motor_stw_write_pid(g_motor_right_knee, STW_CMD_POS_KP, g_joint_normal_pos_kp);
                 }
+                // 恢复跳跃前的腿长和夹角 (防止停在收腿位置)
+                leg_ctrl_set_target(true,  g_jump_saved_leg_length, g_jump_saved_base_angle);
+                leg_ctrl_set_target(false, g_jump_saved_leg_length, g_jump_saved_base_angle);
                 g_jump_state = JUMP_IDLE;
-                ESP_LOGW(TAG, "JUMP: IDLE (complete, leg=%.0fmm, spd=%.0f, kp=%.1f, %s)",
-                         avg_leg_length * 1000.0f, g_joint_normal_max_speed_rpm,
-                         g_joint_normal_pos_kp, reached ? "reached" : "timeout");
+                ESP_LOGW(TAG, "JUMP: IDLE (complete, leg=%.0fmm->%.0fmm, angle=%.1fdeg, %s)",
+                         avg_leg_length * 1000.0f, g_jump_saved_leg_length * 1000.0f,
+                         g_jump_saved_base_angle, reached ? "reached" : "timeout");
             }
             break;
         }
@@ -3551,7 +3608,7 @@ static void update_remote_from_wifi(void) {
     }
     
     // ======== 处理 Yaw 闭环开关 ========
-    static bool last_yaw_enable = true;  // 默认开启
+    static bool last_yaw_enable = false;  // 默认关闭
     if (wifi_data->yaw_enable != last_yaw_enable) {
         g_yaw_control_enabled = wifi_data->yaw_enable;
         if (!wifi_data->yaw_enable) {
@@ -3567,6 +3624,14 @@ static void update_remote_from_wifi(void) {
                  wifi_data->yaw_enable ? "ON" : "OFF",
                  g_lqr_ctrl.yaw_angle_target, g_yaw_angle_total);
         last_yaw_enable = wifi_data->yaw_enable;
+    }
+    
+    // ======== 处理差速转向开关 ========
+    static bool last_diff_speed = false;
+    if (wifi_data->diff_speed_enable != last_diff_speed) {
+        g_diff_speed_enabled = wifi_data->diff_speed_enable;
+        ESP_LOGI(TAG, "WiFi: Diff steer %s", g_diff_speed_enabled ? "ENABLED" : "DISABLED");
+        last_diff_speed = wifi_data->diff_speed_enable;
     }
     
     // ======== 处理 Roll 闭环开关 ========
@@ -3613,8 +3678,11 @@ static void update_remote_from_wifi(void) {
         bool jump_btn = wifi_data->jump || (wifi_data->dir == DIR_JUMP);
         if (jump_btn && !g_jump_last_btn && g_jump_state == JUMP_IDLE) {
             // 上升沿 + 当前空闲 → 启动跳跃序列 (不要求平衡使能, 只要腿部使能即可)
-            if (g_leg_control_enabled && !wifi_data->estop) {
+            // 需双腿均着地 (F_L 检测), 悬空时禁止触发, 防止空中乱动
+            bool both_on_ground = (!g_sforce_left_off && !g_sforce_right_off);
+            if (g_leg_control_enabled && !wifi_data->estop && both_on_ground) {
                 g_jump_saved_leg_length = g_leg_base_length;  // 保存当前腿长
+                g_jump_saved_base_angle = g_leg_base_angle;   // 保存当前夹角 (防止跳跃中被覆盖)
                 g_jump_state = JUMP_CROUCH;
                 g_jump_state_enter_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
                 // 跳跃前提升关节最大速度
@@ -3628,6 +3696,9 @@ static void update_remote_from_wifi(void) {
                 ESP_LOGW(TAG, "JUMP: START! saved_leg=%.0fmm, crouch=%.0fmm, spd=%.0f",
                          g_jump_saved_leg_length * 1000.0f, g_jump_crouch_length * 1000.0f,
                          g_jump_max_speed_rpm);
+            } else if (!both_on_ground) {
+                ESP_LOGW(TAG, "JUMP: IGNORED - not both on ground (L=%d R=%d)",
+                         g_sforce_left_off, g_sforce_right_off);
             }
         }
         g_jump_last_btn = jump_btn;
@@ -4261,7 +4332,7 @@ static void compute_balance_output(float dt) {
     // ======== YAW 使能边沿检测 (所有控制模式通用) ========
     // 检测 OFF→ON 瞬间: 重置目标角到当前角, 清 PID, 使 error 从 0 起步
     {
-        static bool prev_yaw_enabled = true;  // 匹配 g_yaw_control_enabled 的启动默认值
+        static bool prev_yaw_enabled = false;  // 匹配 g_yaw_control_enabled 的启动默认值
         bool yaw_now = g_yaw_control_enabled && (g_uncontrolable == 0);
 
         if (yaw_now && !prev_yaw_enabled) {
@@ -4318,6 +4389,12 @@ static void compute_balance_output(float dt) {
                 g_yaw_output = output.yaw_control;
                 output.left_wheel_torque = torque - g_yaw_output;
                 output.right_wheel_torque = torque + g_yaw_output;
+            } else if (g_diff_speed_enabled && remote.joy_x != 0) {
+                // 差速转向: 开环差速, joy_x > 0 → 右转
+                float diff = remote.joy_x / 100.0f * g_diff_speed_scale;
+                output.left_wheel_torque = torque + diff;
+                output.right_wheel_torque = torque - diff;
+                g_yaw_output = diff;
             } else {
                 output.left_wheel_torque = torque;
                 output.right_wheel_torque = torque;
@@ -4485,6 +4562,11 @@ static void compute_balance_output(float dt) {
                 g_yaw_output = output.yaw_control * g_tpid_yaw_scale;  // 缩放到三环PID量级
                 output.left_wheel_torque = ctrl_output + g_yaw_output;
                 output.right_wheel_torque = ctrl_output - g_yaw_output;
+            } else if (g_diff_speed_enabled && remote.joy_x != 0) {
+                float diff = remote.joy_x * g_diff_speed_scale/100.0f;  // 需要根据实际量级调整缩放
+                output.left_wheel_torque = ctrl_output - diff;
+                output.right_wheel_torque = ctrl_output + diff;
+                g_yaw_output = diff;
             } else {
                 output.left_wheel_torque = ctrl_output;
                 output.right_wheel_torque = ctrl_output;
@@ -4636,6 +4718,11 @@ static void compute_balance_output(float dt) {
                 g_yaw_output = turn_T;
                 T_left += g_yaw_output;
                 T_right -= g_yaw_output;
+            } else if (g_diff_speed_enabled && remote.joy_x != 0) {
+                float diff = remote.joy_x / 100.0f * g_diff_speed_scale;
+                T_left += diff;
+                T_right -= diff;
+                g_yaw_output = diff;
             } else {
                 g_yaw_output = 0.0f;
             }
@@ -4821,6 +4908,12 @@ static void compute_balance_output(float dt) {
             float lqr_u = output.lqr_u;
             output.left_wheel_torque = lqr_u - g_yaw_output;
             output.right_wheel_torque = lqr_u + g_yaw_output;
+        } else if (g_diff_speed_enabled && remote.joy_x != 0) {
+            float lqr_u = output.lqr_u;
+            float diff = remote.joy_x / 100.0f * g_diff_speed_scale;
+            output.left_wheel_torque = lqr_u - diff;
+            output.right_wheel_torque = lqr_u + diff;
+            g_yaw_output = diff;
         } else {
             // 简单模式/YAW禁用时，直接使用 LQR 输出，无 YAW 控制
             float lqr_u = output.lqr_u;
@@ -5155,6 +5248,9 @@ static void compute_balance_output(float dt) {
         // 这些值在 VMC 中用作 target_y
         vmc_compute_leg_state(&input);
     }
+
+    // ======== 支持力估计 (任意模式, 仅需关节电机有效) ========
+    compute_support_force();
     
     // ======== 输出波形数据 (用于 Qt 调参面板) ========
     output_plot_data(&input, &output);
@@ -5162,6 +5258,37 @@ static void compute_balance_output(float dt) {
     // ======== 输出 PID 调试信息 ========
     output_pid_debug(&input);
     
+    // ======== 支持力离地检测 (F_L 阈値, 左右轮独立) ========
+    {
+        // 左腿
+        if (g_support_force_left_FL < SFORCE_FL_THRESHOLD) {
+            if (g_sforce_left_off_cnt < SFORCE_OFF_ENTER_CNT) g_sforce_left_off_cnt++;
+        } else {
+            if (g_sforce_left_off_cnt > -SFORCE_OFF_EXIT_CNT) g_sforce_left_off_cnt--;
+        }
+        bool left_off_new  = g_sforce_left_off ? (g_sforce_left_off_cnt > -SFORCE_OFF_EXIT_CNT)
+                                                : (g_sforce_left_off_cnt >= SFORCE_OFF_ENTER_CNT);
+        if (left_off_new && !g_sforce_left_off)
+            ESP_LOGW(TAG, "SFORCE: Left wheel off ground (F_L=%.2f N)", g_support_force_left_FL);
+        else if (!left_off_new && g_sforce_left_off)
+            ESP_LOGI(TAG, "SFORCE: Left wheel on ground (F_L=%.2f N)", g_support_force_left_FL);
+        g_sforce_left_off = left_off_new;
+
+        // 右腿
+        if (g_support_force_right_FL < SFORCE_FL_THRESHOLD) {
+            if (g_sforce_right_off_cnt < SFORCE_OFF_ENTER_CNT) g_sforce_right_off_cnt++;
+        } else {
+            if (g_sforce_right_off_cnt > -SFORCE_OFF_EXIT_CNT) g_sforce_right_off_cnt--;
+        }
+        bool right_off_new = g_sforce_right_off ? (g_sforce_right_off_cnt > -SFORCE_OFF_EXIT_CNT)
+                                                 : (g_sforce_right_off_cnt >= SFORCE_OFF_ENTER_CNT);
+        if (right_off_new && !g_sforce_right_off)
+            ESP_LOGW(TAG, "SFORCE: Right wheel off ground (F_L=%.2f N)", g_support_force_right_FL);
+        else if (!right_off_new && g_sforce_right_off)
+            ESP_LOGI(TAG, "SFORCE: Right wheel on ground (F_L=%.2f N)", g_support_force_right_FL);
+        g_sforce_right_off = right_off_new;
+    }
+
     // ======== 更新轮命令 ========
     xSemaphoreTake(g_wheel_cmd_mutex, portMAX_DELAY);
     if (g_wheel_off_ground || jump_wants_zero_wheel()) {
@@ -5169,8 +5296,9 @@ static void compute_balance_output(float dt) {
         g_wheel_cmd.left_torque = 0;
         g_wheel_cmd.right_torque = 0;
     } else {
-        g_wheel_cmd.left_torque = output.left_wheel_torque;
-        g_wheel_cmd.right_torque = output.right_wheel_torque;
+        // 左右轮分别判断: F_L 小于阈値则该轮失能
+        g_wheel_cmd.left_torque  = g_sforce_left_off  ? 0.0f : output.left_wheel_torque;
+        g_wheel_cmd.right_torque = g_sforce_right_off ? 0.0f : output.right_wheel_torque;
     }
     // 单环 PID 模式、小车模式使用速度模式；三环 PID 的 WHEEL_SPEED 模式也使用速度模式
     g_wheel_cmd.use_speed_mode = (g_control_mode == CTRL_MODE_SINGLE_PID || g_control_mode == CTRL_MODE_CAR
@@ -5184,11 +5312,47 @@ static void compute_balance_output(float dt) {
  */
 static void apply_motor_commands(void) {
     shared_wheel_cmd_t cmd;
-    
+    // 每条腿的轮电机是否已进入 idle (F_L 离地检测触发)
+    static bool s_left_idled  = false;
+    static bool s_right_idled = false;
+
     xSemaphoreTake(g_wheel_cmd_mutex, portMAX_DELAY);
     memcpy(&cmd, &g_wheel_cmd, sizeof(cmd));
     xSemaphoreGive(g_wheel_cmd_mutex);
-    
+
+    // ── 辅助 lambda: 对单个轮电机应用命令, 同时处理 F_L 离地 idle/re-enable ──
+    // 使用宏简化左右对称逻辑 (避免重复代码)
+#define APPLY_WHEEL_CMD(motor, speed_rpm, torque_val, sforce_off, idled_flag)   \
+    do {                                                                          \
+        if (sforce_off) {                                                         \
+            /* F_L 离地: 首次发送 speed=0 / torque=0 制动, 然后进入 idle */      \
+            if (!idled_flag) {                                                    \
+                if (cmd.use_speed_mode) {                                         \
+                    can_motor_set_speed((motor), 0.0f);                           \
+                }                                                                 \
+                can_motor_set_idle((motor));                                      \
+                idled_flag = true;                                                \
+            }                                                                     \
+            /* 已 idle 时不再发命令, 避免覆盖 idle 状态 */                       \
+        } else {                                                                  \
+            if (idled_flag) {                                                     \
+                /* 重新着地: 恢复闭环, 并重置位移零点防止累积误差 */            \
+                can_motor_enter_closed_loop((motor));                             \
+                g_distance_zeropoint = g_lqr_distance;                           \
+                lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);   \
+                triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl,            \
+                                                  g_distance_zeropoint);         \
+                idled_flag = false;                                               \
+            }                                                                     \
+            /* 正常发命令 */                                                      \
+            if (cmd.use_speed_mode) {                                             \
+                can_motor_set_speed((motor), (speed_rpm));                        \
+            } else {                                                              \
+                can_motor_set_torque((motor), (torque_val));                      \
+            }                                                                     \
+        }                                                                         \
+    } while (0)
+
     if (g_state == BALANCE_TEST_EMERGENCY) {
         // E-stop: 强制发送扭矩 0
         can_motor_set_torque(g_motor_left, 0);
@@ -5198,25 +5362,35 @@ static void apply_motor_commands(void) {
             // IMU 角度超限: 强制发送扭矩 0
             can_motor_set_torque(g_motor_left, 0);
             can_motor_set_torque(g_motor_right, 0);
-        } else if (cmd.use_speed_mode) {
-            // 速度模式 (单环 PID 输出): left_torque/right_torque 实际存储的是速度 (rad/s)
-            // 转换: rad/s → rpm (rpm = rad/s * 60 / 2π ≈ rad/s * 9.5493)
-            float left_speed_rpm = cmd.left_torque * 9.5493f;
-            float right_speed_rpm = cmd.right_torque * 9.5493f;
-            // 死区补偿: 非零指令时叠加 1 RPM 起始值, 确保电机能动
-            const float SPEED_DEADZONE_RPM = 2.0f;
-            if (left_speed_rpm > 0.0f)       left_speed_rpm += SPEED_DEADZONE_RPM;
-            else if (left_speed_rpm < 0.0f)   left_speed_rpm -= SPEED_DEADZONE_RPM;
-            if (right_speed_rpm > 0.0f)       right_speed_rpm += SPEED_DEADZONE_RPM;
-            else if (right_speed_rpm < 0.0f)  right_speed_rpm -= SPEED_DEADZONE_RPM;
-            can_motor_set_speed(g_motor_left, left_speed_rpm);
-            can_motor_set_speed(g_motor_right, right_speed_rpm);
         } else {
-            // 扭矩模式 (LQR / FULL_LQR / 双环 PID 输出)
-            can_motor_set_torque(g_motor_left, cmd.left_torque);
-            can_motor_set_torque(g_motor_right, cmd.right_torque);
+            // 计算速度模式下的 RPM (速度模式时 left_torque 实际存储 rad/s)
+            float left_speed_rpm  = 0.0f;
+            float right_speed_rpm = 0.0f;
+            if (cmd.use_speed_mode) {
+                // 转换: rad/s → rpm (rpm = rad/s * 60 / 2π ≈ rad/s * 9.5493)
+                left_speed_rpm  = cmd.left_torque  * 9.5493f;
+                right_speed_rpm = cmd.right_torque * 9.5493f;
+                // 死区补偿: 非零指令时叠加 DEADZONE, 确保电机能动
+                const float SPEED_DEADZONE_RPM = 2.0f;
+                if      (left_speed_rpm  > 0.0f) left_speed_rpm  += SPEED_DEADZONE_RPM;
+                else if (left_speed_rpm  < 0.0f) left_speed_rpm  -= SPEED_DEADZONE_RPM;
+                if      (right_speed_rpm > 0.0f) right_speed_rpm += SPEED_DEADZONE_RPM;
+                else if (right_speed_rpm < 0.0f) right_speed_rpm -= SPEED_DEADZONE_RPM;
+            }
+            // 左轮: F_L 离地 → idle; 着地 → 恢复闭环
+            APPLY_WHEEL_CMD(g_motor_left,  left_speed_rpm,  cmd.left_torque,
+                            g_sforce_left_off,  s_left_idled);
+            // 右轮: F_L 离地 → idle; 着地 → 恢复闭环
+            APPLY_WHEEL_CMD(g_motor_right, right_speed_rpm, cmd.right_torque,
+                            g_sforce_right_off, s_right_idled);
         }
+    } else {
+        // 系统停止时重置 idle 标志 (下次启动时不会误判)
+        s_left_idled  = false;
+        s_right_idled = false;
     }
+
+#undef APPLY_WHEEL_CMD
     // READY/IDLE 状态: 不发送任何轮电机命令, 不占用 CAN 总线, 允许手动测试
     
     // 记录电机命令发送时间
@@ -7587,9 +7761,22 @@ void balance_test_process_cmd(const char *cmd_str) {
             printf("Usage: balance flqr [stream|pitch_offset|v_scale|max_t|max_tp|split|turn|coeff]\n");
         }
     }
+    // ===== 支持力数据流控制 =====
+    else if (strcmp(token, "sforce") == 0) {
+        token = strtok(NULL, " \t\n\r");
+        if (token == NULL) {
+            g_sforce_stream_enable = !g_sforce_stream_enable;
+        } else if (strcmp(token, "on") == 0 || strcmp(token, "1") == 0) {
+            g_sforce_stream_enable = true;
+        } else if (strcmp(token, "off") == 0 || strcmp(token, "0") == 0) {
+            g_sforce_stream_enable = false;
+        }
+        printf("Support force stream: %s\n", g_sforce_stream_enable ? "ON" : "OFF");
+        printf("Format: #SFORCE,L_FL(N),L_Fa(Nm),R_FL(N),R_Fa(Nm)\n");
+    }
     else {
         printf("Unknown command: %s\n", token);
-        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|wma|joy|flqr]\n");
+        printf("Usage: balance [init|start|stop|enable|disable|estop|reset|status|zero|plot|debug|leg|roll|mzero|loop|task|safety|airborne|mode|dpid|spid|wma|joy|flqr|sforce]\n");
     }
 }
 

@@ -480,20 +480,21 @@ float vmc_torque_forward(float cmd_torque_Nm) {
 }
 
 /**
- * @brief 从电机电流反解实际扭矩 (Nm)
+ * @brief 从电机电流反解关节实际扭矩 (Nm)
  * 
- * 1A 电流 ≈ 0.25 Nm 扭矩
+ * STW 电机: T_joint = Kt × 减速比 × I = 0.44 × 8 × I = 3.52 × I (Nm/A)
+ * 俱瓷电机: T_joint ≈ 0.25 × I (Nm/A, 已含减速比)
  * 
- * @param current_A 电机反馈电流 (A)
- * @return 实际扭矩 (Nm)
+ * @param current_A 电机反馈 Q 轴电流 (A, 电机轴侧)
+ * @return 关节输出轴实际扭矩 (Nm)
  */
 float vmc_current_to_torque(float current_A) {
     if (MOTOR_BRAND_OF(MOTOR_ID_LEFT_HIP) == MOTOR_BRAND_JUCI) {
-        // 俱瓷电机: 1A ≈ 0.25 Nm
+        // 俱瓷电机: 1A ≈ 0.25 Nm (已含减速比)
         return current_A * 0.25f;
     } else {
-        // STW 电机: T = Kt × I (线性)
-        return current_A * STW_TORQUE_CONSTANT;
+        // STW 电机: T = Kt × 减速比 × I = STW_JOINT_TORQUE_CONST × I
+        return current_A * STW_JOINT_TORQUE_CONST;
     }
 }
 

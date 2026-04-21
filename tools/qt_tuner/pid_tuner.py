@@ -7025,6 +7025,175 @@ class MotorPowerPanel(QWidget):
 
 
 # ============================================================================
+# 支持力监测面板
+# ============================================================================
+class SupportForcePanel(QWidget):
+    """双腿支持力监测面板 - 从电机电流通过逆雅可比反解实际足端力"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.max_points = 500
+        self.wave_counter = 0
+        self.wave_data = {
+            'left_FL': [], 'right_FL': [],
+            'left_Fa': [], 'right_Fa': [],
+            'time': []
+        }
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ========== 控制栏 ==========
+        ctrl_group = QGroupBox("⚖️ 支持力监测")
+        ctrl_layout = QHBoxLayout()
+
+        self.stream_on_btn = QPushButton("📈 开启数据流")
+        self.stream_on_btn.setStyleSheet(SS("background-color: #2196F3; color: white; padding: 10px 15px; font-size: 14px;"))
+        self.stream_on_btn.clicked.connect(lambda: self.send_cmd("balance sforce on"))
+        ctrl_layout.addWidget(self.stream_on_btn)
+
+        self.stream_off_btn = QPushButton("⏹️ 关闭数据流")
+        self.stream_off_btn.setStyleSheet(SS("padding: 10px 15px; font-size: 14px;"))
+        self.stream_off_btn.clicked.connect(lambda: self.send_cmd("balance sforce off"))
+        ctrl_layout.addWidget(self.stream_off_btn)
+
+        self.clear_btn = QPushButton("🗑️ 清空波形")
+        self.clear_btn.clicked.connect(self._clear_waveforms)
+        ctrl_layout.addWidget(self.clear_btn)
+
+        ctrl_layout.addWidget(QLabel("缓冲点数:"))
+        self.points_input = QSpinBox()
+        self.points_input.setRange(100, 5000)
+        self.points_input.setSingleStep(100)
+        self.points_input.setValue(500)
+        self.points_input.valueChanged.connect(lambda v: setattr(self, 'max_points', v))
+        ctrl_layout.addWidget(self.points_input)
+
+        ctrl_layout.addStretch()
+        ctrl_group.setLayout(ctrl_layout)
+        layout.addWidget(ctrl_group)
+
+        # ========== 实时数值显示 ==========
+        val_group = QGroupBox("📊 实时数值")
+        val_layout = QGridLayout()
+
+        val_layout.addWidget(QLabel("【左腿】"), 0, 0)
+        val_layout.addWidget(QLabel("F_L (支持力):"), 0, 1)
+        self.left_fl_label = QLabel("-- N")
+        self.left_fl_label.setStyleSheet(SS("font-weight: bold; color: #4fc3f7; font-size: 16px;"))
+        val_layout.addWidget(self.left_fl_label, 0, 2)
+        val_layout.addWidget(QLabel("F_α (角度力矩):"), 0, 3)
+        self.left_fa_label = QLabel("-- Nm")
+        self.left_fa_label.setStyleSheet(SS("font-weight: bold; color: #81d4fa; font-size: 14px;"))
+        val_layout.addWidget(self.left_fa_label, 0, 4)
+
+        val_layout.addWidget(QLabel("【右腿】"), 1, 0)
+        val_layout.addWidget(QLabel("F_L (支持力):"), 1, 1)
+        self.right_fl_label = QLabel("-- N")
+        self.right_fl_label.setStyleSheet(SS("font-weight: bold; color: #ef5350; font-size: 16px;"))
+        val_layout.addWidget(self.right_fl_label, 1, 2)
+        val_layout.addWidget(QLabel("F_α (角度力矩):"), 1, 3)
+        self.right_fa_label = QLabel("-- Nm")
+        self.right_fa_label.setStyleSheet(SS("font-weight: bold; color: #ef9a9a; font-size: 14px;"))
+        val_layout.addWidget(self.right_fa_label, 1, 4)
+
+        val_layout.addWidget(QLabel("【合计】"), 2, 0)
+        val_layout.addWidget(QLabel("总支持力:"), 2, 1)
+        self.total_fl_label = QLabel("-- N")
+        self.total_fl_label.setStyleSheet(SS("font-weight: bold; color: #66bb6a; font-size: 16px;"))
+        val_layout.addWidget(self.total_fl_label, 2, 2)
+
+        val_group.setLayout(val_layout)
+        layout.addWidget(val_group)
+
+        # ========== F_L 波形 (左右腿支持力对比) ==========
+        fl_group = QGroupBox("📈 F_L 足端支持力波形 (N)")
+        fl_layout = QVBoxLayout()
+
+        self.pw_fl = pg.PlotWidget()
+        self.pw_fl.setBackground('#1a1a2e')
+        self.pw_fl.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_fl.setTitle('F_L 足端支持力 (沿腿方向)', color='w', size='11pt')
+        self.pw_fl.setLabel('left', 'N')
+        self.pw_fl.setLabel('bottom', '采样点')
+        self.pw_fl.setMinimumHeight(220)
+        self.pw_fl.addLegend(offset=(60, 5))
+        self.curve_left_fl = self.pw_fl.plot(pen=pg.mkPen(color='#4fc3f7', width=2), name='左腿')
+        self.curve_right_fl = self.pw_fl.plot(pen=pg.mkPen(color='#ef5350', width=2), name='右腿')
+
+        fl_layout.addWidget(self.pw_fl)
+        fl_group.setLayout(fl_layout)
+        layout.addWidget(fl_group)
+
+        # ========== F_alpha 波形 (左右腿角度力矩对比) ==========
+        fa_group = QGroupBox("📈 F_α 角度力矩波形 (Nm)")
+        fa_layout = QVBoxLayout()
+
+        self.pw_fa = pg.PlotWidget()
+        self.pw_fa.setBackground('#1a1a2e')
+        self.pw_fa.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_fa.setTitle('F_α 角度力矩 (摆角方向)', color='w', size='11pt')
+        self.pw_fa.setLabel('left', 'Nm')
+        self.pw_fa.setLabel('bottom', '采样点')
+        self.pw_fa.setMinimumHeight(220)
+        self.pw_fa.addLegend(offset=(60, 5))
+        self.curve_left_fa = self.pw_fa.plot(pen=pg.mkPen(color='#81d4fa', width=2), name='左腿')
+        self.curve_right_fa = self.pw_fa.plot(pen=pg.mkPen(color='#ef9a9a', width=2), name='右腿')
+
+        fa_layout.addWidget(self.pw_fa)
+        fa_group.setLayout(fa_layout)
+        layout.addWidget(fa_group)
+
+        layout.addStretch()
+
+    def send_cmd(self, cmd):
+        if self.parent_window:
+            self.parent_window.send_command(cmd)
+
+    def update_sforce_data(self, left_fl, left_fa, right_fl, right_fa):
+        """更新支持力数据 (来自 #SFORCE 数据流)"""
+        # 更新数值标签
+        self.left_fl_label.setText(f"{left_fl:.2f} N")
+        self.left_fa_label.setText(f"{left_fa:.3f} Nm")
+        self.right_fl_label.setText(f"{right_fl:.2f} N")
+        self.right_fa_label.setText(f"{right_fa:.3f} Nm")
+        self.total_fl_label.setText(f"{left_fl + right_fl:.2f} N")
+
+        # 更新波形数据
+        self.wave_counter += 1
+        self.wave_data['time'].append(self.wave_counter)
+        self.wave_data['left_FL'].append(left_fl)
+        self.wave_data['right_FL'].append(right_fl)
+        self.wave_data['left_Fa'].append(left_fa)
+        self.wave_data['right_Fa'].append(right_fa)
+
+        # 限制缓冲区
+        max_pts = self.max_points
+        for key in self.wave_data:
+            if len(self.wave_data[key]) > max_pts:
+                self.wave_data[key] = self.wave_data[key][-max_pts:]
+
+        # 刷新波形
+        t = self.wave_data['time']
+        self.curve_left_fl.setData(t, self.wave_data['left_FL'])
+        self.curve_right_fl.setData(t, self.wave_data['right_FL'])
+        self.curve_left_fa.setData(t, self.wave_data['left_Fa'])
+        self.curve_right_fa.setData(t, self.wave_data['right_Fa'])
+
+    def _clear_waveforms(self):
+        """清空波形数据"""
+        self.wave_counter = 0
+        for key in self.wave_data:
+            self.wave_data[key] = []
+        self.curve_left_fl.setData([], [])
+        self.curve_right_fl.setData([], [])
+        self.curve_left_fa.setData([], [])
+        self.curve_right_fa.setData([], [])
+
+
+# ============================================================================
 # 速度/位移观测器面板
 # ============================================================================
 class ObserverPanel(QWidget):
@@ -7307,7 +7476,7 @@ class FullLqrPanel(QWidget):
 
         self.mode_btn = QPushButton("🔄 切换Full LQR模式")
         self.mode_btn.setStyleSheet(SS("background-color: #9C27B0; color: white; padding: 8px 12px; font-size: 13px;"))
-        self.mode_btn.clicked.connect(lambda: self.send_cmd("balance mode flqr"))
+        self.mode_btn.clicked.connect(self._switch_to_flqr)
         ctrl_layout.addWidget(self.mode_btn)
 
         self.stream_on_btn = QPushButton("📈 开启数据流")
@@ -7827,6 +7996,11 @@ class FullLqrPanel(QWidget):
         for key in self.WAVE_KEYS:
             self.curves[key].setData([], [])
 
+    def _switch_to_flqr(self):
+        """切换到 Full LQR 模式并使能平衡"""
+        self.send_cmd("balance mode flqr")
+        QTimer.singleShot(200, lambda: self.send_cmd("balance enable"))
+
     def send_cmd(self, cmd):
         if self.parent_window:
             self.parent_window.send_command(cmd)
@@ -8183,6 +8357,10 @@ class PIDTunerUI(QMainWindow):
         # 电机功率监控面板
         self.mpow_panel = MotorPowerPanel(self)
         self.tab_widget.addTab(_make_scrollable(self.mpow_panel), "⚡ 电机功率")
+        
+        # 支持力监测面板
+        self.sforce_panel = SupportForcePanel(self)
+        self.tab_widget.addTab(_make_scrollable(self.sforce_panel), "⚖️ 支持力")
         
         # 速度/位移观测器面板
         self.obsv_panel = ObserverPanel(self)
@@ -8770,6 +8948,23 @@ class PIDTunerUI(QMainWindow):
                 except (ValueError, IndexError) as e:
                     if self.debug_mode:
                         self.log(f"FLQR data parse error: {e}", is_error=True)
+            if not self.debug_mode and not self.show_high_freq_data:
+                return  # 不打印日志(非debug模式)
+        
+        # 支持力数据流 (高频): #SFORCE,L_FL,L_Fa,R_FL,R_Fa
+        if line.startswith("#SFORCE,"):
+            parts = line.split(',')
+            if len(parts) == 5:  # #SFORCE + 4 values
+                try:
+                    l_fl = float(parts[1])
+                    l_fa = float(parts[2])
+                    r_fl = float(parts[3])
+                    r_fa = float(parts[4])
+                    if hasattr(self, 'sforce_panel'):
+                        self.sforce_panel.update_sforce_data(l_fl, l_fa, r_fl, r_fa)
+                except (ValueError, IndexError) as e:
+                    if self.debug_mode:
+                        self.log(f"SFORCE data parse error: {e}", is_error=True)
             if not self.debug_mode and not self.show_high_freq_data:
                 return  # 不打印日志(非debug模式)
         

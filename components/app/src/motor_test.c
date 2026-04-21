@@ -165,6 +165,8 @@ static void print_help(void) {
     printf("  speed <id> <rpm>      - Set speed (rpm)\n");
     printf("  pos <id> <deg>        - Set position (degrees)\n");
     printf("  torque <id> <val>     - Set torque\n");
+    printf("  torque_loop <id> <val> [ms] - Continuous torque (default 2000ms)\n");
+    printf("  torque_debug <id> [val]     - Full torque debug (idle->mode->enable->torque+CAN dump)\n");
     printf("  mode <id> <0-5>       - Set control mode\n");
     printf("      0=Torque, 1=Speed, 2=PosTrap, 3=PosFilter, 4=PosDirect, 5=LowSpeed\n");
     printf("  enable <id>           - Enable closed loop\n");
@@ -173,6 +175,8 @@ static void print_help(void) {
     printf("  stop <id>             - Stop motor (speed=0)\n");
     printf("  stop all              - Stop all motors\n");
     printf("  status on/off         - Toggle status display\n");
+    printf("  can debug [id]        - CAN frame hex dump (TX+RX)\n");
+    printf("  can off               - Stop CAN debug\n");
     printf("  test <id>             - Quick test motor\n");
     printf("  motor <id> origin     - Set current pos as zero\n");
     printf("  motor <id> save       - Save params to Flash\n");
@@ -415,12 +419,26 @@ static void cmd_torque(int id, float torque) {
         return;
     }
     
+    int16_t torque_raw = (int16_t)(torque * 100.0f);
+    printf("Motor %d: torque = %.2f, raw = %d (0x%04X)\n", id, torque, torque_raw, (uint16_t)torque_raw);
+    
     esp_err_t ret = can_motor_set_torque(motor, torque);
     if (ret == ESP_OK) {
-        printf("Motor %d: torque = %.2f\n", id, torque);
+        printf("  CAN send OK\n");
     } else {
-        printf("Failed to set torque: %s\n", esp_err_to_name(ret));
+        printf("  CAN send FAILED: %s\n", esp_err_to_name(ret));
     }
+    
+    // 读回电流确认电机是否响应
+    vTaskDelay(pdMS_TO_TICKS(50));
+    can_motor_request_status(motor);
+    for (int i = 0; i < 5; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        can_motor_process_rx();
+    }
+    motor_state_t state;
+    can_motor_get_state(motor, &state);
+    printf("  Readback -> Current: %.3f A, Speed: %.1f rpm\n", state.current, state.speed);
 }
 
 static void cmd_mode(int id, int mode) {
@@ -447,9 +465,115 @@ static void cmd_mode(int id, int mode) {
     esp_err_t ret = can_motor_set_mode(motor, (motor_mode_t)mode);
     if (ret == ESP_OK) {
         printf("Motor %d: mode = %d (%s)\n", id, mode, mode_names[mode]);
+        printf("  NOTE: 建议顺序: mode -> enable -> torque/speed\n");
     } else {
         printf("Failed to set mode: %s\n", esp_err_to_name(ret));
     }
+}
+
+// 力矩模式连续发送测试 (排除通信超时问题)
+static void cmd_torque_loop(int id, float torque, int duration_ms) {
+    if (id < 1 || id > MOTOR_COUNT) {
+        printf("Invalid motor ID: %d\n", id);
+        return;
+    }
+    
+    can_motor_handle_t motor = g_motors[id - 1];
+    if (!motor) {
+        printf("Motor %d not initialized\n", id);
+        return;
+    }
+    
+    printf("Motor %d: sending torque=%.2f for %d ms (20Hz)...\n", id, torque, duration_ms);
+    
+    int count = duration_ms / 50;
+    if (count < 1) count = 1;
+    
+    for (int i = 0; i < count; i++) {
+        can_motor_set_torque(motor, torque);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_motor_process_rx();
+    }
+    
+    // 读状态
+    can_motor_request_status(motor);
+    for (int i = 0; i < 5; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        can_motor_process_rx();
+    }
+    motor_state_t state;
+    can_motor_get_state(motor, &state);
+    printf("  After loop -> Current: %.3f A, Speed: %.1f rpm\n", state.current, state.speed);
+    
+    // 停止
+    can_motor_set_torque(motor, 0);
+    printf("  Torque loop done, set torque=0\n");
+}
+
+// 力矩模式全流程调试 (自动开启CAN debug, 执行 mode→enable→torque)
+static void cmd_torque_debug(int id, float torque) {
+    if (id < 1 || id > MOTOR_COUNT) {
+        printf("Invalid motor ID: %d\n", id);
+        return;
+    }
+    
+    can_motor_handle_t motor = g_motors[id - 1];
+    if (!motor) {
+        printf("Motor %d not initialized\n", id);
+        return;
+    }
+    
+    printf("=== Torque Debug: Motor %d, torque=%.2f ===\n", id, torque);
+    can_motor_set_debug(true, id);
+    
+    // Step 1: 先 idle 复位
+    printf("\n[1] Set idle...\n");
+    can_motor_set_idle(motor);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_motor_process_rx();
+    
+    // Step 2: 设置模式
+    printf("\n[2] Set mode=0 (Torque)...\n");
+    can_motor_set_mode(motor, (motor_mode_t)0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_motor_process_rx();
+    
+    // Step 3: 进入闭环
+    printf("\n[3] Enter closed loop...\n");
+    can_motor_enter_closed_loop(motor);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_motor_process_rx();
+    
+    // Step 4: 发送力矩
+    printf("\n[4] Set torque=%.2f...\n", torque);
+    can_motor_set_torque(motor, torque);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_motor_process_rx();
+    
+    // Step 5: 连续发送力矩 1秒
+    printf("\n[5] Continuous torque for 1s (20Hz)...\n");
+    for (int i = 0; i < 20; i++) {
+        can_motor_set_torque(motor, torque);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_motor_process_rx();
+    }
+    
+    // Step 6: 读取状态
+    printf("\n[6] Read status...\n");
+    can_motor_request_status(motor);
+    for (int i = 0; i < 5; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        can_motor_process_rx();
+    }
+    motor_state_t state;
+    can_motor_get_state(motor, &state);
+    printf("  Current: %.3f A, Speed: %.1f rpm, Error: 0x%04lX\n",
+           state.current, state.speed, state.error_code);
+    
+    // 清理
+    can_motor_set_torque(motor, 0);
+    can_motor_set_debug(false, 0);
+    printf("\n=== Torque Debug Done ===\n");
 }
 
 static void cmd_enable(int id) {
@@ -619,6 +743,27 @@ static void process_command(char *cmd) {
             printf("Usage: torque <id> <value>\n");
         }
     }
+    else if (strcmp(token, "torque_loop") == 0) {
+        char *id_str = strtok(NULL, " \t\n\r");
+        char *val_str = strtok(NULL, " \t\n\r");
+        char *ms_str  = strtok(NULL, " \t\n\r");
+        if (id_str && val_str) {
+            int ms = ms_str ? atoi(ms_str) : 2000;
+            cmd_torque_loop(atoi(id_str), atof(val_str), ms);
+        } else {
+            printf("Usage: torque_loop <id> <value> [duration_ms=2000]\n");
+        }
+    }
+    else if (strcmp(token, "torque_debug") == 0) {
+        char *id_str = strtok(NULL, " \t\n\r");
+        char *val_str = strtok(NULL, " \t\n\r");
+        if (id_str) {
+            float t = val_str ? atof(val_str) : 0.3f;
+            cmd_torque_debug(atoi(id_str), t);
+        } else {
+            printf("Usage: torque_debug <id> [torque=0.3]\n");
+        }
+    }
     else if (strcmp(token, "mode") == 0) {
         char *id_str = strtok(NULL, " \t\n\r");
         char *val_str = strtok(NULL, " \t\n\r");
@@ -673,6 +818,20 @@ static void process_command(char *cmd) {
             }
         } else {
             printf("Usage: status on/off\n");
+        }
+    }
+    else if (strcmp(token, "can") == 0) {
+        // can debug [motor_id] — 开启CAN帧调试
+        // can off             — 关闭CAN帧调试
+        token = strtok(NULL, " \t\n\r");
+        if (token && strcmp(token, "debug") == 0) {
+            char *id_str = strtok(NULL, " \t\n\r");
+            uint32_t filter = id_str ? (uint32_t)atoi(id_str) : 0;
+            can_motor_set_debug(true, filter);
+        } else if (token && strcmp(token, "off") == 0) {
+            can_motor_set_debug(false, 0);
+        } else {
+            printf("Usage: can debug [motor_id]  |  can off\n");
         }
     }
     else if (strcmp(token, "test") == 0) {

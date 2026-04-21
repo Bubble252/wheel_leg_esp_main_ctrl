@@ -127,6 +127,7 @@ float can_motor_read_current(can_motor_handle_t motor);
  * @return ESP_OK 成功
  */
 esp_err_t can_motor_request_angle(can_motor_handle_t motor);
+esp_err_t can_motor_request_current(can_motor_handle_t motor);
 
 /**
  * @brief 请求读取电源电压寄存器 (非阻塞, 轻量)
@@ -425,6 +426,13 @@ esp_err_t can_motor_stw_mit_get_state(can_motor_handle_t motor, stw_mit_state_t 
 esp_err_t can_motor_stw_mit_control(can_motor_handle_t motor,
                                     float target_pos, float target_vel,
                                     float kp, float kd, float target_torque);
+
+/**
+ * @brief 开启/关闭 CAN 帧调试打印 (TX+RX hex dump)
+ * @param enable true=开启, false=关闭
+ * @param filter_motor_id 0=全部电机, >0=只打印指定电机ID的帧
+ */
+void can_motor_set_debug(bool enable, uint32_t filter_motor_id);
 
 #ifdef __cplusplus
 }

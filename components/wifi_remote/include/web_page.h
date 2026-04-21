@@ -286,9 +286,12 @@ static const char web_page_html[] = R"rawliteral(
             
             <div class="ctrl-row">
                 <label>� Yaw Enable</label>
-                <input type="checkbox" id="yawEnableSwitch" class="switch" checked onclick="toggleYawEnable()">
-            </div>
-            
+                <input type="checkbox" id="yawEnableSwitch" class="switch" onclick="toggleYawEnable()">
+            </div>            
+            <div class="ctrl-row">
+                <label>↔️ Diff Steer (差速转向)</label>
+                <input type="checkbox" id="diffSpeedSwitch" class="switch" onclick="toggleDiffSpeed()">
+            </div>            
             <div class="ctrl-row">
                 <label>�📐 Pitch Compensation</label>
                 <input type="checkbox" id="pitchCompSwitch" class="switch" onclick="togglePitchComp()">
@@ -473,7 +476,7 @@ static const char web_page_html[] = R"rawliteral(
     var socket;
     var g_go = 0;
     var g_carMode = 0;
-    var g_yawEnable = 1;
+    var g_yawEnable = 0;
     var g_height = 38;
     var g_roll = 0;
     var g_joyX = 0;
@@ -505,6 +508,7 @@ static const char web_page_html[] = R"rawliteral(
     var g_obsvSpeed = 0;
     var g_xoffsetEnable = 0;
     var g_xoffsetKp = 100;
+    var g_diffSpeed = 0;
     
     // WebSocket 初始化
     function initWebSocket() {
@@ -583,7 +587,8 @@ static const char web_page_html[] = R"rawliteral(
                 angle_zero: parseFloat(g_angleZero.toFixed(2)),
                 obsv_speed: g_obsvSpeed,
                 xoffset_enable: g_xoffsetEnable,
-                xoffset_kp: g_xoffsetKp / 1000.0
+                xoffset_kp: g_xoffsetKp / 1000.0,
+                diff_speed_enable: g_diffSpeed
             };
             socket.send(JSON.stringify(data));
             msgCount++;
@@ -597,6 +602,12 @@ static const char web_page_html[] = R"rawliteral(
         g_yawEnable = document.getElementById('yawEnableSwitch').checked ? 1 : 0;
         sendData();
         log('Yaw enable: ' + (g_yawEnable ? 'ON' : 'OFF'));
+    }
+    
+    function toggleDiffSpeed() {
+        g_diffSpeed = document.getElementById('diffSpeedSwitch').checked ? 1 : 0;
+        sendData();
+        log('Diff steer: ' + (g_diffSpeed ? 'ON' : 'OFF'));
     }
     
     function updateHeight() {

@@ -75,6 +75,13 @@ static uint32_t g_can_recovery_count = 0;
 static bool g_can_debug = false;
 static uint32_t g_can_debug_filter_id = 0;  // 0=全部, >0=只打印指定 motor_id
 
+void can_motor_set_debug(bool enable, uint32_t filter_motor_id) {
+    g_can_debug = enable;
+    g_can_debug_filter_id = filter_motor_id;
+    printf("CAN debug %s (filter: %s)\n", enable ? "ON" : "OFF",
+           filter_motor_id ? "motor specified" : "all");
+}
+
 // 保存初始化引脚，用于恢复失败时重新初始化
 static gpio_num_t g_can_tx_pin = GPIO_NUM_NC;
 static gpio_num_t g_can_rx_pin = GPIO_NUM_NC;
@@ -693,6 +700,25 @@ esp_err_t can_motor_process_rx(void) {
     
     // 非阻塞接收
     while (twai_receive(&msg, 0) == ESP_OK) {
+        // CAN RX 调试打印
+        if (g_can_debug) {
+            uint32_t rx_id = msg.identifier;
+            bool show = (g_can_debug_filter_id == 0);
+            if (!show) {
+                // 检查是否匹配过滤的电机
+                show = (rx_id == CAN_RX_BASE_ID + g_can_debug_filter_id) ||
+                       (rx_id == CAN_TX_BASE_ID + g_can_debug_filter_id) ||
+                       (rx_id == g_can_debug_filter_id) ||
+                       (rx_id == (STW_TX_ID_OFFSET | g_can_debug_filter_id));
+            }
+            if (show) {
+                printf("CAN RX 0x%03lX [%d]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                       rx_id, msg.data_length_code,
+                       msg.data[0], msg.data[1], msg.data[2], msg.data[3],
+                       msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
+            }
+        }
+
         // 查找对应的电机
         can_motor_handle_t motor = find_motor_by_rx_id(msg.identifier);
         if (motor == NULL) {
@@ -991,6 +1017,16 @@ esp_err_t can_motor_request_angle(can_motor_handle_t motor) {
     } else {
         // STW: 0xA3 读取多圈角度
         return stw_send_cmd_simple(motor, STW_CMD_READ_ANGLE);
+    }
+}
+
+esp_err_t can_motor_request_current(can_motor_handle_t motor) {
+    if (motor == NULL) return ESP_ERR_INVALID_ARG;
+    if (motor->brand == MOTOR_BRAND_JUCI) {
+        return read_reg_1_request(motor, REG_CURRENT);
+    } else {
+        // STW: 0xA1 读取 Q 轴电流
+        return stw_send_cmd_simple(motor, STW_CMD_READ_CURRENT);
     }
 }
 

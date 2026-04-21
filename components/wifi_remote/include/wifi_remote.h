@@ -90,6 +90,9 @@ typedef struct {
     bool xoffset_enable;        // X-Offset使能
     float xoffset_kp;           // X-Offset Kp参数
     
+    // 差速转向
+    bool diff_speed_enable;     // 差速转向使能 (Yaw失能时的开环差速)
+    
     // 状态
     uint32_t last_update_ms;    // 最后更新时间 (毫秒)
     uint64_t receive_time_us;   // 精确接收时间 (微秒) - 用于延迟测量
