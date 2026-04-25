@@ -312,6 +312,12 @@ static const char web_page_html[] = R"rawliteral(
                 <input type="checkbox" id="carModeSwitch" class="switch" onclick="toggleCarMode()">
             </div>
             
+            <div style="text-align:center; margin:6px 0;">
+                <button class="dir-btn" style="width:160px; background:#28a745; border-color:#1e7e34; color:white;"
+                        ontouchstart="carStandupPress()" ontouchend="carStandupRelease()"
+                        onmousedown="carStandupPress()" onmouseup="carStandupRelease()">🏃 Car Standup</button>
+            </div>
+            
             <div class="slider-row">
                 <label id="angleZeroLabel">🎯 Angle Zero: 7.40°</label>
                 <div style="display:flex; align-items:center; gap:4px;">
@@ -504,6 +510,7 @@ static const char web_page_html[] = R"rawliteral(
     var msgCount = 0;
     var heartbeatTimer = null;
     var g_standup = 0;
+    var g_carStandup = 0;
     var g_angleZero = 7.4;
     var g_obsvSpeed = 0;
     var g_xoffsetEnable = 0;
@@ -584,6 +591,7 @@ static const char web_page_html[] = R"rawliteral(
                 yaw_enable: g_yawEnable,
                 roll_enable: g_rollEnable,
                 standup: g_standup,
+                car_standup: g_carStandup,
                 angle_zero: parseFloat(g_angleZero.toFixed(2)),
                 obsv_speed: g_obsvSpeed,
                 xoffset_enable: g_xoffsetEnable,
@@ -639,6 +647,16 @@ static const char web_page_html[] = R"rawliteral(
     
     function standupRelease() {
         g_standup = 0;
+        sendData();
+    }
+    
+    function carStandupPress() {
+        g_carStandup = 1;
+        sendData();
+    }
+    
+    function carStandupRelease() {
+        g_carStandup = 0;
         sendData();
     }
     

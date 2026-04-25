@@ -1190,13 +1190,13 @@ static const triple_pid_params_t triple_pid_default_params = {
     .speed_kp = 0.85f,
     .speed_ki = 0.00006f,
     .speed_kd = 0.0f,
-    .speed_limit = 40.0f,       // 最大目标倾角 20 deg
+    .speed_limit = 30.0f,       // 最大目标倾角 20 deg
 
     // 角度环 (中环): pitch_target - pitch → wheel_speed_target
     .angle_kp = 1.2f,
     .angle_ki = 0.0f,
     .angle_kd = 0.0f,
-    .angle_limit = 28.0f,       // 最大目标轮速 28 rad/s
+    .angle_limit = 20.0f,       // 最大目标轮速 20 rad/s
 
     // 轮速环 (内环): wheel_speed_target - wheel_speed → torque
     .wheel_kp = 0.5f,
@@ -1212,10 +1212,10 @@ static const triple_pid_params_t triple_pid_default_params = {
     .lpf_joyy_tf = 0.2f,
     
     // 角速度阻尼环
-    .gyro_kp = 0.1f,
+    .gyro_kp = 0.13f,
     .gyro_ki = 0.0f,
     .gyro_kd = 0.0f,
-    .gyro_limit = 10.0f,
+    .gyro_limit = 20.0f,
     
     // 位移环 (最外环, 默认开启)
     .distance_kp = 4.2f,

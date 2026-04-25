@@ -488,6 +488,19 @@ static standup_state_t g_standup_state = STANDUP_IDLE;
 static uint32_t g_standup_state_enter_ms = 0;
 static bool g_standup_last_btn = false;             // 上一帧起身按钮状态 (上升沿检测)
 
+// ============================================================================
+// 小车模式起身 (Car Standup) 状态机
+// ============================================================================
+typedef enum {
+    CAR_STANDUP_IDLE = 0,       // 空闲
+    CAR_STANDUP_SWING,          // 腿从 -130° 摆向 -90°
+    CAR_STANDUP_DONE,           // 到达目标, 等待切入平衡
+} car_standup_state_t;
+
+static car_standup_state_t g_car_standup_state = CAR_STANDUP_IDLE;
+static uint32_t g_car_standup_enter_ms = 0;
+static bool g_car_standup_last_btn = false;         // 上一帧按钮状态 (上升沿检测)
+
 // 起身参数 (可调)
 static float g_standup_retract_length = 0.065f;     // 收腿目标腿长 (m)
 static float g_standup_retract_angle = 0.0f;        // 收腿时身体夹角 (度), 运行时由 FK 读取
@@ -2001,6 +2014,8 @@ static void apply_motor_commands(void);
 static void jump_state_machine_update(void);
 static void standup_state_machine_update(void);
 static bool standup_is_active(void);
+static void car_standup_state_machine_update(void);
+static bool car_standup_is_active(void);
 static esp_err_t leg_ctrl_get_state_cached(bool is_left, leg_state_t *state);
 esp_err_t leg_ctrl_set_target(bool is_left, float leg_length, float body_angle);
 
@@ -2672,6 +2687,9 @@ static void task_balance_ctrl(void *arg) {
         // 起身状态机更新
         standup_state_machine_update();
         
+        // 小车模式起身状态机更新
+        car_standup_state_machine_update();
+        
         // 记录控制结束时间
         uint64_t ctrl_end = esp_timer_get_time();
         
@@ -3215,6 +3233,10 @@ static bool standup_is_active(void) {
     return g_standup_state != STANDUP_IDLE;
 }
 
+static bool car_standup_is_active(void) {
+    return g_car_standup_state != CAR_STANDUP_IDLE;
+}
+
 static void standup_state_machine_update(void) {
     if (g_standup_state == STANDUP_IDLE) return;
     
@@ -3406,6 +3428,90 @@ static void standup_state_machine_update(void) {
     }
 }
 
+// ============================================================================
+// 小车模式起身 (Car Standup) 状态机
+// ============================================================================
+static void car_standup_state_machine_update(void) {
+    if (g_car_standup_state == CAR_STANDUP_IDLE) return;
+
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t elapsed = now_ms - g_car_standup_enter_ms;
+
+    switch (g_car_standup_state) {
+        case CAR_STANDUP_SWING: {
+            // 超时保护 (3 秒)
+            if (elapsed > 3000) {
+                ESP_LOGW(TAG, "CAR_STANDUP: timeout, abort");
+                g_car_standup_state = CAR_STANDUP_IDLE;
+                break;
+            }
+            // 持续推腿目标到 -90° (防被遥控覆盖)
+            leg_ctrl_set_target(true,  g_leg_length_min, -90.0f);
+            leg_ctrl_set_target(false, g_leg_length_min, -90.0f);
+
+            // 检测左腿 body_angle 是否到达 -90° ±20° 以内
+            leg_state_t left_st;
+            if (leg_ctrl_get_state_cached(true, &left_st) == ESP_OK && left_st.valid) {
+                if (fabsf(left_st.workspace.body_angle - (-90.0f)) < 20.0f) {
+                    g_car_standup_state = CAR_STANDUP_DONE;
+                    g_car_standup_enter_ms = now_ms;
+                    ESP_LOGW(TAG, "CAR_STANDUP: angle reached (%.1f deg), enabling balance",
+                             left_st.workspace.body_angle);
+                }
+            }
+            break;
+        }
+        case CAR_STANDUP_DONE: {
+            // 等待 200ms 让腿稳定, 然后切入平衡控制
+            if (elapsed >= 200) {
+                // 停轮速
+                can_motor_set_speed(g_motor_left, 0);
+                can_motor_set_speed(g_motor_right, 0);
+
+                // 切换电机到力矩模式 (或根据前一个控制模式选速度模式)
+                control_mode_t prev = g_car_mode_prev_mode;
+                if (prev == CTRL_MODE_SINGLE_PID ||
+                    (prev == CTRL_MODE_TRIPLE_PID &&
+                     g_triple_pid_ctrl.params.wheel_mode == TRIPLE_PID_WHEEL_SPEED)) {
+                    can_motor_set_mode(g_motor_left, MODE_SPEED);
+                    can_motor_set_mode(g_motor_right, MODE_SPEED);
+                } else {
+                    can_motor_set_mode(g_motor_left, MODE_TORQUE);
+                    can_motor_set_mode(g_motor_right, MODE_TORQUE);
+                }
+
+                // 退出 car 模式, 恢复前一个控制模式
+                g_control_mode = prev;
+
+                // 强制腿部目标为直立姿态
+                leg_ctrl_set_target(true,  g_leg_length_min, -90.0f);
+                leg_ctrl_set_target(false, g_leg_length_min, -90.0f);
+
+                // 重置距离零点 (与着陆处理一致)
+                g_distance_zeropoint = g_lqr_distance;
+                lqr_set_distance_zeropoint(&g_lqr_ctrl, g_distance_zeropoint);
+                triple_pid_set_distance_zeropoint(&g_triple_pid_ctrl, g_distance_zeropoint);
+
+                // 清除失控标志, 允许平衡输出
+                g_uncontrolable = 0;
+
+                const char *mode_str = (prev == CTRL_MODE_LQR) ? "LQR" :
+                                       (prev == CTRL_MODE_DUAL_PID) ? "DUAL_PID" :
+                                       (prev == CTRL_MODE_TRIPLE_PID) ? "TRIPLE_PID" :
+                                       (prev == CTRL_MODE_FULL_LQR) ? "FULL_LQR" : "SINGLE_PID";
+                ESP_LOGW(TAG, "CAR_STANDUP: done! Switched to %s, balance active", mode_str);
+                printf("CTRL_MODE:%s\n", mode_str);
+
+                g_car_standup_state = CAR_STANDUP_IDLE;
+            }
+            break;
+        }
+        default:
+            g_car_standup_state = CAR_STANDUP_IDLE;
+            break;
+    }
+}
+
 /**
  * @brief 从 WiFi 模块更新遥控数据
  */
@@ -3511,10 +3617,12 @@ static void update_remote_from_wifi(void) {
                                    (g_control_mode == CTRL_MODE_FULL_LQR) ? "FULL_LQR" : "SINGLE_PID";
         ESP_LOGW(TAG, "WiFi: Auto-exit CAR mode (set by standup), restored to %s", restored_str);
         printf("CTRL_MODE:%s\n", restored_str);
+        g_car_standup_state = CAR_STANDUP_IDLE;  // 中止任何进行中的 car standup
     }
     
     if (wifi_data->car_mode && !last_car_mode && !wifi_data->estop) {
         // 进入小车模式: 保存当前状态, 设置腿部角度, 切电机速度模式
+        g_car_standup_state = CAR_STANDUP_IDLE;  // 进入 car mode 时重置起身状态机
         g_car_mode_prev_mode = g_control_mode;
         g_car_mode_prev_base_angle = g_leg_base_angle;
         g_car_mode_prev_base_length = g_leg_base_length;
@@ -3565,6 +3673,7 @@ static void update_remote_from_wifi(void) {
                                        (g_control_mode == CTRL_MODE_FULL_LQR) ? "FULL_LQR" : "SINGLE_PID";
             ESP_LOGI(TAG, "WiFi: CAR mode OFF, restored to %s", restored_str);
             printf("CTRL_MODE:%s\n", restored_str);
+            g_car_standup_state = CAR_STANDUP_IDLE;  // 中止任何进行中的 car standup
         }
     }
     last_car_mode = wifi_data->car_mode;
@@ -3746,6 +3855,25 @@ static void update_remote_from_wifi(void) {
         g_standup_last_btn = standup_btn;
     }
     
+    // ======== 处理小车模式起身按钮 (上升沿触发) ========
+    {
+        bool car_standup_btn = wifi_data->car_standup;
+        if (car_standup_btn && !g_car_standup_last_btn) {
+            if (g_control_mode == CTRL_MODE_CAR && g_leg_control_enabled &&
+                !wifi_data->estop && g_car_standup_state == CAR_STANDUP_IDLE) {
+                g_car_standup_state = CAR_STANDUP_SWING;
+                g_car_standup_enter_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                leg_ctrl_set_target(true,  g_leg_length_min, -90.0f);
+                leg_ctrl_set_target(false, g_leg_length_min, -90.0f);
+                ESP_LOGW(TAG, "CAR_STANDUP: triggered, swinging to -90deg");
+            } else if (g_car_standup_state == CAR_STANDUP_IDLE) {
+                ESP_LOGW(TAG, "CAR_STANDUP: ignored (mode=%d leg=%d estop=%d)",
+                         g_control_mode, g_leg_control_enabled, wifi_data->estop);
+            }
+        }
+        g_car_standup_last_btn = car_standup_btn;
+    }
+    
     // ======== 处理腿部使能 ========
     static bool last_leg_enable = false;
     if (wifi_data->leg_enable != last_leg_enable && !wifi_data->estop) {
@@ -3756,7 +3884,7 @@ static void update_remote_from_wifi(void) {
     
     // ======== 处理腿部角度和长度 ========
     // 跳跃/起身过程中不允许遥控覆盖腿长 (由状态机接管)
-    if (g_leg_control_enabled && !wifi_data->estop && !jump_is_active() && !standup_is_active()) {
+    if (g_leg_control_enabled && !wifi_data->estop && !jump_is_active() && !standup_is_active() && !car_standup_is_active()) {
         static float last_leg_angle = -90.0f;
         static float last_leg_length = 0.09f;
         if (fabsf(wifi_data->leg_angle - last_leg_angle) > 0.5f ||
@@ -4518,27 +4646,27 @@ static void compute_balance_output(float dt) {
             wheel_speed_avg = wma_compute(&g_wheel_speed_wma, wheel_speed_avg);
         }
         
-        // 根据腿长线性插值角度环Kp: L0=0.06→Kp=1.3, L0=0.11→Kp=0.9
-        {
-            float avg_L0 = (g_leg_left_target_length + g_leg_right_target_length) * 0.5f;
-            if (avg_L0 < 0.06f) avg_L0 = 0.06f;
-            if (avg_L0 > 0.11f) avg_L0 = 0.11f;
-            float interp_angle_kp = 1.25f + (1.15f - 1.25f) * (avg_L0 - 0.06f) / (0.11f - 0.06f);
-            triple_pid_set_angle_gains(&g_triple_pid_ctrl, interp_angle_kp,
-                                       g_triple_pid_ctrl.params.angle_ki,
-                                       g_triple_pid_ctrl.params.angle_kd);
-        }
+        // // 根据腿长线性插值角度环Kp: L0=0.06→Kp=1.3, L0=0.11→Kp=0.9
+        // {
+        //     float avg_L0 = (g_leg_left_target_length + g_leg_right_target_length) * 0.5f;
+        //     if (avg_L0 < 0.06f) avg_L0 = 0.06f;
+        //     if (avg_L0 > 0.11f) avg_L0 = 0.11f;
+        //     float interp_angle_kp = 1.25f + (1.15f - 1.25f) * (avg_L0 - 0.06f) / (0.11f - 0.06f);
+        //     triple_pid_set_angle_gains(&g_triple_pid_ctrl, interp_angle_kp,
+        //                                g_triple_pid_ctrl.params.angle_ki,
+        //                                g_triple_pid_ctrl.params.angle_kd);
+        // }
         
-        // 根据腿长线性插值角速度环Kp: L0=0.06→Kp=0.11, L0=0.11→Kp=0.09
-        {
-            float avg_L0 = (g_leg_left_target_length + g_leg_right_target_length) * 0.5f;
-            if (avg_L0 < 0.06f) avg_L0 = 0.06f;
-            if (avg_L0 > 0.11f) avg_L0 = 0.11f;
-            float interp_gyro_kp = 0.105f + (0.095f - 0.105f) * (avg_L0 - 0.06f) / (0.11f - 0.06f);
-            triple_pid_set_gyro_gains(&g_triple_pid_ctrl, interp_gyro_kp,
-                                      g_triple_pid_ctrl.params.gyro_ki,
-                                      g_triple_pid_ctrl.params.gyro_kd);
-        }
+        // // 根据腿长线性插值角速度环Kp: L0=0.06→Kp=0.11, L0=0.11→Kp=0.09
+        // {
+        //     float avg_L0 = (g_leg_left_target_length + g_leg_right_target_length) * 0.5f;
+        //     if (avg_L0 < 0.06f) avg_L0 = 0.06f;
+        //     if (avg_L0 > 0.11f) avg_L0 = 0.11f;
+        //     float interp_gyro_kp = 0.105f + (0.095f - 0.105f) * (avg_L0 - 0.06f) / (0.11f - 0.06f);
+        //     triple_pid_set_gyro_gains(&g_triple_pid_ctrl, interp_gyro_kp,
+        //                               g_triple_pid_ctrl.params.gyro_ki,
+        //                               g_triple_pid_ctrl.params.gyro_kd);
+        // }
         
         esp_err_t ret = triple_pid_balance_loop(&g_triple_pid_ctrl,
                                                  pitch_for_control, imu.pitch_rate,

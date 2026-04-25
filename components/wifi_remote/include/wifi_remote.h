@@ -80,6 +80,9 @@ typedef struct {
     // 起身按钮
     bool standup;               // 起身按钮 (true=按下起身, 上升沿触发)
     
+    // 小车模式起身按钮
+    bool car_standup;           // 小车模式起身 (true=按下, 上升沿触发; 仅 car mode 有效)
+    
     // 角度零点
     float angle_zero;           // 角度零点偏移 (度, -30 ~ 30)
     

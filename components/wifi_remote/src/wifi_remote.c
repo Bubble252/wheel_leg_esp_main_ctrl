@@ -295,6 +295,12 @@ static void parse_json_command(const char *json_str) {
         g_remote_data.standup = (standup->valueint == 1);
     }
     
+    // 解析小车模式起身按钮
+    cJSON *car_standup = cJSON_GetObjectItem(json, "car_standup");
+    if (car_standup && cJSON_IsNumber(car_standup)) {
+        g_remote_data.car_standup = (car_standup->valueint == 1);
+    }
+    
     // 解析角度零点
     cJSON *angle_zero = cJSON_GetObjectItem(json, "angle_zero");
     if (angle_zero && cJSON_IsNumber(angle_zero)) {
