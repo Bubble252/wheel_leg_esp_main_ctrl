@@ -290,7 +290,7 @@ static const char web_page_html[] = R"rawliteral(
             </div>            
             <div class="ctrl-row">
                 <label>↔️ Diff Steer (差速转向)</label>
-                <input type="checkbox" id="diffSpeedSwitch" class="switch" onclick="toggleDiffSpeed()">
+                <input type="checkbox" id="diffSpeedSwitch" class="switch" checked onclick="toggleDiffSpeed()">
             </div>            
             <div class="ctrl-row">
                 <label>�📐 Pitch Compensation</label>
@@ -319,22 +319,22 @@ static const char web_page_html[] = R"rawliteral(
             </div>
             
             <div class="slider-row">
-                <label id="angleZeroLabel">🎯 Angle Zero: 7.40°</label>
+                <label id="angleZeroLabel">🎯 Angle Zero: -1.5°</label>
                 <div style="display:flex; align-items:center; gap:4px;">
                     <button class="dir-btn" style="width:36px; height:32px; font-size:16px; padding:0;" onclick="nudgeAngleZero(-0.1)">◀</button>
-                    <input type="range" id="angleZeroSlider" min="-30" max="30" value="7.4" step="0.1" style="flex:1;" oninput="updateAngleZero()">
+                    <input type="range" id="angleZeroSlider" min="-30" max="30" value="-1.5" step="0.1" style="flex:1;" oninput="updateAngleZero()">
                     <button class="dir-btn" style="width:36px; height:32px; font-size:16px; padding:0;" onclick="nudgeAngleZero(0.1)">▶</button>
                 </div>
             </div>
             
             <div class="slider-row">
-                <label id="joySpeedLabel">🏎️ Speed Gain: 3.0 ‰</label>
-                <input type="range" id="joySpeedSlider" min="1" max="20" value="3" step="0.5" oninput="updateJoySpeed()">
+                <label id="joySpeedLabel">🏎️ Speed Gain: 1.5 ‰</label>
+                <input type="range" id="joySpeedSlider" min="0.1" max="3" value="1.5" step="0.1" oninput="updateJoySpeed()">
             </div>
             
             <div class="slider-row">
-                <label id="joyYawLabel">🔄 Yaw Gain: 30 ‰</label>
-                <input type="range" id="joyYawSlider" min="5" max="200" value="30" step="1" oninput="updateJoyYaw()">
+                <label id="joyYawLabel">🔄 Yaw Gain: 60 ‰</label>
+                <input type="range" id="joyYawSlider" min="5" max="100" value="60" step="1" oninput="updateJoyYaw()">
             </div>
             
             <div class="ctrl-row">
@@ -377,7 +377,7 @@ static const char web_page_html[] = R"rawliteral(
             
             <div class="slider-row">
                 <label id="legLengthLabel">Leg Length: 90 mm</label>
-                <input type="range" id="legLengthSlider" min="45" max="110" value="90" oninput="updateLegLength()">
+                <input type="range" id="legLengthSlider" min="68" max="110" value="90" oninput="updateLegLength()">
             </div>
         </div>
         
@@ -496,8 +496,8 @@ static const char web_page_html[] = R"rawliteral(
     var g_rollEnable = 0;
     var g_legAngle = -90;
     var g_legLength = 90;
-    var g_joySpeedGain = 3.0;
-    var g_joyYawGain = 30;
+    var g_joySpeedGain = 1.5;
+    var g_joyYawGain = 60;
     var g_distEnable = 1;
     var g_detailMode = 0;
     var g_detailSync = 1;
@@ -511,11 +511,11 @@ static const char web_page_html[] = R"rawliteral(
     var heartbeatTimer = null;
     var g_standup = 0;
     var g_carStandup = 0;
-    var g_angleZero = 7.4;
+    var g_angleZero = -1.5;
     var g_obsvSpeed = 0;
     var g_xoffsetEnable = 0;
     var g_xoffsetKp = 100;
-    var g_diffSpeed = 0;
+    var g_diffSpeed = 1;
     
     // WebSocket 初始化
     function initWebSocket() {

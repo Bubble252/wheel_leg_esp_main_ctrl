@@ -355,6 +355,11 @@ static can_motor_handle_t find_motor_by_rx_id(uint32_t rx_id) {
         if (g_motors[i] && g_motors[i]->rx_frame_id == rx_id) {
             return g_motors[i];
         }
+        // 同时匹配 STW MIT 运控反馈帧 ID (0x400 | motor_id)
+        if (g_motors[i] && g_motors[i]->brand == MOTOR_BRAND_STW &&
+            rx_id == (STW_MIT_ID_OFFSET | (uint32_t)g_motors[i]->motor_id)) {
+            return g_motors[i];
+        }
     }
     return NULL;
 }
@@ -795,6 +800,46 @@ esp_err_t can_motor_process_rx(void) {
 
         } else {
         // ---- 伺泰威协议解析 (小端序, 命令码协议) ----
+
+        // MIT 运控反馈帧: StdID = 0x400|motor_id, DLC=8
+        // 格式 (与 TX 镜像, 大端序 12-bit 打包):
+        //   [0-1]=pos(16bit BE), [2]=vel[11:4], [3]=vel[3:0]|trq[11:8], [4]=trq[7:0]
+        // 暂时禁用: MIT 反馈帧位置精度有限 (±pos_max 范围编码, 非多圈绝对值),
+        // 改为只依赖主动发送的 0xA3 获取多圈绝对角度, 避免 FK 误差.
+        // TODO: 若需速度/力矩实时反馈, 可单独恢复 vel/trq 部分
+        if (msg.identifier == (STW_MIT_ID_OFFSET | (uint32_t)motor->motor_id)) {
+#if 0  // MIT 位置/速度/力矩反馈暂时禁用, 只用 0xA3 多圈绝对角度
+            if (msg.data_length_code >= 5) {
+                uint16_t pos_raw = ((uint16_t)msg.data[0] << 8) | msg.data[1];
+                uint16_t vel_raw = ((uint16_t)msg.data[2] << 4) | (msg.data[3] >> 4);
+                uint16_t trq_raw = ((uint16_t)(msg.data[3] & 0x0F) << 8) | msg.data[4];
+
+                float pm = motor->stw_mit_pos_max;
+                float vm = motor->stw_mit_vel_max;
+                float tm = motor->stw_mit_t_max;
+
+                float pos_rad  = ((float)pos_raw / 65535.0f * 2.0f * pm - pm) * motor->dir;
+                float vel_rads = ((float)vel_raw / 4095.0f  * 2.0f * vm - vm) * motor->dir;
+                float trq_nm   = ((float)trq_raw / 4095.0f  * 2.0f * tm - tm) * motor->dir;
+
+                // 统一单位: 与 0xA3/0xA2/0xA1 应答保持一致
+                motor->state.position = pos_rad  * (180.0f / (float)M_PI);     // rad → deg
+                motor->state.speed    = vel_rads * (60.0f / (2.0f * (float)M_PI)); // rad/s → RPM
+                motor->state.current  = trq_nm   / STW_JOINT_TORQUE_CONST;    // Nm → 等效 A
+
+                // 同步 MIT 专用缓存供上层直接读取
+                motor->stw_mit_state.position = pos_rad;
+                motor->stw_mit_state.velocity = vel_rads;
+                motor->stw_mit_state.torque   = trq_nm;
+                motor->stw_mit_state_valid     = true;
+            }
+#endif
+            motor->state.is_online   = true;
+            motor->state.last_update = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            continue;  // 不走下面的 cmd-byte 解析
+        }
+
+        // 普通命令应答 (cmd 字节在 data[0])
         uint8_t cmd = msg.data[0];
         
         switch (cmd) {

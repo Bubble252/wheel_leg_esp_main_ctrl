@@ -60,10 +60,10 @@ static const lqr_params_t default_params = {
     .yaw_gyro_limit = 7.0f,
     
     // 横滚控制 PID
-    .roll_kp = 0.001f,
-    .roll_ki = 0.0f,
+    .roll_kp = 0.0016f,
+    .roll_ki = 0.005f,
     .roll_kd = 0.0f,
-    .roll_limit = 0.015f,
+    .roll_limit = 0.02f,
     
     // 零点调整 PID
     .zeropoint_kp = 0.0f,
@@ -75,7 +75,7 @@ static const lqr_params_t default_params = {
     .angle_zeropoint = -10.5f,
     
     // 低通滤波器
-    .lpf_joyy_tf = 0.2f,
+    .lpf_joyy_tf = 0.02f,
     .lpf_zeropoint_tf = 0.08f,
     .lpf_roll_tf = 0.1f,
     .lpf_gyro_tf = 0.005f,
@@ -715,7 +715,7 @@ static const dual_pid_params_t dual_pid_default_params = {
     .speed_cmd_gain = 33333.0f,
     
     // 遥杆目标速度低通滤波 (与 LQR 的 lpf_joyy 相同)
-    .lpf_joyy_tf = 0.2f,
+    .lpf_joyy_tf = 0.02f,
     
     // 角速度阻尼环 (默认关闭, kp=0)
     .gyro_kp = 0.0f,
@@ -1190,13 +1190,13 @@ static const triple_pid_params_t triple_pid_default_params = {
     .speed_kp = 0.85f,
     .speed_ki = 0.00006f,
     .speed_kd = 0.0f,
-    .speed_limit = 30.0f,       // 最大目标倾角 20 deg
+    .speed_limit = 25.0f,       // 最大目标倾角 25 deg
 
     // 角度环 (中环): pitch_target - pitch → wheel_speed_target
     .angle_kp = 1.2f,
     .angle_ki = 0.0f,
     .angle_kd = 0.0f,
-    .angle_limit = 20.0f,       // 最大目标轮速 20 rad/s
+    .angle_limit = 60.0f,       // 最大目标轮速 60 rad/s
 
     // 轮速环 (内环): wheel_speed_target - wheel_speed → torque
     .wheel_kp = 0.5f,
@@ -1205,11 +1205,11 @@ static const triple_pid_params_t triple_pid_default_params = {
     .wheel_limit = 20.0f,       // 最大扭矩 20 Nm
 
     // 通用参数
-    .angle_zeropoint = -7.0f,
+    .angle_zeropoint = -1.5f,
     .emergency_angle = 45.0f,
     .max_torque = 20.0f,
     .speed_cmd_gain = 15.0f,
-    .lpf_joyy_tf = 0.2f,
+    .lpf_joyy_tf = 0.02f,
     
     // 角速度阻尼环
     .gyro_kp = 0.13f,
@@ -1221,7 +1221,7 @@ static const triple_pid_params_t triple_pid_default_params = {
     .distance_kp = 4.2f,
     .distance_ki = 0.0f,
     .distance_kd = 1.2f,
-    .distance_limit = 10.0f,   // 最大速度修正
+    .distance_limit = 20.0f,   // 最大速度修正
     .distance_enable = 1,      // 默认开启
     
     // 默认使用电机速度模式 (不经过软件轮速PID)
@@ -1448,7 +1448,17 @@ esp_err_t triple_pid_balance_loop(triple_pid_controller_t *ctrl,
     // =============================================================
     float distance_control = 0.0f;
     float distance_error = 0.0f;
-    bool distance_active = (ctrl->params.distance_enable != 0);
+    // 仅在姿态角处于平衡点 ±15° 以内时启动位移环，防止大倾斜时积分发散
+    bool distance_angle_ok = (fabsf(pitch - ctrl->params.angle_zeropoint) <= 10.0f);
+    bool distance_active = (ctrl->params.distance_enable != 0) && distance_angle_ok;
+
+    // 检测退出事件: 上一周期激活、本周期关闭 → 锁存当前位置为新零点并清除积分
+    if (ctrl->distance_prev_active && !distance_active) {
+        ctrl->distance_zeropoint = lqr_distance;
+        ctrl->pid_distance.integral = 0.0f;
+    }
+    ctrl->distance_prev_active = distance_active;
+
     if (distance_active) {
         // 四环PID的位移环: 误差符号与LQR相反
         // LQR: distance_control 直接叠加到力矩 (负反馈)

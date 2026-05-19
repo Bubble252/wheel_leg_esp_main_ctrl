@@ -937,6 +937,7 @@ typedef struct {
     lowpass_filter_t lpf_joyy;      // 遥杆目标速度低通滤波
     
     float distance_zeropoint;       // 位移零点 (目标位置)
+    bool distance_prev_active;      // 上一周期位移环是否激活 (用于检测退出事件)
     
     triple_pid_params_t params;
     
