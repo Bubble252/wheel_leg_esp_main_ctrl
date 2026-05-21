@@ -20,21 +20,11 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "leg_kinematics.h"  // 腿部运动学类型和接口
+#include "balance_types.h"   // balance_test_state_t, control_mode_t, shared_wheel_cmd_t
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**
- * @brief 平衡测试状态
- */
-typedef enum {
-    BALANCE_TEST_IDLE = 0,      // 空闲 (电机断开)
-    BALANCE_TEST_READY,         // 就绪 (等待使能)
-    BALANCE_TEST_RUNNING,       // 平衡运行中
-    BALANCE_TEST_EMERGENCY,     // 紧急停止
-    BALANCE_TEST_ERROR,         // 错误状态
-} balance_test_state_t;
 
 /**
  * @brief 平衡测试统计信息
@@ -204,6 +194,16 @@ void leg_ctrl_init(void);
 esp_err_t leg_ctrl_get_state(bool is_left, leg_state_t *state);
 
 /**
+ * @brief 读取当前腿部状态 (从缓存，无阻塞)
+ * @note 直接从电机驱动缓存中读取位置，不发送 CAN 请求。
+ *       适合在控制循环中使用，延迟 < 1us。
+ * @param is_left 是否为左腿
+ * @param state 输出腿部状态
+ * @return ESP_OK 成功
+ */
+esp_err_t leg_ctrl_get_state_cached(bool is_left, leg_state_t *state);
+
+/**
  * @brief 设置目标腿部状态 (腿长 + 身体夹角)
  * @param is_left 是否为左腿
  * @param leg_length 目标腿长 (米)
@@ -232,6 +232,75 @@ void leg_ctrl_print_status(void);
  * @brief 打印当前状态
  */
 void balance_test_print_status(void);
+
+// ============================================================================
+// 腿部控制使能和参数设置
+// ============================================================================
+
+/**
+ * @brief 使能/禁用腿部电机控制
+ */
+void balance_test_set_leg_control(bool enable);
+
+/**
+ * @brief 设置腿部电机目标角度 (直接设置关节角度)
+ * @param left_hip 左髋角度 (度)
+ * @param left_knee 左膝角度 (度)
+ * @param right_hip 右髋角度 (度)
+ * @param right_knee 右膝角度 (度)
+ */
+void balance_test_set_leg_angles(float left_hip, float left_knee,
+                                  float right_hip, float right_knee);
+
+/**
+ * @brief 设置腿部电机运动速度
+ * @param speed 速度 (RPM)
+ */
+void balance_test_set_leg_speed(float speed);
+
+// ============================================================================
+// Roll / Pitch Comp / X-Offset 控制
+// ============================================================================
+
+/**
+ * @brief 使能/禁用 Roll 控制
+ */
+void balance_test_set_roll_control(bool enable);
+
+/**
+ * @brief 获取 Roll 控制状态
+ */
+bool balance_test_get_roll_control(void);
+
+/**
+ * @brief 使能/禁用 Pitch 腿部角度补偿
+ */
+void balance_test_set_pitch_comp(bool enable);
+
+/**
+ * @brief 获取 Pitch 腿部角度补偿状态
+ */
+bool balance_test_get_pitch_comp(void);
+
+/**
+ * @brief 使能/禁用 X-Offset
+ */
+void balance_test_set_xoffset(bool enable);
+
+/**
+ * @brief 获取 X-Offset 状态
+ */
+bool balance_test_get_xoffset(void);
+
+/**
+ * @brief 设置 X-Offset PID 参数
+ */
+void balance_test_set_xoffset_pid(float kp, float ki, float kd);
+
+/**
+ * @brief 设置 X-Offset 限幅
+ */
+void balance_test_set_xoffset_limit(float limit);
 
 // ============================================================================
 // Leg Sync (防劈叉) API
